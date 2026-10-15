@@ -1,0 +1,27 @@
+{
+  "event": "game_end",
+  "game_id": "a1b2c3-server-job-id",
+  "season": 1,
+  "week": 3,
+  "timestamp": "2026-10-15T19:00:00Z",
+  "home": { "name": "Ravens", "score": 28 },
+  "away": { "name": "Bills",  "score": 21 },
+  "players": [
+    { "username": "QBKing_123", "user_id": 111111, "team": "Ravens", "position": "QB",
+      "stats": { "passing": { "completions": 18, "attempts": 25, "yards": 312, "tds": 3, "ints": 1 },
+                 "rushing": { "carries": 4, "yards": 22, "tds": 0 } } },
+    { "username": "SpeedyWR", "user_id": 222222, "team": "Ravens", "position": "WR",
+      "stats": { "receiving": { "receptions": 7, "targets": 9, "yards": 141, "tds": 2 } } },
+    { "username": "LockdownCB", "user_id": 333333, "team": "Ravens", "position": "CB",
+      "stats": { "defense": { "tackles": 5, "interceptions": 1, "deflections": 2, "tds": 1 } } },
+    { "username": "BillsQB", "user_id": 444444, "team": "Bills", "position": "QB",
+      "stats": { "passing": { "completions": 15, "attempts": 30, "yards": 240, "tds": 2, "ints": 1 },
+                 "rushing": { "carries": 6, "yards": 48, "tds": 1 } } },
+    { "username": "TruckStick", "user_id": 555555, "team": "Bills", "position": "RB",
+      "stats": { "rushing": { "carries": 14, "yards": 97, "tds": 0 },
+                 "receiving": { "receptions": 3, "yards": 25, "tds": 0 },
+                 "fumbles_lost": 1 } },
+    { "username": "PassRusher99", "user_id": 666666, "team": "Bills", "position": "DE",
+      "stats": { "defense": { "tackles": 4, "sacks": 2, "forced_fumbles": 1 } } }
+  ]
+}
