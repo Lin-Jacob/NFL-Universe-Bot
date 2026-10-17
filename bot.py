@@ -23,6 +23,7 @@ from nflu.admin import Admin
 from nflu.commands import Stats
 from nflu.db import Database
 from nflu.embeds import game_embed
+from nflu.feed import is_nflu_csv, nflu_embed
 from nflu.parser import ParsedGame
 from nflu.tunnel import Tunnel
 from nflu.webhook import WebhookServer, ingest
@@ -43,13 +44,21 @@ class NFLUBot(commands.Bot):
         self.db = Database(os.getenv("DATABASE_PATH", "data/nfl_universe.db"))
         self.port = int(os.getenv("WEBHOOK_PORT", "8080"))
         self.secret = os.getenv("WEBHOOK_SECRET", "")
-        self.webhook = WebhookServer(self.db, self.secret, config.DEFAULT_SEASON,
+        self.webhook = WebhookServer(self.db, self.secret,
                                      host=os.getenv("WEBHOOK_HOST", "0.0.0.0"), port=self.port,
                                      on_game=self.on_webhook_game)
         self.tunnel = Tunnel(os.getenv("TUNNEL", "cloudflared"), self.port)
         self._notified = False
+        self._pending_csv: discord.Message | None = None
+
+    def apply_config(self) -> int:
+        """Load PLAYER_NAMES into the name map and rescore every game with FANTASY_SCORING."""
+        for name, ign in config.PLAYER_NAMES.items():
+            self.db.set_name(ign, name)
+        return self.db.recompute_fantasy()
 
     async def setup_hook(self) -> None:
+        self.apply_config()
         await self.add_cog(Stats(self))
         await self.add_cog(Admin(self))
         await self.webhook.start()
@@ -68,7 +77,7 @@ class NFLUBot(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "?")
-        if not self._notified and os.getenv("DM_ADMINS_WEBHOOK_URL", "true").lower() == "true":
+        if not self._notified and os.getenv("DM_ADMINS_WEBHOOK_URL", "false").lower() == "true":
             self._notified = True
             for uid in config.ADMIN_IDS:
                 try:
@@ -78,32 +87,40 @@ class NFLUBot(commands.Bot):
                     log.warning("Couldn't DM admin %s: %s", uid, e)
 
     async def on_message(self, message: discord.Message) -> None:
-        """Option B: NFL Universe posts to a normal Discord webhook in FEED_CHANNEL_ID; we read those posts."""
+        """NFL Universe posts each game to FEED_CHANNEL_ID as two messages: the stats CSV, then the score embed."""
         if not self.feed_channel_id or message.channel.id != self.feed_channel_id:
             return
-        if not message.webhook_id and not message.author.bot:
+        if message.author.id != config.NFLU_WEBHOOK_ID:
             return
-        bodies = []
-        for att in message.attachments:
-            if att.filename.lower().endswith(".json") and att.size < 2 * 1024 * 1024:
-                bodies.append((await att.read()).decode("utf-8", errors="replace"))
-        if not bodies:
-            payload = {"content": message.content, "embeds": [e.to_dict() for e in message.embeds]}
-            # The content itself may be raw JSON
-            stripped = message.content.strip().strip("`").removeprefix("json").strip()
-            if stripped.startswith("{"):
-                bodies.append(stripped)
-            else:
-                bodies.append(json.dumps(payload))
-        for body in bodies:
-            res = ingest(self.db, body, f"discord-feed:{message.id}", config.DEFAULT_SEASON)
-            log.info("Feed message %s -> %s", message.id, {k: v for k, v in res.items() if k != "game"})
-            if res.get("game") is not None:
+        if is_nflu_csv(message):
+            self._pending_csv = message  # held until the score message that follows it
+        elif nflu_embed(message) is not None:
+            csv_message, self._pending_csv = self._pending_csv, None
+            await self.ingest_game_post(message, csv_message)
+
+    async def ingest_game_post(self, message: discord.Message, csv_message: discord.Message | None,
+                               *, live: bool = True) -> dict:
+        """Store + parse one NFL Universe score message plus the CSV posted just before it.
+        Skips messages already saved (by message ID). live=False (backfill) doesn't announce."""
+        if self.db.has_message(message.id):
+            return {"ok": True, "status": "already saved"}
+        csv_text = None
+        if csv_message and 0 <= (message.created_at - csv_message.created_at).total_seconds() <= 30:
+            att = next(a for a in csv_message.attachments if a.filename.lower().endswith(".csv"))
+            csv_text = (await att.read()).decode("utf-8", errors="replace")
+        else:
+            log.warning("Game post %s: no CSV just before it; saving the score only", message.id)
+        body = json.dumps({"nfl_universe": {"embed": nflu_embed(message), "csv": csv_text}})
+        res = ingest(self.db, body, f"discord-feed:{message.id}", message_id=message.id)
+        log.info("Game post %s -> %s", message.id, {k: v for k, v in res.items() if k != "game"})
+        if res.get("game") is not None:
+            if live:
                 await self.announce_game(res["game_id"], res.get("replaced", False))
-                try:
-                    await message.add_reaction("✅")
-                except discord.DiscordException:
-                    pass
+            try:
+                await message.add_reaction("✅")
+            except discord.DiscordException:
+                pass
+        return res
 
     async def close(self) -> None:
         await self.tunnel.stop()

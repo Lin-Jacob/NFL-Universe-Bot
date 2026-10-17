@@ -2,43 +2,120 @@
 
 # canonical name -> (label, category)
 STATS: dict[str, tuple[str, str]] = {
+    # Passing (QB)
     "pass_completions": ("Completions", "passing"),
     "pass_attempts": ("Pass Attempts", "passing"),
     "pass_yards": ("Passing Yards", "passing"),
     "pass_tds": ("Passing TDs", "passing"),
     "interceptions": ("Interceptions Thrown", "passing"),
+    "int_charged": ("INTs Charged", "passing"),  # computed: INTs this player loses points for
+    "pick_sixes_thrown": ("Pick-Sixes Thrown", "passing"),
     "sacks_taken": ("Sacks Taken", "passing"),
-    "pass_2pt": ("Passing 2PT", "passing"),
+    "longest_pass": ("Longest Pass", "passing"),
+    "pass_att_lt15": ("Attempts 0-15 yd", "passing"),
+    "pass_cmp_lt15": ("Completions 0-15 yd", "passing"),
+    "pass_att_lt35": ("Attempts 15-35 yd", "passing"),
+    "pass_cmp_lt35": ("Completions 15-35 yd", "passing"),
+    "pass_att_lt50": ("Attempts 35-50 yd", "passing"),
+    "pass_cmp_lt50": ("Completions 35-50 yd", "passing"),
+    "pass_att_gt50": ("Attempts 50+ yd", "passing"),
+    "pass_cmp_gt50": ("Completions 50+ yd", "passing"),
+    # Rushing (RB)
     "rush_attempts": ("Carries", "rushing"),
     "rush_yards": ("Rushing Yards", "rushing"),
     "rush_tds": ("Rushing TDs", "rushing"),
-    "rush_2pt": ("Rushing 2PT", "rushing"),
+    "rush_20plus": ("Carries 20+ yd", "rushing"),
+    "rush_first_downs": ("Rushing First Downs", "rushing"),
+    "longest_rush": ("Longest Rush", "rushing"),
+    # Receiving (WR)
     "targets": ("Targets", "receiving"),
     "receptions": ("Receptions", "receiving"),
     "rec_yards": ("Receiving Yards", "receiving"),
     "rec_tds": ("Receiving TDs", "receiving"),
-    "rec_2pt": ("Receiving 2PT", "receiving"),
-    "fumbles": ("Fumbles", "ball security"),
-    "fumbles_lost": ("Fumbles Lost", "ball security"),
+    "yac": ("Yards After Catch", "receiving"),
+    "rec_first_downs": ("Receiving First Downs", "receiving"),
+    "catches_in_traffic": ("Catches In Traffic", "receiving"),
+    "drops": ("Drops", "receiving"),
+    "ints_allowed": ("INTs Allowed (receiver)", "receiving"),
+    "toss_ups": ("Toss Ups", "receiving"),
+    "longest_rec": ("Longest Reception", "receiving"),
+    "rec_lt15": ("Catches 0-15 yd", "receiving"),
+    "rec_lt35": ("Catches 15-35 yd", "receiving"),
+    "rec_lt50": ("Catches 35-50 yd", "receiving"),
+    "rec_gt50": ("Catches 50+ yd", "receiving"),
+    # Shared offense
+    "third_down_conv": ("3rd Down Conversions", "offense"),
+    "fourth_down_conv": ("4th Down Conversions", "offense"),
+    "fumbles": ("Fumbles", "offense"),
+    # Defense (DB + DL)
     "tackles": ("Tackles", "defense"),
+    "tfl": ("Tackles For Loss", "defense"),
+    "tfl_yards": ("TFL Yards", "defense"),
     "sacks": ("Sacks", "defense"),
+    "sack_yards": ("Sack Yards", "defense"),
+    "qb_hits": ("QB Hits", "defense"),
+    "qb_pressures": ("QB Pressures", "defense"),
+    "pass_rushes": ("Pass Rushes", "defense"),
     "def_ints": ("Interceptions", "defense"),
+    "ints_in_traffic": ("INTs In Traffic", "defense"),
+    "int_return_yards": ("INT Return Yards", "defense"),
+    "longest_int_return": ("Longest INT Return", "defense"),
     "pass_deflections": ("Pass Deflections", "defense"),
     "forced_fumbles": ("Forced Fumbles", "defense"),
     "fumble_recoveries": ("Fumble Recoveries", "defense"),
+    "fumble_return_yards": ("Fumble Return Yards", "defense"),
     "def_tds": ("Defensive TDs", "defense"),
     "safeties": ("Safeties", "defense"),
-    "return_yards": ("Return Yards", "special teams"),
-    "return_tds": ("Return TDs", "special teams"),
-    "fg_made": ("FG Made", "kicking"),
-    "fg_missed": ("FG Missed", "kicking"),
-    "xp_made": ("XP Made", "kicking"),
-    "xp_missed": ("XP Missed", "kicking"),
-    "punts": ("Punts", "kicking"),
+    "completions_allowed": ("Completions Allowed", "defense"),
+    "targets_allowed": ("Targets Allowed", "defense"),
+    "pass_yards_allowed": ("Pass Yards Allowed", "defense"),
+    "pass_tds_allowed": ("Pass TDs Allowed", "defense"),
+    "toss_ups_def": ("Toss Ups (defense)", "defense"),
+    # Special teams (ST)
+    "fg_made": ("FG Made", "special teams"),
+    "fg_missed": ("FG Missed", "special teams"),
+    "fg_yards": ("FG Yards", "special teams"),
+    "longest_fg": ("Longest FG", "special teams"),
+    "kick_returns": ("Kick Returns", "special teams"),
+    "kick_return_yards": ("Kick Return Yards", "special teams"),
+    "kick_return_tds": ("Kick Return TDs", "special teams"),
+    "punt_returns": ("Punt Returns", "special teams"),
+    "punt_return_yards": ("Punt Return Yards", "special teams"),
+    "punt_return_tds": ("Punt Return TDs", "special teams"),
+    "punt_blocks": ("Punt Blocks", "special teams"),
+    "kickoffs": ("Kickoffs", "special teams"),
+    "touchbacks": ("Touchbacks", "special teams"),
+    "punts": ("Punts", "special teams"),
+    "punt_yards": ("Punt Yards", "special teams"),
+    "punts_inside_10": ("Punts Inside 10", "special teams"),
+    "longest_punt": ("Longest Punt", "special teams"),
+    "onside_recoveries": ("Onside Recoveries", "special teams"),
+    "onside_recovery_yards": ("Onside Recovery Yards", "special teams"),
+    "snaps": ("Snaps", "other"),
 }
 
-CATEGORY_ORDER = ["passing", "rushing", "receiving", "ball security", "defense",
-                  "special teams", "kicking"]
+# Always shown in /player and /compare; other stats show once they're worth points in config.py
+CORE_DISPLAY = {
+    "pass_completions", "pass_attempts", "pass_yards", "pass_tds", "interceptions", "sacks_taken",
+    "rush_attempts", "rush_yards", "rush_tds", "targets", "receptions", "rec_yards", "rec_tds", "fumbles",
+    "tackles", "sacks", "def_ints", "pass_deflections", "forced_fumbles", "fumble_recoveries", "def_tds",
+    "safeties", "fg_made", "fg_missed", "kick_return_tds", "punt_return_tds", "snaps",
+}
+
+# Longest-play stats combine across games by taking the best, not by adding up
+MAX_STATS = {k for k in STATS if k.startswith("longest_")}
+
+# Positions for /stats: code -> (section title, CSV section it comes from)
+POSITIONS: dict[str, tuple[str, str]] = {
+    "QB": ("Quarterbacks", "Passing"),
+    "RB": ("Running backs", "Rushing"),
+    "WR": ("Receivers", "Receiving"),
+    "DB": ("Defensive backs", "Cornerback"),
+    "DL": ("Defensive line", "DLine"),
+    "ST": ("Special teams", "SpecialTeams"),
+}
+
+CATEGORY_ORDER = ["passing", "rushing", "receiving", "offense", "defense", "special teams"]
 
 
 def _norm(key: str) -> str:

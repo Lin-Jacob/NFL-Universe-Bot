@@ -28,11 +28,11 @@ MAX_BODY = 2 * 1024 * 1024  # 2 MB
 OnGame = Callable[[int, ParsedGame, bool], Awaitable[None]]
 
 
-def ingest(db: Database, body: str, remote: str | None, default_season: int,
-           source: str = "webhook") -> dict:
-    """Store + parse one payload. Shared by the HTTP handler and /admin import."""
+def ingest(db: Database, body: str, remote: str | None, source: str = "webhook",
+           message_id: int | None = None) -> dict:
+    """Store + parse one payload. Shared by the HTTP handler, the feed channel and /admin import."""
     h = payload_hash(body.encode())
-    raw_id, dup = db.store_raw(body, remote, h)
+    raw_id, dup = db.store_raw(body, remote, h, message_id)
     if dup:
         row = db.raw(raw_id)
         return {"ok": True, "status": "duplicate", "raw_id": raw_id, "game_id": row["game_id"] if row else None}
@@ -41,17 +41,16 @@ def ingest(db: Database, body: str, remote: str | None, default_season: int,
     except json.JSONDecodeError as e:
         db.set_raw_status(raw_id, "failed", f"invalid JSON: {e}")
         return {"ok": False, "status": "failed", "raw_id": raw_id, "error": "invalid JSON"}
-    return parse_raw(db, raw_id, payload, default_season, source)
+    return parse_raw(db, raw_id, payload, source)
 
 
-def parse_raw(db: Database, raw_id: int, payload, default_season: int, source: str = "webhook") -> dict:
+def parse_raw(db: Database, raw_id: int, payload, source: str = "webhook") -> dict:
     try:
         game = parse_payload(payload)
     except ParseError as e:
         db.set_raw_status(raw_id, "failed", str(e))
         return {"ok": False, "status": "failed", "raw_id": raw_id, "error": str(e)}
-    game_id, replaced = db.save_game(game, season=db.current_season(default_season),
-                                     raw_id=raw_id, source=source)
+    game_id, replaced = db.save_game(game, raw_id=raw_id, source=source)
     note = None
     if game.unknown_stats:
         note = "unrecognized stats kept in 'extra': " + ", ".join(sorted(game.unknown_stats))[:500]
@@ -60,14 +59,22 @@ def parse_raw(db: Database, raw_id: int, payload, default_season: int, source: s
             "game_id": game_id, "players": len(game.players), "game": game, "replaced": replaced}
 
 
+def reparse_all(db: Database) -> dict[str, int]:
+    """Parse every stored game payload again (after a parser change). Game numbers are kept."""
+    counts: dict[str, int] = {}
+    for r in db.q("SELECT id, body FROM raw_payloads WHERE status = 'parsed' ORDER BY id"):
+        res = parse_raw(db, r["id"], json.loads(r["body"]))
+        counts[res["status"]] = counts.get(res["status"], 0) + 1
+    return counts
+
+
 class WebhookServer:
-    def __init__(self, db: Database, secret: str, default_season: int,
+    def __init__(self, db: Database, secret: str,
                  host: str = "0.0.0.0", port: int = 8080, on_game: OnGame | None = None):
         if not secret or len(secret) < 12:
             raise ValueError("WEBHOOK_SECRET must be set in .env (at least 12 characters)")
         self.db = db
         self.secret = secret
-        self.default_season = default_season
         self.host, self.port = host, port
         self.on_game = on_game
         self.runner: web.AppRunner | None = None
@@ -119,7 +126,7 @@ class WebhookServer:
         if not body.strip():
             return web.json_response({"ok": False, "error": "empty body"}, status=400)
 
-        result = ingest(self.db, body, remote, self.default_season)
+        result = ingest(self.db, body, remote)
         game = result.pop("game", None)
         replaced = result.pop("replaced", False)
         log.info("Webhook from %s -> %s", remote, result)

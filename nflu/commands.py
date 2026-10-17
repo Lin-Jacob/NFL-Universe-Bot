@@ -11,12 +11,20 @@ from discord.ext import commands
 import config
 
 from . import analytics
-from .embeds import Names, fmt_num, game_embed, game_header, score_line, short_line, stats_block, table
+from .embeds import (Names, displayed, fmt_num, game_embed, player_card, score_line, short_line, stats_block, table,
+                     when)
 from .fantasy import breakdown
-from .stats import STATS, label
+from .stats import POSITIONS, STATS, label
+from .views import Pager
+
+GAMES_PER_PAGE = 8
 
 if TYPE_CHECKING:
     from bot import NFLUBot
+
+
+def _rank(i: int) -> str:
+    return ["🥇", "🥈", "🥉"][i] if i < 3 else f"**{i + 1}.**"
 
 
 async def stat_autocomplete(_: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -43,13 +51,6 @@ class Stats(commands.Cog):
                 break
         return out
 
-    async def team_autocomplete(self, _: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        teams = {r["team"] for r in analytics.standings(self.db, None)}
-        return [app_commands.Choice(name=t, value=t) for t in sorted(teams) if current.lower() in t.lower()][:25]
-
-    def _season(self, season: int | None) -> int:
-        return season if season is not None else self.db.current_season(config.DEFAULT_SEASON)
-
     async def _resolve(self, inter: discord.Interaction, query: str) -> str | None:
         key = self.db.resolve_player(query)
         if not key:
@@ -57,87 +58,112 @@ class Stats(commands.Cog):
         return key
 
     # ------------------------------------------------------------------ games
-    @app_commands.command(name="games", description="Recent game results")
-    @app_commands.describe(team="Only this team's games", season="Season number (default: current)",
-                           count="How many games (max 25)")
-    @app_commands.autocomplete(team=team_autocomplete)
-    async def games(self, inter: discord.Interaction, team: str | None = None, season: int | None = None,
-                    count: app_commands.Range[int, 1, 25] = 10):
-        rows = self.db.recent_games(count, self._season(season), team)
-        if not rows:
-            await inter.response.send_message("No games recorded yet for that filter.")
-            return
-        e = discord.Embed(title=f"Recent games · Season {self._season(season)}" + (f" · {team}" if team else ""),
-                          color=config.EMBED_COLOR)
-        e.description = "\n".join(f"`#{g['id']}` {score_line(g)}" + (f" · Wk {g['week']}" if g["week"] else "")
-                                  for g in rows)
-        e.set_footer(text="Use /game <id> for the box score")
-        await inter.response.send_message(embed=e)
+    async def game_autocomplete(self, _: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
+        cur = current.strip().lstrip("#").lower()
+        out = []
+        for g in self.db.recent_games(limit=100000):
+            label = f"#{g['id']} {score_line(g, bold_winner=False)} · {g['played_at'][:10]}"
+            if cur in label.lower():
+                out.append(app_commands.Choice(name=label[:100], value=g["id"]))
+            if len(out) >= 25:
+                break
+        return out
 
-    @app_commands.command(name="game", description="Full box score for one game")
-    @app_commands.describe(game_id="Game number shown in /games (leave empty for the latest game)")
-    async def game(self, inter: discord.Interaction, game_id: int | None = None):
-        if game_id is None:
-            latest = self.db.recent_games(1)
-            if not latest:
-                await inter.response.send_message("No games recorded yet.")
+    @app_commands.command(name="games", description="Every game played, newest first, with date and time")
+    async def games(self, inter: discord.Interaction):
+        rows = self.db.recent_games(100000)
+        if not rows:
+            await inter.response.send_message("No games recorded yet.")
+            return
+        names = Names(self.db)
+        per_page = GAMES_PER_PAGE
+        pages = (len(rows) + per_page - 1) // per_page
+        title = "Games played"
+
+        def render(page: int) -> discord.Embed:
+            out = []
+            for g in rows[page * per_page:(page + 1) * per_page]:
+                line = f"`#{g['id']}` {score_line(g)}\n🕒 {when(g['played_at'])}"
+                players = self.db.game_players(g["id"])  # sorted by fantasy points
+                if players and players[0]["fantasy_points"] > 0:
+                    line += f" · ⭐ {names(players[0]['username'])} ({fmt_num(players[0]['fantasy_points'])} pts)"
+                out.append(line)
+            e = discord.Embed(title=title, color=config.EMBED_COLOR, description="\n\n".join(out)[:4000])
+            e.set_footer(text=f"Page {page + 1}/{pages} · {len(rows)} games · "
+                              "/inspect_game <#> for a game's full box score")
+            return e
+
+        await Pager(inter.user.id, pages, render).send(inter)
+
+    @app_commands.command(name="inspect_game", description="Box score for one game, or a stat card per player (◀ ▶)")
+    @app_commands.describe(game="Game number from /games (leave empty for the latest game)",
+                           view="Simple: box score, ◀ ▶ flips games. Complex: a full stat card per player, "
+                                "◀ ▶ flips players",
+                           player="Complex view: start on this player")
+    @app_commands.choices(view=[app_commands.Choice(name="Simple (box score)", value="simple"),
+                                app_commands.Choice(name="Complex (player stat cards)", value="complex")])
+    @app_commands.autocomplete(game=game_autocomplete, player=player_autocomplete)
+    async def inspect_game(self, inter: discord.Interaction, game: int | None = None,
+                           view: app_commands.Choice[str] | None = None, player: str | None = None):
+        ids = [g["id"] for g in reversed(self.db.recent_games(limit=100000))]  # oldest -> newest, so ▶ = newer
+        if not ids:
+            await inter.response.send_message("No games recorded yet.")
+            return
+        if game is None:
+            game = ids[-1]
+        if game not in ids:
+            await inter.response.send_message(f"There's no game #{game}. `/games` lists them all.", ephemeral=True)
+            return
+
+        if (view and view.value == "complex") or player:
+            g = self.db.game(game)
+            players = self.db.game_players(game)  # highest points first
+            if not players:
+                await inter.response.send_message(f"Game #{game} has no player stats.", ephemeral=True)
                 return
-            game_id = latest[0]["id"]
-        e = game_embed(self.db, game_id)
-        if not e:
-            await inter.response.send_message(f"No game #{game_id}.", ephemeral=True)
-            return
-        await inter.response.send_message(embed=e)
+            names = Names(self.db)
+            start = 0
+            if player:
+                key = self.db.resolve_player(player)
+                start = next((i for i, p in enumerate(players) if p["username_key"] == key), None)
+                if start is None:
+                    await inter.response.send_message(f"**{player}** didn't play in game #{game}.", ephemeral=True)
+                    return
 
-    @app_commands.command(name="standings", description="Team standings")
-    @app_commands.describe(season="Season number (default: current)")
-    async def standings(self, inter: discord.Interaction, season: int | None = None):
-        rows = analytics.standings(self.db, self._season(season))
-        if not rows:
-            await inter.response.send_message("No games recorded yet this season.")
-            return
-        t = table([[i + 1, r["team"][:18], f"{r['w']}-{r['l']}" + (f"-{r['t']}" if r["t"] else ""),
-                    f"{r['pct']:.3f}", r["pf"], r["pa"], f"{r['diff']:+d}"] for i, r in enumerate(rows)],
-                  ["#", "Team", "W-L", "PCT", "PF", "PA", "DIFF"])
-        await inter.response.send_message(embed=discord.Embed(
-            title=f"Standings · Season {self._season(season)}", description=t, color=config.EMBED_COLOR))
+            def card(page: int) -> discord.Embed:
+                e = player_card(g, players[page], page + 1, len(players), names)
+                e.set_footer(text=f"Player {page + 1} of {len(players)} · ◀ ▶ to flip players · "
+                                  "/inspect_game view:Simple for the box score")
+                return e
 
-    @app_commands.command(name="h2h", description="Head-to-head history between two teams")
-    @app_commands.autocomplete(team_a=team_autocomplete, team_b=team_autocomplete)
-    async def h2h(self, inter: discord.Interaction, team_a: str, team_b: str):
-        games = analytics.head_to_head(self.db, team_a, team_b)
-        if not games:
-            await inter.response.send_message(f"{team_a} and {team_b} haven't played each other yet.")
+            await Pager(inter.user.id, len(players), card, start=start).send(inter)
             return
-        wins_a = sum(1 for g in games if (g["home_team"].lower() == team_a.lower() and g["home_score"] > g["away_score"])
-                     or (g["away_team"].lower() == team_a.lower() and g["away_score"] > g["home_score"]))
-        wins_b = sum(1 for g in games if (g["home_team"].lower() == team_b.lower() and g["home_score"] > g["away_score"])
-                     or (g["away_team"].lower() == team_b.lower() and g["away_score"] > g["home_score"]))
-        e = discord.Embed(title=f"{team_a} vs {team_b}", color=config.EMBED_COLOR,
-                          description=f"**{team_a} {wins_a} – {wins_b} {team_b}**"
-                                      + (f" ({len(games) - wins_a - wins_b} ties)" if len(games) - wins_a - wins_b else ""))
-        e.add_field(name="Games", value="\n".join(f"`#{g['id']}` {score_line(g)} · S{g['season']}" for g in games[:15]))
-        await inter.response.send_message(embed=e)
+
+        def render(page: int) -> discord.Embed:
+            e = game_embed(self.db, ids[page])
+            e.set_footer(text=f"{e.footer.text} · Game {page + 1} of {len(ids)} (◀ older · newer ▶)")
+            return e
+
+        await Pager(inter.user.id, len(ids), render, start=ids.index(game)).send(inter)
 
     # ---------------------------------------------------------------- players
     @app_commands.command(name="player", description="A player's stats and fantasy points")
-    @app_commands.describe(name="Name, Roblox username, or @mention", season="Season (default: current; 0 = career)")
+    @app_commands.describe(name="Name, Roblox username, or @mention")
     @app_commands.autocomplete(name=player_autocomplete)
-    async def player(self, inter: discord.Interaction, name: str, season: int | None = None):
+    async def player(self, inter: discord.Interaction, name: str):
         key = await self._resolve(inter, name)
         if not key:
             return
-        s = None if season == 0 else self._season(season)
-        summ = analytics.player_summary(self.db, key, s)
+        summ = analytics.player_summary(self.db, key)
         names = Names(self.db)
         if not summ:
-            await inter.response.send_message(f"**{names.full(key)}** has no games in season {s}. "
-                                              "Try `season: 0` for career stats.")
+            await inter.response.send_message(f"**{names.full(key)}** has no games yet.")
             return
         e = discord.Embed(title=names.full(summ["username"]), color=config.EMBED_COLOR,
-                          description=f"{'Career' if s is None else f'Season {s}'} · {summ['games']} games · "
-                                      f"{summ['wins']} wins · Teams: {', '.join(summ['teams']) or '?'}")
+                          description=f"{summ['games']} games played")
         e.add_field(name="Fantasy", value=f"Total **{fmt_num(summ['fantasy_total'])}**\n"
+                                          f"Per {config.FANTASY_RATE_SNAPS} snaps **{fmt_num(summ['fantasy_rate'])}**"
+                                          f" ({fmt_num(summ['snaps'])} snaps)\n"
                                           f"Per game **{fmt_num(summ['fantasy_avg'])}**", inline=True)
         b = summ["best_game"]
         e.add_field(name="Best game", value=f"{fmt_num(b['fantasy_points'])} FP · game #{b['game_id']}\n"
@@ -156,47 +182,43 @@ class Stats(commands.Cog):
         names = Names(self.db)
         e = discord.Embed(title=f"Game log · {names.full(lines[0]['username'])}", color=config.EMBED_COLOR)
         e.description = "\n".join(
-            f"`#{ln['game_id']}` {ln['away_team']} {ln['away_score']} @ {ln['home_team']} {ln['home_score']} · "
+            f"`#{ln['game_id']}` {score_line(ln)} · "
             f"**{fmt_num(ln['fantasy_points'])} FP**\n{short_line(ln['stats'])}" for ln in lines)[:4000]
         await inter.response.send_message(embed=e)
 
     @app_commands.command(name="compare", description="Compare two players side by side")
-    @app_commands.describe(season="Season (default: current; 0 = career)")
     @app_commands.autocomplete(player1=player_autocomplete, player2=player_autocomplete)
-    async def compare(self, inter: discord.Interaction, player1: str, player2: str, season: int | None = None):
+    async def compare(self, inter: discord.Interaction, player1: str, player2: str):
         k1, k2 = self.db.resolve_player(player1), self.db.resolve_player(player2)
         if not k1 or not k2:
             await inter.response.send_message(f"Couldn't find **{player1 if not k1 else player2}**.", ephemeral=True)
             return
-        s = None if season == 0 else self._season(season)
-        a, b = analytics.player_summary(self.db, k1, s), analytics.player_summary(self.db, k2, s)
+        a, b = analytics.player_summary(self.db, k1), analytics.player_summary(self.db, k2)
         if not a or not b:
-            await inter.response.send_message("One of those players has no games in that season.")
+            await inter.response.send_message("One of those players has no games yet.")
             return
         names = Names(self.db)
-        keys = [k for k in STATS if a["totals"].get(k) or b["totals"].get(k)]
+        keys = [k for k in STATS if displayed(k) and (a["totals"].get(k) or b["totals"].get(k))]
         rows = [["Games", a["games"], b["games"]],
                 ["Fantasy", fmt_num(a["fantasy_total"]), fmt_num(b["fantasy_total"])],
+                ["Snaps", fmt_num(a["snaps"]), fmt_num(b["snaps"])],
+                [f"FP/{config.FANTASY_RATE_SNAPS} snaps", fmt_num(a["fantasy_rate"]), fmt_num(b["fantasy_rate"])],
                 ["FP/game", fmt_num(a["fantasy_avg"]), fmt_num(b["fantasy_avg"])]]
         rows += [[label(k)[:18], fmt_num(a["totals"].get(k, 0)), fmt_num(b["totals"].get(k, 0))] for k in keys]
         e = discord.Embed(title=f"{names(a['username'])} vs {names(b['username'])}",
                           description=table(rows, ["", names(a["username"])[:14], names(b["username"])[:14]]),
                           color=config.EMBED_COLOR)
-        e.set_footer(text="Career" if s is None else f"Season {s}")
         await inter.response.send_message(embed=e)
 
     # ------------------------------------------------------------ leaderboards
     @app_commands.command(name="leaders", description="Stat leaders")
-    @app_commands.describe(stat="Which stat", season="Season (default: current; 0 = all-time)",
-                           per_game="Rank by per-game average instead of totals")
+    @app_commands.describe(stat="Which stat", per_game="Rank by per-game average instead of totals")
     @app_commands.autocomplete(stat=stat_autocomplete)
-    async def leaders(self, inter: discord.Interaction, stat: str, season: int | None = None,
-                      per_game: bool = False):
+    async def leaders(self, inter: discord.Interaction, stat: str, per_game: bool = False):
         if stat != "fantasy" and stat not in STATS:
             await inter.response.send_message("Pick a stat from the list.", ephemeral=True)
             return
-        s = None if season == 0 else self._season(season)
-        rows = analytics.leaders(self.db, stat, s, 10, per_game)
+        rows = analytics.leaders(self.db, stat, 10, per_game)
         if not rows:
             await inter.response.send_message("Nobody has recorded that stat yet.")
             return
@@ -206,24 +228,59 @@ class Stats(commands.Cog):
                           color=config.EMBED_COLOR,
                           description="\n".join(f"**{i + 1}.** {names(n)} · **{fmt_num(v)}** ({g} GP)"
                                                 for i, (n, v, g) in enumerate(rows)))
-        e.set_footer(text="All-time" if s is None else f"Season {s}")
         await inter.response.send_message(embed=e)
 
-    @app_commands.command(name="fantasy", description="Fantasy points leaderboard")
-    @app_commands.describe(season="Season (default: current)", week="Only this week")
-    async def fantasy(self, inter: discord.Interaction, season: int | None = None, week: int | None = None):
-        s = self._season(season)
-        rows = analytics.fantasy_week(self.db, s, week, 15)
-        if not rows:
-            await inter.response.send_message("No fantasy points recorded for that filter yet.")
+    @app_commands.command(name="fantasy", description="Fantasy leaderboard by points per snap (fair for late joiners)")
+    async def fantasy(self, inter: discord.Interaction):
+        ranked, short = analytics.fantasy_rates(self.db)
+        if not ranked and not short:
+            await inter.response.send_message("No fantasy points recorded yet.")
             return
         names = Names(self.db)
-        e = discord.Embed(title=f"Fantasy leaderboard · Season {s}" + (f" · Week {week}" if week else ""),
-                          color=config.EMBED_COLOR,
+        per = config.FANTASY_RATE_SNAPS
+        e = discord.Embed(title=f"Fantasy leaderboard · points per {per} snaps", color=config.EMBED_COLOR,
                           description="\n".join(
-                              f"{['🥇', '🥈', '🥉'][i] if i < 3 else f'**{i + 1}.**'} {names(n)} · "
-                              f"**{fmt_num(v)}** FP ({g} GP, {fmt_num(v / g)}/g)"
-                              for i, (n, v, g) in enumerate(rows)))
+                              f"{_rank(i)} {names.dashed(r['username'])} · **{fmt_num(r['rate'])}**\n"
+                              f"{fmt_num(r['points'])} pts in {fmt_num(r['snaps'])} snaps ({r['games']} GP)"
+                              for i, r in enumerate(ranked[:15]))[:4000] or "Nobody has enough snaps yet.")
+        if short:
+            value = "\n".join(f"{names.dashed(r['username'])} · {fmt_num(r['rate'])} "
+                              f"({fmt_num(r['points'])} pts, {fmt_num(r['snaps'])} snaps)" for r in short)
+            e.add_field(name=f"Not enough snaps yet (under {config.FANTASY_MIN_SNAPS})", value=value[:1024],
+                        inline=False)
+        e.set_footer(text=f"Ranked by fantasy points per {per} snaps on the field, so joining a game late "
+                          "doesn't cost you. A full game is about 130-145 snaps.")
+        await inter.response.send_message(embed=e)
+
+    @app_commands.command(name="stats", description="Position leaderboards (QB, RB, WR, DB, DL, ST) ranked by points")
+    @app_commands.describe(position="Show the full ranking for one position")
+    @app_commands.choices(position=[app_commands.Choice(name=f"{code} · {title}", value=code)
+                                    for code, (title, _) in POSITIONS.items()])
+    async def stats(self, inter: discord.Interaction, position: app_commands.Choice[str] | None = None):
+        names = Names(self.db)
+
+        def lines(rows: list[dict]) -> list[str]:
+            return [f"{_rank(i)} {names(r['username'])} · **{fmt_num(r['points'])}** pts ({r['games']} GP)\n"
+                    f"{short_line(r['stats'])}" for i, r in enumerate(rows)]
+
+        if position:
+            code = position.value
+            rows = analytics.position_leaders(self.db, code, 15)
+            e = discord.Embed(title=f"{code} · {POSITIONS[code][0]}", color=config.EMBED_COLOR,
+                              description="\n".join(lines(rows))[:4000] or "No one has scored at this position yet.")
+        else:
+            e = discord.Embed(title="Position leaderboards", color=config.EMBED_COLOR,
+                              description="Fantasy points earned at each position across all games. "
+                                          "Use `/stats position:` for a full ranking.")
+            for code, (title, _) in POSITIONS.items():
+                value, out = "", lines(analytics.position_leaders(self.db, code, 5))
+                for ln in out:  # keep whole entries within Discord's 1024-character field limit
+                    if len(value) + len(ln) + 1 > 1024:
+                        break
+                    value += ln + "\n"
+                e.add_field(name=f"{code} · {title}", value=value or "No one yet", inline=False)
+        e.set_footer(text="Positions come from the NFL Universe stat sheet: Passing, Rushing, Receiving, "
+                          "Cornerback, DLine, Special Teams")
         await inter.response.send_message(embed=e)
 
     @app_commands.command(name="points", description="How a player's fantasy points were scored in a game")
@@ -238,22 +295,28 @@ class Stats(commands.Cog):
         if not line:
             await inter.response.send_message("That player has no stats in that game.", ephemeral=True)
             return
-        rows = [[label(s) if s in STATS else s, fmt_num(v), f"{p:+.2f}"] for s, v, p in breakdown(line["stats"])]
+        rows = [[s, fmt_num(v), f"{p:+.2f}"] for s, v, p in breakdown(line["stats"], line["pos_stats"])]
         names = Names(self.db)
         e = discord.Embed(title=f"{names(line['username'])} · {fmt_num(line['fantasy_points'])} FP",
-                          description=f"Game #{line['game_id']}: {line['away_team']} {line['away_score']} @ "
-                                      f"{line['home_team']} {line['home_score']}\n" +
+                          description=f"Game #{line['game_id']}: {score_line(line)}\n" +
                                       table(rows, ["Stat", "Value", "Pts"]),
                           color=config.EMBED_COLOR)
         await inter.response.send_message(embed=e)
 
     @app_commands.command(name="scoring", description="Show the fantasy scoring rules")
     async def scoring(self, inter: discord.Interaction):
-        rows = [[label(k), f"{v:+g}"] for k, v in config.FANTASY_SCORING.items() if v]
-        rows += [[f"{label(s)} ≥ {t:g}", f"{b:+g} bonus"] for s, t, b in config.FANTASY_BONUSES]
-        await inter.response.send_message(embed=discord.Embed(
-            title="Fantasy scoring (per unit)", description=table(rows, ["Stat", "Points"]),
-            color=config.EMBED_COLOR))
+        e = discord.Embed(title="Fantasy scoring (points per unit, by position)", color=config.EMBED_COLOR,
+                          description="Each stat counts toward the position group it was earned in. "
+                                      "Stats not listed are worth 0.")
+        for code, (title, section) in POSITIONS.items():
+            rows = [[label(k), f"{v:+g}"] for k, v in config.FANTASY_SCORING.get(code, {}).items() if v]
+            if rows:
+                e.add_field(name=f"{code} · {title} ({section})", value=table(rows, ["Stat", "Pts"])[:1024],
+                            inline=True)
+        bonuses = [[f"{label(s)} ≥ {t:g}", f"{b:+g}"] for s, t, b in config.FANTASY_BONUSES]
+        if bonuses:
+            e.add_field(name="Single-game bonuses", value=table(bonuses, ["Stat", "Pts"])[:1024], inline=False)
+        await inter.response.send_message(embed=e)
 
     # ------------------------------------------------------------------ names
     @app_commands.command(name="names", description="Who's who: Roblox usernames and real names")
@@ -283,26 +346,42 @@ class Stats(commands.Cog):
         await inter.response.send_message(msg, allowed_mentions=discord.AllowedMentions.none())
 
     @app_commands.command(name="me", description="Your own stats (needs your Discord account linked by an admin)")
-    @app_commands.describe(season="Season (default: current; 0 = career)")
-    async def me(self, inter: discord.Interaction, season: int | None = None):
+    async def me(self, inter: discord.Interaction):
         row = self.db.name_for_discord(inter.user.id)
         if not row:
             await inter.response.send_message("Your Discord account isn't linked to a Roblox username yet. "
                                               "Ask an admin to run `/admin setname` with your @.", ephemeral=True)
             return
-        await self.player.callback(self, inter, row["roblox_username"], season)
+        await self.player.callback(self, inter, row["roblox_username"])
 
     @app_commands.command(name="help", description="What this bot can do")
     async def help(self, inter: discord.Interaction):
-        e = discord.Embed(title="NFL Universe stats bot", color=config.EMBED_COLOR, description=(
-            "**Games**\n"
-            "`/games` recent results · `/game` box score · `/standings` · `/h2h` team vs team\n"
-            "**Players**\n"
-            "`/player` stats · `/me` your stats · `/gamelog` · `/compare` two players\n"
-            "**Leaderboards**\n"
-            "`/leaders` any stat · `/fantasy` fantasy standings · `/points` fantasy breakdown · `/scoring`\n"
-            "**Names**\n"
-            "`/names` everyone's mapped name · `/whois` look someone up\n"
-            "**Admins**\n"
-            "`/admin …` manage names, games, stats, seasons and the webhook"))
+        e = discord.Embed(title="NFL Universe stats bot", color=config.EMBED_COLOR,
+                          description="Every NFL Universe game posted in the feed channel is saved automatically.")
+        e.add_field(name="🏈 Games", inline=False, value=(
+            "`/games` every game played with date & time (◀ ▶ to page)\n"
+            "`/inspect_game [#]` full box score (latest if empty, ◀ ▶ for other games)\n"
+            "`/inspect_game [#] view:Complex` a full stat card per player (◀ ▶ to flip players)"))
+        e.add_field(name="📊 Leaderboards", inline=False, value=(
+            "`/stats [position]` QB, RB, WR, DB, DL and ST rankings by points\n"
+            "`/fantasy` fantasy leaderboard by points per 100 snaps (fair if you joined late)\n"
+            "`/leaders stat` top 10 in any single stat"))
+        e.add_field(name="👤 Players", inline=False, value=(
+            "`/player name` a player's totals, fantasy points and best game\n"
+            "`/gamelog name` their recent games · `/compare a b` side by side\n"
+            "`/points name [game_id]` how their points were scored · `/me` your own stats"))
+        e.add_field(name="ℹ️ Info", inline=False, value=(
+            "`/scoring` fantasy scoring by position (INTs and missed FGs subtract)\n"
+            "`/names` real names ↔ Roblox usernames · `/whois query` look someone up"))
+        if inter.user.id in config.ADMIN_IDS:
+            e.add_field(name="🔧 Admin (only you can see this)", inline=False, value=(
+                "`/admin test` dry-run the latest game post (checks the feed works, saves nothing)\n"
+                "`/admin backfill` import past game posts · `/admin reparseall` re-read saved games\n"
+                "`/admin setname` / `removename` / `unmapped` player names\n"
+                "`/admin addgame` / `editgame` / `deletegame` / `setstat` / `removeplayer` fix games "
+                "(master admin only)\n"
+                "`/admin intfault` move an INT's −2 to the player at fault, or excuse it · `intfaults` · "
+                "`removeintfault`\n"
+                "`/admin import` · `rawlog` · `raw` · `reparse` raw game data\n"
+                "`/admin channel` · `announce` · `recalc` · `admins` · `webhookurl` settings"))
         await inter.response.send_message(embed=e, ephemeral=True)

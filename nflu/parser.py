@@ -11,6 +11,7 @@ parser, then run /admin reparse.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import re
@@ -32,6 +33,8 @@ class ParsedPlayer:
     position: str | None = None
     stats: dict[str, float] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)  # numeric keys we didn't recognize
+    # Same stats split by the position they were earned at (QB/RB/WR/DB/DL/ST), when the source says so
+    pos_stats: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -41,7 +44,6 @@ class ParsedGame:
     away_team: str
     home_score: int
     away_score: int
-    season: int | None = None
     week: int | None = None
     played_at: str | None = None
     players: list[ParsedPlayer] = field(default_factory=list)
@@ -199,6 +201,9 @@ def parse_payload(payload: Any) -> ParsedGame:
         else:
             break
 
+    if isinstance(payload.get("nfl_universe"), dict):
+        return _parse_nflu(payload["nfl_universe"])
+
     if "embeds" in payload or "content" in payload and not _get(payload, "home", "teams", "players"):
         return _parse_discord_style(payload)
 
@@ -271,7 +276,6 @@ def parse_payload(payload: Any) -> ParsedGame:
         away_team=str(away_name or "Away"),
         home_score=_int(home_score),
         away_score=_int(away_score),
-        season=_int(_get(payload, "season", "szn"), default=0) or None,
         week=_int(_get(payload, "week", "round", "gameweek"), default=0) or None,
         played_at=_str_or_none(_get(payload, "timestamp", "time", "date", "playedat", "played_at", "endedat", "ended_at")),
         players=_merge_players(players),
@@ -364,6 +368,227 @@ def _parse_discord_style(payload: dict) -> ParsedGame:
     for p in players:
         game.unknown_stats.update(p.extra.keys())
     return game
+
+
+# ---------------------------------------------------------------------------
+# NFL Universe Football's own Discord feed
+# ---------------------------------------------------------------------------
+# The game posts two webhook messages per game: a CSV attachment with per-player
+# stats (sections Passing, Rushing, Receiving, Cornerback, DLine, SpecialTeams),
+# then an embed titled "<Team A> vs <Team B>" with a "Scoring History" table.
+# bot.py pairs them into {"nfl_universe": {"embed": {...}, "csv": "..."}}.
+# The CSV has no team column, so players are stored without a team.
+
+# (section, column) -> canonical stat, for every column on NFL Universe's stat sheet.
+# The same stat name can appear in several sections (e.g. "tackles" in Cornerback and
+# DLine, "third_down_conv" in Passing/Rushing/Receiving); each is scored by the
+# position group it came from (config.FANTASY_SCORING). Unknown future columns go to 'extra'.
+_NFLU_COLUMNS: dict[tuple[str, str], str] = {
+    # Passing -> QB
+    ("passing", "completions"): "pass_completions",
+    ("passing", "attempts"): "pass_attempts",
+    ("passing", "passingyards"): "pass_yards",
+    ("passing", "touchdowns"): "pass_tds",
+    ("passing", "interceptions"): "interceptions",
+    ("passing", "fumbles"): "fumbles",
+    ("passing", "interceptiontds"): "pick_sixes_thrown",
+    ("passing", "sackstaken"): "sacks_taken",
+    ("passing", "3rddownconv"): "third_down_conv",
+    ("passing", "4thdownconv"): "fourth_down_conv",
+    ("passing", "longestthrow"): "longest_pass",
+    ("passing", "15ydatts"): "pass_att_lt15",   # "<15 YD ATTs" (symbols are stripped)
+    ("passing", "15ydcmps"): "pass_cmp_lt15",
+    ("passing", "35ydatts"): "pass_att_lt35",
+    ("passing", "35ydcmps"): "pass_cmp_lt35",
+    ("passing", "50ydatts"): "pass_att_lt50",
+    ("passing", "50ydcmps"): "pass_cmp_lt50",
+    # ">50 YD ATTs/CMPs" normalize the same as "<50": told apart by column order below
+    # Rushing -> RB
+    ("rushing", "rushingattempts"): "rush_attempts",
+    ("rushing", "rushingyards"): "rush_yards",
+    ("rushing", "touchdowns"): "rush_tds",
+    ("rushing", "carriesover20"): "rush_20plus",
+    ("rushing", "3rddownconv"): "third_down_conv",
+    ("rushing", "4thdownconv"): "fourth_down_conv",
+    ("rushing", "fumbles"): "fumbles",
+    ("rushing", "rushingfirstdowns"): "rush_first_downs",
+    ("rushing", "longestrush"): "longest_rush",
+    # Receiving -> WR
+    ("receiving", "receptionss"): "receptions",  # sic, the game's header has the typo
+    ("receiving", "receptions"): "receptions",
+    ("receiving", "targets"): "targets",
+    ("receiving", "touchdowns"): "rec_tds",
+    ("receiving", "receivingyards"): "rec_yards",
+    ("receiving", "fumbles"): "fumbles",
+    ("receiving", "yardsaftercatch"): "yac",
+    ("receiving", "receivingfirstdowns"): "rec_first_downs",
+    ("receiving", "longestreception"): "longest_rec",
+    ("receiving", "catchesintraffic"): "catches_in_traffic",
+    ("receiving", "drops"): "drops",
+    ("receiving", "interceptionsallowed"): "ints_allowed",
+    ("receiving", "tossups"): "toss_ups",
+    ("receiving", "3rddownconv"): "third_down_conv",
+    ("receiving", "4thdownconv"): "fourth_down_conv",
+    ("receiving", "15ydrecs"): "rec_lt15",
+    ("receiving", "35ydrecs"): "rec_lt35",
+    ("receiving", "50ydrecs"): "rec_lt50",
+    # Cornerback -> DB
+    ("cornerback", "tackles"): "tackles",
+    ("cornerback", "tacklesforloss"): "tfl",
+    ("cornerback", "tacklesforlossyards"): "tfl_yards",
+    ("cornerback", "passbreakups"): "pass_deflections",
+    ("cornerback", "interceptions"): "def_ints",
+    ("cornerback", "interceptiontds"): "def_tds",
+    ("cornerback", "intsintraffic"): "ints_in_traffic",
+    ("cornerback", "interceptionyards"): "int_return_yards",
+    ("cornerback", "longestinterceptionreturn"): "longest_int_return",
+    ("cornerback", "completionsallowed"): "completions_allowed",
+    ("cornerback", "targets"): "targets_allowed",
+    ("cornerback", "passingyardsallowed"): "pass_yards_allowed",
+    ("cornerback", "passingtouchdownsallowed"): "pass_tds_allowed",
+    ("cornerback", "tossups"): "toss_ups_def",
+    # DLine -> DL
+    ("dline", "tackles"): "tackles",
+    ("dline", "tacklesforloss"): "tfl",
+    ("dline", "tacklesforlossyards"): "tfl_yards",
+    ("dline", "rushes"): "pass_rushes",
+    ("dline", "sacks"): "sacks",
+    ("dline", "sacklossyards"): "sack_yards",
+    ("dline", "quarterbackhits"): "qb_hits",
+    ("dline", "swats"): "pass_deflections",
+    ("dline", "qbpressures"): "qb_pressures",
+    ("dline", "safeties"): "safeties",
+    ("dline", "fumblesforced"): "forced_fumbles",
+    ("dline", "fumblesrecovered"): "fumble_recoveries",
+    ("dline", "fumblesyards"): "fumble_return_yards",
+    ("dline", "fumbletouchdowns"): "def_tds",
+    # SpecialTeams -> ST ("Field Goals" made/attempted is handled separately)
+    ("specialteams", "fieldgoalyards"): "fg_yards",
+    ("specialteams", "longestfieldgoal"): "longest_fg",
+    ("specialteams", "kickreturns"): "kick_returns",
+    ("specialteams", "kickreturnyards"): "kick_return_yards",
+    ("specialteams", "kickreturntouchdowns"): "kick_return_tds",
+    ("specialteams", "puntreturns"): "punt_returns",
+    ("specialteams", "puntreturnyards"): "punt_return_yards",
+    ("specialteams", "puntreturntouchdowns"): "punt_return_tds",
+    ("specialteams", "puntblocks"): "punt_blocks",
+    ("specialteams", "kicks"): "kickoffs",
+    ("specialteams", "kicktouchbacks"): "touchbacks",
+    ("specialteams", "punts"): "punts",
+    ("specialteams", "puntyards"): "punt_yards",
+    ("specialteams", "puntsin10ydline"): "punts_inside_10",
+    ("specialteams", "longestpunt"): "longest_punt",
+    ("specialteams", "onsiderecoveries"): "onside_recoveries",
+    ("specialteams", "onsiderecoveryyards"): "onside_recovery_yards",
+}
+# Columns whose header starts with ">" (over 50 yards): "<50" and ">50" normalize alike.
+_NFLU_OVER50 = {"passing": {"50ydatts": "pass_att_gt50", "50ydcmps": "pass_cmp_gt50"},
+                "receiving": {"50ydrecs": "rec_gt50"}}
+# Averages and percentages are derived from other columns, so they aren't stored or scored.
+_NFLU_DERIVED = {("rushing", "averageyards"), ("specialteams", "fieldgoalpercent"),
+                 ("specialteams", "kickreturnaverage"), ("specialteams", "puntreturnaverage")}
+
+
+# CSV section -> position it counts toward in /stats
+_NFLU_SECTION_POS = {"passing": "QB", "rushing": "RB", "receiving": "WR",
+                     "cornerback": "DB", "dline": "DL", "specialteams": "ST"}
+
+
+def _add(p: ParsedPlayer, pos: str | None, stat: str, n: float) -> None:
+    p.stats[stat] = p.stats.get(stat, 0) + n
+    if pos:
+        ps = p.pos_stats.setdefault(pos, {})
+        ps[stat] = ps.get(stat, 0) + n
+
+
+def _parse_nflu_csv(text: str) -> list[ParsedPlayer]:
+    players: dict[str, ParsedPlayer] = {}
+    blocks = re.split(r"\r?\n\s*\r?\n", text.strip())
+    for block in blocks:
+        lines = [ln for ln in block.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            continue
+        section = lines[0].strip().strip('"')
+        sec = _norm(section)
+        pos = _NFLU_SECTION_POS.get(sec)
+        rows = list(csv.reader(lines[1:]))
+        header = rows[0]
+        for row in rows[1:]:
+            if not row or not row[0].strip():
+                continue
+            uname = row[0].strip()
+            p = players.setdefault(uname.lower(), ParsedPlayer(username=uname))
+            for col, val in zip(header[1:], row[1:]):
+                if not col.strip():
+                    continue
+                col_n = _norm(col)
+                val = val.strip()
+                if (sec, col_n) in _NFLU_DERIVED:
+                    continue
+                if sec == "specialteams" and col_n == "fieldgoals":
+                    m = re.fullmatch(r"(\d+)\s*/\s*(\d+)", val)
+                    if m:
+                        made, att = int(m.group(1)), int(m.group(2))
+                        _add(p, pos, "fg_made", made)
+                        _add(p, pos, "fg_missed", att - made)
+                    continue
+                n = _num(val.rstrip("%"))
+                if n is None:
+                    continue
+                if col.strip().startswith(">") and col_n in _NFLU_OVER50.get(sec, {}):
+                    canon = _NFLU_OVER50[sec][col_n]
+                else:
+                    canon = _NFLU_COLUMNS.get((sec, col_n))
+                if col_n == "snaps":
+                    _add(p, pos, "snaps", n)  # per position, and the total for /fantasy's per-snap rate
+                    p.extra["Snaps"] = p.extra.get("Snaps", 0) + n
+                elif canon:
+                    _add(p, pos, canon, n)
+                elif n:
+                    p.extra[f"{section} {col.strip()}"] = n
+    for p in players.values():
+        p.stats = {k: v for k, v in p.stats.items() if v}
+        p.pos_stats = {pos: nonzero for pos, st in p.pos_stats.items()
+                       if (nonzero := {k: v for k, v in st.items() if v})}
+    return list(players.values())
+
+
+def _parse_nflu(feed: dict) -> ParsedGame:
+    embed = feed.get("embed") or {}
+    title = _strip_md(embed.get("title") or "")
+    m = re.fullmatch(r"\s*(.+?)\s+vs\.?\s+(.+?)\s*", title)
+    if not m:
+        raise ParseError(f"NFL Universe embed title isn't '<team> vs <team>': {title!r}")
+    home, away = m.group(1), m.group(2)
+
+    fields = {_norm(f.get("name", "")): str(f.get("value", "")) for f in embed.get("fields") or []
+              if isinstance(f, dict)}
+    # Scoring History rows look like "Browns    0   0   0   0   0   0" (Q1..Q4, OT, F).
+    finals: list[tuple[str, int]] = []
+    for line in _strip_md(fields.get("scoringhistory", "")).splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1].isdigit() and not parts[0].startswith("#"):
+            name_parts = [x for x in parts if not x.isdigit()]
+            finals.append((" ".join(name_parts), int(parts[-1])))
+    scores: dict[str, int] = {}
+    for i, (short, pts) in enumerate(finals[:2]):
+        s = short.lower()
+        if home.lower().endswith(s) or s in home.lower():
+            scores.setdefault("home", pts)
+        elif away.lower().endswith(s) or s in away.lower():
+            scores.setdefault("away", pts)
+        else:
+            scores.setdefault("home" if i == 0 else "away", pts)
+
+    server_id = fields.get("serverid", "").strip()
+    played_at = embed.get("timestamp")
+    players = _parse_nflu_csv(feed["csv"]) if feed.get("csv") else []
+    return ParsedGame(
+        external_id=f"nflu:{server_id}:{played_at}" if played_at else None,
+        home_team=home, away_team=away,
+        home_score=scores.get("home", 0), away_score=scores.get("away", 0),
+        played_at=played_at, players=players,
+    )
 
 
 def payload_hash(body: bytes) -> str:
