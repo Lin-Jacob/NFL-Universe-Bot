@@ -22,6 +22,9 @@ MASTER_ADMIN_IDS: list[int] = [
     532388408945803275,  # Jacob
 ]
 
+# Claude model for /asknfl ("" = your subscription's default; or e.g. "opus", "sonnet").
+ASKNFL_MODEL: str = "sonnet"
+
 # ---------------------------------------------------------------------------
 # Fantasy scoring
 # ---------------------------------------------------------------------------
@@ -86,7 +89,7 @@ FANTASY_SCORING: dict[str, dict[str, float]] = {
         "drops": 0,
         "ints_allowed": 0,           # the game's own count of picks on this receiver
         "toss_ups": 0,
-        "fumbles": 0,
+        "fumbles": -2,
         "third_down_conv": 0,
         "fourth_down_conv": 0,
         "longest_rec": 0,
@@ -97,7 +100,7 @@ FANTASY_SCORING: dict[str, dict[str, float]] = {
         "snaps": 0,
     },
     "DB": {
-        "tackles": 1,
+        "tackles": 0,
         "def_ints": 3,
         "pass_deflections": 1,       # pass break-ups
         "def_tds": 6,                # pick-sixes
@@ -162,12 +165,23 @@ FANTASY_RATE_SNAPS: int = 100
 # yet" instead of ranked, so a few lucky snaps can't top the board.
 FANTASY_MIN_SNAPS: int = 0
 
+# /odds: win chances for two lineups, from each player's fantasy points per full game.
+ODDS_FULL_GAME_SNAPS: int = 130  # a full game is about this many snaps (the median here is ~129)
+ODDS_MIN_GAME_SNAPS: int = 30    # games where a player had fewer snaps are too short to judge
+# How strongly a player with few games is pulled toward the league average: like adding
+# this many average games to their record. Higher = more cautious odds.
+ODDS_PRIOR_GAMES: float = 2
+# Roles matter: players keep their usual role. A player is a QB if they spend at least
+# this share of their offense snaps at QB (currently Stewie, Gabe and DJ); the rest catch.
+# A team passes at its best QB's level, and receivers' output scales with it.
+ODDS_QB_SHARE: float = 0.4
+# A role a player has never played is rated at this fraction of the league average for it;
+# a team with no QB passes at this fraction of an average QB.
+ODDS_UNPROVEN_ROLE: float = 0.5
+
 # Bonus points when a single-game stat reaches a threshold.
 FANTASY_BONUSES: list[tuple[str, float, float]] = [
     # (stat, threshold, bonus points)
-    ("pass_yards", 300, 3),
-    ("rush_yards", 100, 3),
-    ("rec_yards", 100, 3),
 ]
 
 # ---------------------------------------------------------------------------
@@ -178,6 +192,17 @@ FANTASY_BONUSES: list[tuple[str, float, float]] = [
 # (or on /admin recalc). Overrides the same IGN set with /admin setname.
 PLAYER_NAMES: dict[str, str] = {
     "Jacob": "roblox_user_759822057",
+    "Chris": "Heroichades1",
+    "Rhea": "tigerlillyloud",
+    "Gabe": "Rojedx785",
+    "Ethan Sze": "EthanPlayzOfficialYT",
+    "Stewie": "banspd4963",
+    "Rithik": "JJonahJameson_Jr",
+    "Nate": "evhmlh",
+    "Ryan": "Brawlv4",
+    "DJ": "manofwaste",
+    "Aaron": "conkydood",
+    "Anth": "anthonyalpha"
 }
 
 # ---------------------------------------------------------------------------
@@ -188,6 +213,16 @@ PLAYER_NAMES: dict[str, str] = {
 # If you delete and recreate the webhook, its ID changes: right-click the
 # author name on a game post > "Copy User ID" and paste it here.
 NFLU_WEBHOOK_ID: int = 1560835578579394611
+
+# Only games played in these NFL Universe servers are saved. Each game's summary
+# message shows its "Server Id" (e.g. EBA64F); games from any other server (a
+# test or pickup game) are ignored. Add more IDs to accept several servers.
+# Leave the list empty to accept games from any server.
+NFLU_SERVER_IDS: list[str] = [
+    "EBA64F",
+    "5088EC",
+    "3826BE",
+]
 
 # ---------------------------------------------------------------------------
 # Misc

@@ -36,12 +36,6 @@ class Pager(discord.ui.View):
         self._sync()
         await inter.response.edit_message(embed=self.render(self.page), view=self)
 
-    async def interaction_check(self, inter: discord.Interaction) -> bool:
-        if inter.user.id == self.owner_id:
-            return True
-        await inter.response.send_message("Run the command yourself to flip through it.", ephemeral=True)
-        return False
-
     async def on_timeout(self) -> None:
         for item in self.children:
             item.disabled = True

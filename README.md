@@ -21,6 +21,7 @@ It runs entirely on your own computer. You do **not** need a domain: when the bo
 4. **Copy `.env.example` to `.env`** and fill in:
    - `DISCORD_TOKEN`: the token from step 3.
    - `GUILD_ID`: your server ID (turn on Developer Mode, right-click the server → Copy Server ID). This makes slash commands show up instantly.
+   - The bot only re-registers slash commands with Discord when they've changed, because Discord limits how often that can happen. If commands ever go missing, set `FORCE_COMMAND_SYNC=1`, restart once, then remove it.
    - `WEBHOOK_SECRET`: a long random string. Generate one with
      `python -c "import secrets; print(secrets.token_urlsafe(24))"`
 5. **Add yourself as an admin** in `config.py`:
@@ -84,6 +85,8 @@ The bot then reads the posts from that webhook (set its ID as `NFLU_WEBHOOK_ID` 
 
 NFL Universe posts each game as two messages: a `.csv` file with every player's stats, then a "Team A vs Team B" embed with the score. The bot pairs them up. The CSV doesn't say which team a player was on, so player stats are saved without a team. Games posted while the bot was offline can be imported with `/admin backfill`.
 
+Only games from your own NFL Universe servers are saved. The score embed shows a **Server Id** (for example `EBA64F`). List the ones that count in `NFLU_SERVER_IDS` in `config.py`, and games from any other server (test or pickup games) are ignored. You can list as many servers as you like, and case doesn't matter. An empty list accepts every server. Ignored games aren't stored, so if you add a server later, `/admin backfill` can still import its past games. `/admin test` shows the latest game's Server Id and whether it's allowed.
+
 ---
 
 ## 3. Webhook payload format
@@ -134,7 +137,7 @@ Notes:
 |---|---|
 | `/games` | Every game played, newest first, with the date and time (in each viewer's time zone) and top player. ◀ ▶ buttons page through long lists |
 | `/inspect_game [game] [view] [player]` | One game (latest if empty). **Simple** (default): the box score, with ◀ ▶ flipping to older / newer games. **Complex**: a stat card per player showing the matchup, fantasy points, rank in the game, snaps and every stat they recorded grouped by position (QB/RB/WR/DB/DL/ST) with points per group, with ◀ ▶ flipping between players (best first). `player` starts the cards on that player |
-| `/player name` | Career stats, fantasy totals, best game |
+| `/player [name] [view]` | **Simple** (default): career stats, fantasy totals, best game. **Complex**: a career card with every stat combined over all games, grouped by position (QB/RB/WR/DB/DL/ST), each shown as total · per-game average (longest plays show best · average), plus points per group, snaps, points per 100 snaps and best game. ◀ ▶ flips between players in `/fantasy` order, starting on `name` (or #1 if empty) |
 | `/me` | Your own stats (once an admin links your Discord account) |
 | `/gamelog name [count]` | A player's recent games |
 | `/compare player1 player2` | Side-by-side stats |
@@ -143,7 +146,9 @@ Notes:
 | `/stats [position]` | Position leaderboards: QB (Passing), RB (Rushing), WR (Receiving), DB (Cornerback), DL (DLine), ST (Special Teams), ranked by fantasy points earned at that position |
 | `/points name [game_id]` | How a player's fantasy points were scored |
 | `/scoring` | Fantasy scoring rules |
+| `/odds team1 team2` | Win chances for two lineups. List each team's players separated by commas (real names or Roblox usernames, with autocomplete). Shows each team's win %, moneyline and decimal odds, projected fantasy points, and each player's rating. See "Matchup odds" below |
 | `/names`, `/whois query` | Who's who |
+| `/asknfl prompt [public]` | **Owner only** (`ASKNFL_USER_IDS` in `config.py`). Ask Claude a question about the league's stats. It runs the Claude Code CLI (`claude`) on this PC with your own Claude subscription. See "Ask the stats (/asknfl)" below |
 | `/help` | Command overview |
 
 Anywhere a player name is asked for you can type a mapped real name, a Roblox username, or an @mention, and it autocompletes.
@@ -190,7 +195,7 @@ Every column on the stat sheet is listed in its group, including drops, yards af
 
 The penalties are interceptions charged (−2) and missed field goals (−2). Negative yardage never costs points. The stat sheet has no extra points or 2-point conversions, so those can't be scored. Averages and percentages (yards per carry, FG %) aren't stored, because they're worked out from other columns.
 
-`/scoring` shows every non-zero value by group, and `/points` shows which group each point came from. `/admin setstat` takes an optional `position` for stats that exist in more than one group, such as tackles.
+`/scoring` shows every value by group, zeros included, and `/points` shows which group each point came from. `/admin setstat` takes an optional `position` for stats that exist in more than one group, such as tackles.
 
 ### Points per snap
 
@@ -222,6 +227,32 @@ PLAYER_NAMES = {
 ```
 
 Restart the bot or run `/admin recalc`. Commands like `/player` then accept either the name or the IGN. `/admin setname` does the same thing from Discord, and can also link a Discord account for `/me`.
+
+### Matchup odds (/odds)
+
+`/odds team1:"Chris, Gabe, Jacob" team2:"DJ, Ethan, Stewie"` estimates which lineup wins:
+
+1. **Each team is just a list of players**, and everyone keeps their **usual role**. A player counts as a QB if at least `ODDS_QB_SHARE` (40%) of their offense snaps were at QB. That's currently Stewie, Gabe and DJ, worked out from the stats rather than a fixed list. Everyone else is a receiver.
+2. **The QBs throw, one at a time:** a team passes at its best QB's level, and any other QBs on it catch instead. **Receivers only produce as well as their QB throws**: their output is scaled by the QB's quality, from 20% to 150% of average. Three great receivers with no QB are therefore an underdog, not a favorite. The embed warns when a team has no QB.
+3. **Everyone plays defense and special teams**, rated per snap on their own history there.
+4. **Unproven roles:** a team with no QB passes at `ODDS_UNPROVEN_ROLE` (default 0.5) of an average QB, and a role someone has never played is rated at that fraction of the league average.
+5. **Few games, cautious rating:** each role rating is pulled toward the league average as if the player had `ODDS_PRIOR_GAMES` extra average games there. A player with no games at all gets the unproven rating everywhere.
+6. **Win chance:** players vary from game to game, so the bot works out the chance that one team's projected total beats the other's, using each player's consistency (`ODDS_FULL_GAME_SNAPS` and `ODDS_MIN_GAME_SNAPS` set what counts as a full game). That's shown as a percentage, a moneyline (−150 = bet 150 to win 100) and decimal odds. Each player is listed with their role (🎯 QB or 🙌 WR) and projected points.
+
+It predicts from fantasy output, not past results between these lineups. The game doesn't record who was on which team, so there's no win/loss history to learn from.
+
+### Ask the stats (/asknfl)
+
+`/asknfl prompt:"Who has the most passing yards?"` asks Claude about the league's stats. The answer is visible only to you unless you add `public:True`.
+
+- **Who can use it:** only the IDs in `ASKNFL_USER_IDS` in `config.py` (default: just the owner). It runs the Claude Code CLI on this PC, signed in with your own Claude subscription (`claude` must be installed and signed in). Anthropic's terms don't allow routing other people's requests through a Pro/Max login, so don't add other people. Letting others use it would need an Anthropic API key instead.
+- **Read-only:** the bot reads the stats through a read-only database connection, which SQLite itself refuses to write to, and gives Claude a text copy of them. Claude has **no tools at all**, so it can't run SQL, read or write files, or run commands. It can't change anything even if asked.
+- **Prompt-injection safeguards:**
+  - Player and team names come from the game, so they're reduced to safe characters and passed as data that Claude is told never to treat as instructions.
+  - Nothing variable goes on the command line.
+  - Claude runs without your Claude Code settings, plugins, hooks, MCP servers or saved sessions, in an empty temporary folder.
+- **Stats only:** off-topic questions (general knowledge, real NFL, coding, chit-chat) are rejected.
+- **Model:** `ASKNFL_MODEL` in `config.py` (`""` = your subscription's default). It handles one question at a time, with a 3-minute limit. If `claude` isn't on PATH, set `CLAUDE_PATH` in `.env`.
 
 ---
 

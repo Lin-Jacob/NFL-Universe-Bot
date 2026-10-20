@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import io
+import struct
+import zlib
 from datetime import datetime, timezone
 
 import discord
@@ -10,7 +13,7 @@ import config
 
 from .db import Database
 from .fantasy import scored_stats
-from .stats import CATEGORY_ORDER, CORE_DISPLAY, STATS, label
+from .stats import CATEGORY_ORDER, CORE_DISPLAY, MAX_STATS, STATS, label
 
 # A short stat line per category, in display order
 _SHORT = {
@@ -113,7 +116,26 @@ def game_header(g) -> str:
     return f"{wk}Game #{g['id']}"
 
 
-_GROUP_ICON = {"QB": "🎯", "RB": "🏃", "WR": "🙌", "DB": "🛡️", "DL": "💥", "ST": "🦶"}
+def _transparent_png(width: int, height: int) -> bytes:
+    """A fully transparent RGBA PNG, built by hand (no image library needed)."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    rows = b"".join(b"\x00" + b"\x00\x00\x00\x00" * width for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+_SPACER = _transparent_png(1200, 1)
+
+
+def full_width(e: discord.Embed) -> discord.File:
+    """Stretch an embed to Discord's maximum width with an invisible wide image.
+    Send the returned file with the embed (send_message(embed=e, file=...))."""
+    e.set_image(url="attachment://spacer.png")
+    return discord.File(io.BytesIO(_SPACER), filename="spacer.png")
+
+
+GROUP_ICON = {"QB": "🎯", "RB": "🏃", "WR": "🙌", "DB": "🛡️", "DL": "💥", "ST": "🦶"}
 
 
 def player_card(g, p: dict, rank: int, total: int, names: Names) -> discord.Embed:
@@ -140,8 +162,45 @@ def player_card(g, p: dict, rank: int, total: int, names: Names) -> discord.Embe
         body = "\n".join(f"{label(k)}: **{fmt_num(st[k])}**" for k in keys)
         if st.get("snaps"):
             body += f"\n*{fmt_num(st['snaps'])} snaps*"
-        title = f"{_GROUP_ICON.get(code, '')} {code} · {fmt_num(group_points(code, st))} pts"
+        title = f"{GROUP_ICON.get(code, '')} {code} · {fmt_num(group_points(code, st))} pts"
         e.add_field(name=title, value=body[:1024], inline=True)
+    return e
+
+
+def career_card(c: dict, rank: int, total: int, names: Names) -> discord.Embed:
+    """A player's combined stats over every game: totals with a per-game average on everything."""
+    n = c["games"]
+    e = discord.Embed(title=f"{_rank_icon(rank)} {names.dashed(c['username'])}", color=config.EMBED_COLOR,
+                      description=f"Career · **{n}** game{'s' if n != 1 else ''} · "
+                                  f"**{fmt_num(c['snaps'])}** snaps ({fmt_num(c['snaps'] / n)}/game)")
+    e.add_field(name="Fantasy points", value=f"**{fmt_num(c['fantasy_total'])}**\n{fmt_num(c['fantasy_avg'])}/game",
+                inline=True)
+    e.add_field(name=f"Per {config.FANTASY_RATE_SNAPS} snaps",
+                value=f"**{fmt_num(c['fantasy_rate'])}**\nRank {rank} of {total}", inline=True)
+    b = c["best_game"]
+    e.add_field(name="Best game", value=f"**{fmt_num(b['fantasy_points'])}** pts\nGame #{b['game_id']}", inline=True)
+    for code in config.FANTASY_SCORING:  # QB, RB, WR, DB, DL, ST in config order
+        st = c["groups"].get(code)
+        if not st:
+            continue
+        order = list(config.FANTASY_SCORING[code])
+        keys = sorted((k for k, (tot, _) in st.items() if tot and k != "snaps"),
+                      key=lambda k: order.index(k) if k in order else len(order))
+        if not keys:
+            continue
+        body = ""
+        for k in keys:  # whole lines only, within Discord's 1024-character field limit
+            tot, avg = st[k]
+            line = (f"{label(k)}: **{fmt_num(tot)}** (best) · {fmt_num(avg)} avg\n" if k in MAX_STATS
+                    else f"{label(k)}: **{fmt_num(tot)}** · {fmt_num(avg)}/g\n")
+            if len(body) + len(line) > 1000:
+                break
+            body += line
+        if "snaps" in st:
+            body += f"*{fmt_num(st['snaps'][0])} snaps · {fmt_num(st['snaps'][1])}/g*"
+        pts = c["group_points"].get(code, 0)
+        e.add_field(name=f"{GROUP_ICON.get(code, '')} {code} · {fmt_num(pts)} pts ({fmt_num(pts / n)}/g)",
+                    value=body, inline=True)
     return e
 
 

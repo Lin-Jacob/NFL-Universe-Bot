@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS raw_payloads (
     remote       TEXT,
     hash         TEXT UNIQUE,
     body         TEXT NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'received',   -- received | parsed | failed | duplicate | deleted
+    status       TEXT NOT NULL DEFAULT 'received',   -- received | parsed | failed | duplicate | deleted | superseded
     error        TEXT,
     game_id      INTEGER,
     message_id   TEXT                                 -- Discord message it came from (feed channel)
@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS int_faults (
     created_at   TEXT NOT NULL
 );
 
+-- Players an admin removed from a game (/admin removeplayer); kept out when the game is re-read.
+CREATE TABLE IF NOT EXISTS removed_players (
+    game_id      INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    username_key TEXT NOT NULL,
+    PRIMARY KEY (game_id, username_key)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -87,6 +94,7 @@ def _now() -> str:
 
 class Database:
     def __init__(self, path: str | Path):
+        self.path = str(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -149,6 +157,11 @@ class Database:
         """True if this Discord message was already stored."""
         return self.one("SELECT 1 FROM raw_payloads WHERE message_id = ?", (str(message_id),)) is not None
 
+    def raws_for_message(self, message_id: int) -> list[sqlite3.Row]:
+        """Stored payloads from this Discord message that still count (not superseded by a later save)."""
+        return self.q("SELECT id, status, body FROM raw_payloads WHERE message_id = ? AND status != 'superseded' "
+                      "ORDER BY id DESC", (str(message_id),))
+
     def set_raw_status(self, raw_id: int, status: str, error: str | None = None,
                        game_id: int | None = None) -> None:
         self.x("UPDATE raw_payloads SET status = ?, error = ?, game_id = ? WHERE id = ?",
@@ -185,7 +198,9 @@ class Database:
                                 (g.external_id, g.week, g.home_team, g.away_team,
                                  g.home_score, g.away_score, played, source, raw_id))
                 game_id = cur.lastrowid
-            for p in g.players:
+            removed = {r[0] for r in c.execute("SELECT username_key FROM removed_players WHERE game_id = ?",
+                                                (game_id,))}
+            for p in (p for p in g.players if p.username.lower() not in removed):
                 c.execute("INSERT INTO player_games(game_id, username, username_key, roblox_user_id, team, "
                           "position, stats, extra, pos_stats, fantasy_points) VALUES(?,?,?,?,?,?,?,?,?,?) "
                           "ON CONFLICT(game_id, username_key) DO UPDATE SET stats=excluded.stats, "
@@ -270,8 +285,16 @@ class Database:
                                      (game_id, key)).fetchone()["fantasy_points"]
 
     def remove_player_from_game(self, game_id: int, username: str) -> bool:
-        return self.x("DELETE FROM player_games WHERE game_id=? AND username_key=?",
-                      (game_id, username.lower())).rowcount > 0
+        """Remove a player's line from a game. Remembered, so re-reading the game doesn't add them back."""
+        key = username.lower()
+        with self.lock:
+            ok = self.conn.execute("DELETE FROM player_games WHERE game_id=? AND username_key=?",
+                                   (game_id, key)).rowcount > 0
+            if ok:
+                self.conn.execute("INSERT OR IGNORE INTO removed_players(game_id, username_key) VALUES(?,?)",
+                                  (game_id, key))
+            self.conn.commit()
+            return ok
 
     def recompute_fantasy(self) -> int:
         """Recalculate every stored fantasy score (run after editing config.FANTASY_SCORING)."""
@@ -346,8 +369,15 @@ class Database:
 
     # ---------------------------------------------------------------- players
     def resolve_player(self, query: str) -> str | None:
-        """Find a player's username_key from a display name, Roblox username, or Discord mention/ID."""
+        """Find a player's username_key from a display name, Roblox username, or Discord mention/ID.
+        Also accepts the forms the bot itself shows: "Name (username)" and "Name - username"."""
         q = query.strip()
+        for left, right in ((q[:q.rfind("(")], q[q.rfind("(") + 1:-1]) if q.endswith(")") and "(" in q else (None, None),
+                            q.rsplit(" - ", 1) if " - " in q else (None, None)):
+            if right and right.strip():  # try the username part first, then the name part
+                found = self.resolve_player(right) or (self.resolve_player(left) if left and left.strip() else None)
+                if found:
+                    return found
         digits = q.strip("<@!>")
         if digits.isdigit():
             row = self.one("SELECT username_key FROM names WHERE discord_id = ?", (int(digits),))

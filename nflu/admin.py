@@ -15,7 +15,7 @@ import config
 from .commands import stat_autocomplete
 from .embeds import Names, fmt_num, game_embed, score_line, short_line, table
 from .fantasy import fantasy_points
-from .feed import is_nflu_csv, nflu_embed
+from .feed import is_nflu_csv, nearest_csv, nflu_embed, nflu_server_id, server_allowed
 from .parser import ParsedGame, ParseError, parse_payload
 from .stats import POSITIONS, STATS, label
 from .webhook import ingest, parse_raw, reparse_all
@@ -180,10 +180,9 @@ class Admin(commands.GroupCog, group_name="admin", group_description="Admin-only
             await inter.followup.send("\n".join(lines), ephemeral=True)
             return
         post = recent[idx]
-        csv_msg = next((m for m in recent[idx + 1:idx + 4]
-                        if m.author.id == config.NFLU_WEBHOOK_ID and is_nflu_csv(m)), None)
+        csv_msg = nearest_csv(post, recent[max(0, idx - 3):idx + 4])  # the CSV can come before or after it
         csv_text = None
-        if csv_msg and 0 <= (post.created_at - csv_msg.created_at).total_seconds() <= 30:
+        if csv_msg:
             att = next(a for a in csv_msg.attachments if a.filename.lower().endswith(".csv"))
             csv_text = (await att.read()).decode("utf-8", errors="replace")
         try:
@@ -194,9 +193,14 @@ class Admin(commands.GroupCog, group_name="admin", group_description="Admin-only
             return
 
         saved = self.db.has_message(post.id)
+        sid = nflu_server_id(nflu_embed(post) or {})
+        server_line = (f"Server: `{sid}` ✅ allowed" if server_allowed(sid) and config.NFLU_SERVER_IDS
+                       else f"Server: `{sid}` (any server accepted: NFLU_SERVER_IDS is empty)" if server_allowed(sid)
+                       else f"Server: `{sid}` ❌ **not in NFLU_SERVER_IDS** ({', '.join(config.NFLU_SERVER_IDS)}), "
+                            "so this game is ignored. Add it in config.py if it should count.")
         e = discord.Embed(title=f"Dry run: {game.home_team} {game.home_score} vs {game.away_team} {game.away_score}",
                           color=config.EMBED_COLOR, url=post.jump_url,
-                          description=f"Posted {discord.utils.format_dt(post.created_at, 'f')}\n"
+                          description=f"Posted {discord.utils.format_dt(post.created_at, 'f')}\n{server_line}\n"
                                       f"Stats CSV: {'found ✅' if csv_text else 'not found ❌ (score only)'}\n"
                                       f"Saved in the database: {'yes ✅' if saved else 'no (run /admin backfill)'}")
         names = Names(self.db)
@@ -234,20 +238,20 @@ class Admin(commands.GroupCog, group_name="admin", group_description="Admin-only
         # the NFL Universe webhook was created (its ID encodes that time); nothing older can be from it.
         # Each game is a CSV message followed by its score message. Already-saved posts (by message ID)
         # are skipped, so this is safe to re-run.
-        games = 0
+        posts = [m async for m in channel.history(limit=None, after=discord.Object(id=config.NFLU_WEBHOOK_ID),
+                                                  oldest_first=True)
+                 if m.author.id == config.NFLU_WEBHOOK_ID]
+        csvs = [m for m in posts if is_nflu_csv(m)]
+        scores = [m for m in posts if nflu_embed(m) is not None]
         counts: dict[str, int] = {}
-        csv_message = None
-        async for m in channel.history(limit=None, after=discord.Object(id=config.NFLU_WEBHOOK_ID),
-                                       oldest_first=True):
-            if m.author.id != config.NFLU_WEBHOOK_ID:
-                continue
-            if is_nflu_csv(m):
-                csv_message = m
-            elif nflu_embed(m) is not None:
-                games += 1
-                res = await self.bot.ingest_game_post(m, csv_message, live=False)
-                csv_message = None
-                counts[res["status"]] = counts.get(res["status"], 0) + 1
+        used: set[int] = set()
+        for m in scores:  # each score message gets the nearest unused CSV, before or after it
+            csv_message = nearest_csv(m, [c for c in csvs if c.id not in used])
+            if csv_message:
+                used.add(csv_message.id)
+            res = await self.bot.ingest_game_post(m, csv_message, live=False)
+            counts[res["status"]] = counts.get(res["status"], 0) + 1
+        games = len(scores)
         summary = ", ".join(f"{n} {s}" for s, n in sorted(counts.items())) or "nothing to import"
         await inter.followup.send(f"Found {games} NFL Universe games in {channel.mention}: {summary}. "
                                   "`/admin rawlog` shows any failures.", ephemeral=True)
