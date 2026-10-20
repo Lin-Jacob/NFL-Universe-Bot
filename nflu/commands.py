@@ -537,6 +537,18 @@ class Stats(commands.Cog):
         e.set_footer(text=f"Q: {prompt[:200]}" + (" · read-only, answers from the stats database" if ok else ""))
         await inter.followup.send(embed=e, ephemeral=not public, allowed_mentions=discord.AllowedMentions.none())
 
+    @app_commands.command(name="website", description="Link to the league stats website")
+    async def website(self, inter: discord.Interaction):
+        url = self.bot.site_url()
+        if not self.bot.website:
+            msg = "The stats website is turned off (`WEBSITE=false` in the bot's `.env`)."
+        elif url:
+            msg = f"📊 League stats website: {url}"
+        else:
+            msg = ("The stats website is running, but only on the host's own network right now "
+                   "(no tunnel or `PUBLIC_URL` set).")
+        await inter.response.send_message(msg)
+
     @app_commands.command(name="help", description="What this bot can do")
     async def help(self, inter: discord.Interaction):
         e = discord.Embed(title="NFL Universe stats bot", color=config.EMBED_COLOR,
@@ -557,7 +569,8 @@ class Stats(commands.Cog):
             "`/points name [game_id]` how their points were scored · `/me` your own stats"))
         e.add_field(name="ℹ️ Info", inline=False, value=(
             "`/scoring` fantasy scoring by position (INTs and missed FGs subtract)\n"
-            "`/names` real names ↔ Roblox usernames · `/whois query` look someone up"))
+            "`/names` real names ↔ Roblox usernames · `/whois query` look someone up\n"
+            "`/website` link to the stats website"))
         if True:  # /asknfl is open to everyone (ASKNFL_USER_IDS was removed)
             e.add_field(name="🤖 Ask", inline=False, value=(
                 "`/asknfl prompt [public]` ask Claude about the league's stats (read-only, stats questions only)"))

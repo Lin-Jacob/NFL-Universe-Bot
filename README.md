@@ -36,6 +36,7 @@ It runs entirely on your own computer. You do **not** need a domain: when the bo
    ```bash
    python bot.py
    ```
+   That one command starts the bot **and** the stats website (section 2b). Or just double-click `start.bat` (Windows) / run `./start.sh` (macOS/Linux): on the first run it also sets up `.venv` and installs the requirements.
    The console prints the public webhook URL (set `DM_ADMINS_WEBHOOK_URL=true` in `.env` to also have the bot DM it to every admin on startup). `/admin webhookurl` shows it again any time.
 7. **Paste that URL into NFL Universe's webhook setting**, then pick a channel for results with `/admin channel`.
 
@@ -86,6 +87,20 @@ The bot then reads the posts from that webhook (set its ID as `NFLU_WEBHOOK_ID` 
 NFL Universe posts each game as two messages: a `.csv` file with every player's stats, then a "Team A vs Team B" embed with the score. The bot pairs them up. The CSV doesn't say which team a player was on, so player stats are saved without a team. Games posted while the bot was offline can be imported with `/admin backfill`.
 
 Only games from your own NFL Universe servers are saved. The score embed shows a **Server Id** (for example `EBA64F`). List the ones that count in `NFLU_SERVER_IDS` in `config.py`, and games from any other server (test or pickup games) are ignored. You can list as many servers as you like, and case doesn't matter. An empty list accepts every server. Ignored games aren't stored, so if you add a server later, `/admin backfill` can still import its past games. `/admin test` shows the latest game's Server Id and whether it's allowed.
+
+## 2b. Stats website
+
+The bot also serves a read-only stats website from the same web server, so it runs whenever the bot runs. No extra setup: start the bot and open it.
+
+| Who | Address |
+|---|---|
+| You, on the computer running the bot | `http://localhost:8080/` |
+| People on the same Wi-Fi / network | `http://<that computer's local IP>:8080/` (find the IP with `ipconfig` on Windows, `ipconfig getifaddr en0` on macOS). Allow Python through the firewall if Windows asks |
+| Anyone on the internet | The tunnel address **without** `/webhook/...`, e.g. `https://yourname.ngrok-free.app/`. `/website` in Discord posts it |
+
+Pages: home (latest games, fantasy and position leaders), every game with its box score and each player's points by position, every player with career totals and a game log showing how each game's points were scored, the fantasy board (points per 100 snaps), QB/RB/WR/DB/DL/ST rankings, leaders in any stat, and the scoring rules. Real names from the name mapping are shown everywhere, and times show in each visitor's own time zone. It works on phones and follows the visitor's light/dark setting.
+
+The site can only show data, never change it, and never shows the webhook secret or raw webhook payloads, so the base URL is safe to share. Keep sharing the full `/webhook/<secret>` URL with no one but the game. Set `WEBSITE=false` in `.env` to turn the site off (the address then only answers the health check). With `cloudflared` the address changes on every restart, so use `ngrok`'s free static domain if you want a link people can bookmark.
 
 ---
 
@@ -259,7 +274,8 @@ It predicts from fantasy output, not past results between these lineups. The gam
 ## 6. Files
 
 ```
-bot.py                     entry point: Discord bot + webhook server + tunnel
+bot.py                     entry point: Discord bot + webhook server + website + tunnel
+start.bat, start.sh        one-click start (sets up .venv on first run)
 config.py                  ADMIN_IDS, fantasy scoring, player names, NFL Universe webhook ID   <- edit me
 .env.example               copy to .env and fill in                     <- edit me
 nflu/parser.py             webhook JSON -> game + player stats
@@ -270,6 +286,7 @@ nflu/analytics.py          totals and leaderboards
 nflu/commands.py           public slash commands
 nflu/admin.py              /admin slash commands
 nflu/webhook.py            aiohttp webhook server
+nflu/site.py               read-only stats website (same server)
 nflu/tunnel.py             starts cloudflared / ngrok
 samples/sample_game.json   example payload
 scripts/send_test_webhook.py
