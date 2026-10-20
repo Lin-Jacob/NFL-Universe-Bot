@@ -9,7 +9,8 @@ Accepted URLs (all need the shared secret WEBHOOK_SECRET):
     GET  /health                              liveness check, no secret needed
 
 With site=True (WEBSITE=true in .env, the default) the read-only stats website in site.py
-is served from the same server, so the same local / tunnel address opens it in a browser.
+is served from the same server, so the same local / tunnel address opens it in a browser,
+along with the fake-money sportsbook in book.py (/book, admin at /admin).
 """
 
 from __future__ import annotations
@@ -23,7 +24,9 @@ from aiohttp import web
 
 from .db import Database
 from .parser import ParseError, ParsedGame, parse_payload, payload_hash
+from .book import BookSite
 from .site import Site
+from .sportsbook import Book
 
 log = logging.getLogger("nflu.webhook")
 
@@ -59,6 +62,11 @@ def parse_raw(db: Database, raw_id: int, payload, source: str = "webhook") -> di
     if game.unknown_stats:
         note = "unrecognized stats kept in 'extra': " + ", ".join(sorted(game.unknown_stats))[:500]
     db.set_raw_status(raw_id, "parsed", note, game_id)
+    if not replaced:
+        try:
+            Book(db).on_game_saved(game_id)  # settle sportsbook bets on this game
+        except Exception:
+            log.exception("Sportsbook auto-settle failed for game %s", game_id)
     return {"ok": True, "status": "replaced" if replaced else "parsed", "raw_id": raw_id,
             "game_id": game_id, "players": len(game.players), "game": game, "replaced": replaced}
 
@@ -91,6 +99,8 @@ class WebhookServer:
             web.post("/api/webhooks/{hook_id}/{secret}", self.handle),
         ])
         self.app.add_routes(Site(db).routes() if site else [web.get("/", self.health)])
+        if site:
+            self.app.add_routes(BookSite(db, secret).routes())
 
     async def start(self) -> None:
         self.runner = web.AppRunner(self.app, access_log=None)

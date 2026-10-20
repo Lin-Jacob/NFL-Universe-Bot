@@ -1,0 +1,165 @@
+import asyncio
+import json
+import random
+import re
+
+from aiohttp.test_utils import TestClient, TestServer
+
+from nflu.db import Database
+from nflu.parser import ParsedGame, ParsedPlayer
+from nflu.sportsbook import (START_BALANCE, Book, Models, decimal_odds, default_line, p_over, price,
+                             to_american)
+from nflu.webhook import WebhookServer, ingest
+from tests.test_bot import SAMPLE, SECRET
+
+PASSWORD = "hunter2-admin"
+
+
+def _game(i: int, rng: random.Random, home="Ravens", away="Bills", score=(28, 21)) -> ParsedGame:
+    def player(name, qb):
+        st = {"snaps": 130}
+        if qb:
+            pos = {"QB": {"pass_yards": rng.randint(150, 350), "pass_tds": rng.randint(0, 4),
+                          "interceptions": rng.randint(0, 2), "pass_completions": rng.randint(10, 25), **st}}
+        else:
+            pos = {"WR": {"receptions": rng.randint(1, 9), "rec_yards": rng.randint(10, 150),
+                          "rec_tds": rng.randint(0, 2), **st},
+                   "DB": {"tackles": rng.randint(0, 6), "def_ints": rng.randint(0, 1), **st}}
+        flat: dict[str, float] = {}
+        for g in pos.values():
+            for k, v in g.items():
+                if k != "snaps":
+                    flat[k] = flat.get(k, 0) + v
+        return ParsedPlayer(username=name, stats=flat, pos_stats=pos, extra={"Snaps": 130})
+    return ParsedGame(external_id=f"g{i}", home_team=home, away_team=away, home_score=score[0],
+                      away_score=score[1], played_at=f"2026-10-{i + 1:02d}T19:00:00+00:00",
+                      players=[player("QBOne", True), player("WrOne", False), player("QBTwo", True),
+                               player("WrTwo", False)])
+
+
+def _db(tmp_path) -> Database:
+    db = Database(tmp_path / "b.db")
+    rng = random.Random(4)
+    for i in range(6):
+        db.save_game(_game(i, rng, score=(rng.randint(7, 35), rng.randint(7, 35))))
+    return db
+
+
+def test_odds_math():
+    assert to_american(0.5 * 1.045) == -110
+    assert to_american(0.25) == 300 and to_american(0.75) == -300
+    assert decimal_odds(-110) == 1 + 100 / 110 and decimal_odds(150) == 2.5
+    o1, o2 = price([0.5, 0.5])
+    assert o1 == o2 == -110
+    pois = {"mean": 0.4, "sd": 0.6, "dist": "poisson"}
+    assert default_line(pois) == 0.5 and 0.3 < p_over(pois, 0.5) < 0.35
+    norm = {"mean": 240.3, "sd": 50, "dist": "normal"}
+    assert default_line(norm) == 240.5 and abs(p_over(norm, 240.5) - 0.5) < 0.01
+
+
+def test_models_and_settlement(tmp_path):
+    db = _db(tmp_path)
+    models = Models(db)
+    py = models.stat("qbone", "pass_yards")
+    assert py["dist"] == "normal" and 150 < py["mean"] < 350 and py["games"] == 6
+    assert models.stat("qbone", "interceptions")["dist"] == "poisson"
+    assert models.stat("wrone", "pass_yards")["mean"] == 0  # never threw: no invented yards
+
+    book = Book(db)
+    mid = book.create_matchup("", "Ravens", "Bills", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    kinds = [m["kind"] for m in book.markets(mid)]
+    assert kinds[:2] == ["moneyline", "total"] and kinds.count("prop") >= 8
+    bettor, _ = book.create_bettor("Sam")
+    ml = book.markets(mid)[0]
+    prop = next(m for m in book.markets(mid) if m["stat"] == "pass_yards" and m["player_key"] == "qbone")
+    over = next(s for s in prop["selections"] if s["side"] == "over")
+    book.place_bet(bettor, ml["selections"][0]["id"], 1000)
+    book.place_bet(bettor, over["id"], 500)
+    assert book.bettor(bettor)["balance"] == START_BALANCE - 1500
+
+    # a later game with these players settles everything; Ravens win 30-10, QBOne throws 999
+    g = _game(10, random.Random(1), score=(30, 10))
+    g.players[0].stats["pass_yards"] = g.players[0].pos_stats["QB"]["pass_yards"] = 999
+    gid, _ = db.save_game(g)
+    assert book.on_game_saved(gid) == [mid]
+    assert book.matchup(mid)["status"] == "settled"
+    win = round(1000 * decimal_odds(ml["selections"][0]["odds"]), 2) + round(500 * decimal_odds(over["odds"]), 2)
+    assert book.bettor(bettor)["balance"] == round(START_BALANCE - 1500 + win, 2)
+    assert book.market(prop["id"])["result"].startswith("999 Passing Yards")
+
+    # undo and settle by hand the other way
+    book.unsettle_market(ml["id"])
+    book.settle_market(ml["id"], ml["selections"][1]["id"])
+    assert book.bettor(bettor)["balance"] == round(START_BALANCE - 1500 + round(500 * decimal_odds(over["odds"]), 2), 2)
+
+
+def test_web_flow(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADMIN_PASSWORD", PASSWORD)
+
+    async def run():
+        db = _db(tmp_path)
+        srv = WebhookServer(db, SECRET)
+        async with TestClient(TestServer(srv.app)) as c:
+            # new visitor is asked for a name
+            html = await (await c.get("/book")).text()
+            assert "Pick a name" in html and "$10,000.00" in html
+            assert "Sportsbook" in await (await c.get("/")).text()
+            r = await c.post("/book/join", data={"name": "<i>Ann</i>", "next": "/book"})
+            assert r.status == 200 and "&lt;i&gt;Ann&lt;/i&gt;" in await r.text()
+            assert (await c.post("/book/join", data={"name": "Ann2"})).status == 200  # already joined: no-op
+            assert len(Book(db).leaderboard()) == 1
+
+            # admin: wrong password, then right
+            assert "Wrong username" in await (await c.post("/admin/login", data={
+                "username": "admin", "password": "nope"})).text()
+            assert (await c.get("/admin/matchups/1")).url.path == "/admin"
+            r = await c.post("/admin/login", data={"username": "admin", "password": PASSWORD})
+            html = await r.text()
+            assert "New matchup" in html
+            csrf = re.search(r'name="csrf" value="(\w+)"', html).group(1)
+            assert (await c.post("/admin/matchups", data={"csrf": "bad", "team1": "A", "team2": "B"})).status == 403
+            r = await c.post("/admin/matchups", data={"csrf": csrf, "team1": "Ravens", "team2": "Bills",
+                                                     "p:qbone": "1", "p:wrone": "1", "p:qbtwo": "2",
+                                                     "extra2": "Newbie"})
+            html = await r.text()
+            assert r.url.path == "/admin/matchups/1" and "Matchup created" in html and "newbie" in html.lower()
+            mu = Book(db).matchup(1)
+            assert mu["players2"] == ["qbtwo", "newbie"]
+            prop = next(m for m in Book(db).markets(1) if m["stat"] == "interceptions")
+            r = await c.post(f"/admin/markets/{prop['id']}", data={"csrf": csrf, "action": "save", "line": "1.5",
+                             **{f"odds_{s['id']}": "+120" for s in prop["selections"]}})
+            assert "saved" in await r.text()
+            assert [s["label"] for s in Book(db).market(prop["id"])["selections"]] == ["Over 1.5", "Under 1.5"]
+            r = await c.post("/admin/matchups/1", data={"csrf": csrf, "action": "custom", "title": "Pick six?",
+                                                       "options": "Yes | +400\nNo | -600"})
+            assert "Custom bet added" in await r.text()
+            r = await c.post("/admin/matchups/1", data={"csrf": csrf, "action": "prop", "player": "wrone",
+                                                       "stat": "yac", "line": ""})
+            assert "Yards After Catch" in await r.text()
+
+            # bettor places a bet
+            html = await (await c.get("/book/matchups/1")).text()
+            sel = int(re.search(r'href="/book/bet/(\d+)"', html).group(1))
+            html = await (await c.get(f"/book/bet/{sel}")).text()
+            bcsrf = re.search(r'name="csrf" value="(\w+)"', html).group(1)
+            odds = re.search(r'name="odds" value="(-?\d+)"', html).group(1)
+            r = await c.post(f"/book/bet/{sel}", data={"csrf": bcsrf, "odds": odds, "stake": "20000"})
+            assert "You only have" in await r.text()
+            r = await c.post(f"/book/bet/{sel}", data={"csrf": bcsrf, "odds": odds, "stake": "250"})
+            assert "Bet placed" in await r.text()
+            assert "$9,750.00" in await (await c.get("/book/me")).text()
+            assert "Ann" in await (await c.get("/book/leaderboard")).text()
+
+            # the game arrives by webhook and settles the matchup
+            p = json.loads(SAMPLE.read_text())
+            p["game_id"] = "new-one"
+            p["players"] = [{"username": u, "stats": {"passing": {"yards": 200}}} for u in ("QBOne", "WrOne", "QBTwo")]
+            r = await c.post(f"/webhook/{SECRET}", data=json.dumps(p))
+            assert (await r.json())["status"] == "parsed"
+            assert Book(db).matchup(1)["game_id"] is not None
+            html = await (await c.get("/admin/matchups/1")).text()
+            assert "Pick six?" in html and "Undo settlement" in html
+            for path in ["/book", "/book/me", "/book/matchups/1", "/admin", "/admin/bettors"]:
+                assert SECRET not in await (await c.get(path)).text(), path
+            assert (await c.get("/book/matchups/99")).status == 404
+    asyncio.run(run())
