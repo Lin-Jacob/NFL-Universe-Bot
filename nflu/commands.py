@@ -543,7 +543,7 @@ class Stats(commands.Cog):
         if not self.bot.website:
             msg = "The stats website is turned off (`WEBSITE=false` in the bot's `.env`)."
         elif url:
-            msg = f"📊 League stats website: {url}"
+            msg = f"📊 League stats website: {url}\n🎲 Sportsbook (fake money): {url}/book"
         else:
             msg = ("The stats website is running, but only on the host's own network right now "
                    "(no tunnel or `PUBLIC_URL` set).")

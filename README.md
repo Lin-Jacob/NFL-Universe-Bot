@@ -102,6 +102,23 @@ Pages: home (latest games, fantasy and position leaders), every game with its bo
 
 The site can only show data, never change it, and never shows the webhook secret or raw webhook payloads, so the base URL is safe to share. Keep sharing the full `/webhook/<secret>` URL with no one but the game. Set `WEBSITE=false` in `.env` to turn the site off (the address then only answers the health check). With `cloudflared` the address changes on every restart, so use `ngrok`'s free static domain if you want a link people can bookmark.
 
+### Sportsbook (fake money)
+
+`/book` on the same address is a mock sportsbook. A new visitor picks a name and starts with $10,000 of fake money; their browser cookie remembers them. Everything (accounts, balances, bets, matchups) is saved in the bot's database (`data/nfl_universe.db`), so stopping and starting the bot loses nothing. A browser only remembers its account for one address, so when the link changes (a `cloudflared` restart) or someone switches devices, they type the **account code** shown on their My bets page into the join page to get their account back. They bet on open matchups, see their bets at `/book/me`, and everyone's money at `/book/leaderboard`.
+
+**Admin page:** `/admin`, username `admin`, password `ADMIN_PASSWORD` from `.env` (add the line `ADMIN_PASSWORD=...` and restart; without it the admin page stays off). There you:
+
+1. **Create a matchup:** mark each player Team 1 / Team 2 (or type names of players with no games yet). Teams are called "Team <first player>" until the game comes in. Odds are generated from the stored stats right away:
+   - **Winner**, from the same model as `/odds`.
+   - **Total points**, over/under from past games' combined scores.
+   - **Player props**, over/under for each player's fantasy points and the stats they actually record (passing yards, TDs, interceptions thrown, completions, receptions, receiving yards, touchdowns, tackles, sacks, interceptions...). Lines come from each player's per-game average (scaled to a full game, pulled toward the league average when they have few games), priced with about a -110/-110 margin.
+2. **Add more:** an over/under on **any** stat on the sheet for any player in the matchup, or a custom bet with your own question, options and odds.
+3. **Edit:** change any line or odds (Auto-price re-prices a line from the stats), close or reopen betting per market or for the whole matchup, void (refunds), delete.
+4. **Settle:** when a game arrives with at least half the matchup's players, it settles itself: props and the total from the game's stats, and the winner by working out which side each lineup played from its players (their team if the game reports it, otherwise which lineup's touchdowns, field goals and safeties fit each final score). The teams then take the game's team names. A player who didn't play has their props voided. Anything left (custom bets, a winner it couldn't tell, e.g. a 0-0 game) you settle by hand; "Settle from this game" does the same for a game you pick, and "Undo settlement" reverses payouts if you got one wrong.
+5. **Bettors:** add or take away money, or delete someone.
+
+Optional tuning in `config.py`: `BOOK_START_BALANCE`, `BOOK_VIG` (margin, 0.045 = -110 lines), `BOOK_MIN_STAKE`.
+
 ---
 
 ## 3. Webhook payload format
@@ -287,6 +304,8 @@ nflu/commands.py           public slash commands
 nflu/admin.py              /admin slash commands
 nflu/webhook.py            aiohttp webhook server
 nflu/site.py               read-only stats website (same server)
+nflu/sportsbook.py         sportsbook: markets, odds from stats, bets, settling
+nflu/book.py               sportsbook pages and the /admin page
 nflu/tunnel.py             starts cloudflared / ngrok
 samples/sample_game.json   example payload
 scripts/send_test_webhook.py

@@ -73,7 +73,7 @@ if(!isNaN(d))t.textContent=d.toLocaleString(undefined,{dateStyle:'medium',timeSt
 """
 
 NAV = [("/games", "Games"), ("/players", "Players"), ("/fantasy", "Fantasy"), ("/positions", "Positions"),
-       ("/leaders", "Leaders"), ("/scoring", "Scoring")]
+       ("/leaders", "Leaders"), ("/scoring", "Scoring"), ("/book", "Sportsbook")]
 
 
 def _e(v) -> str:
