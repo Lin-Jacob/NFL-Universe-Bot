@@ -10,8 +10,9 @@ as). Creating one generates its markets:
     custom      anything else: the admin types the question, options and odds
 
 Settling: when a new game arrives that has at least half of a matchup's players, the matchup
-is locked and every market the game can answer is settled (props, totals, and the moneyline
-when the team names match). Anything left is settled by hand on the admin page.
+is locked and every market the game can answer is settled. Which side of the game each lineup
+played on is worked out from the players (see Book.assign_sides), so the winner settles too.
+Anything left (custom bets, a side it can't tell) is settled by hand on the admin page.
 
 Tunable values below can be overridden by adding the same name to config.py.
 """
@@ -53,6 +54,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS book_bettors (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     token       TEXT NOT NULL UNIQUE,                  -- kept in the bettor's cookie
+    code        TEXT UNIQUE,                           -- typed in to get the account back (new link/device)
     name        TEXT NOT NULL,
     name_key    TEXT NOT NULL UNIQUE,
     balance     REAL NOT NULL,
@@ -61,7 +63,7 @@ CREATE TABLE IF NOT EXISTS book_bettors (
 CREATE TABLE IF NOT EXISTS book_matchups (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     title         TEXT NOT NULL,
-    team1         TEXT NOT NULL,
+    team1         TEXT NOT NULL,                       -- "Team <first player>" until a game names it
     team2         TEXT NOT NULL,
     players1      TEXT NOT NULL DEFAULT '[]',          -- username keys
     players2      TEXT NOT NULL DEFAULT '[]',
@@ -117,8 +119,28 @@ def _now() -> str:
 
 def ensure_schema(db: Database) -> None:
     with db.lock:
-        db.conn.executescript(SCHEMA)
-        db.conn.commit()
+        c = db.conn
+        c.executescript(SCHEMA)
+        if "code" not in {r["name"] for r in c.execute("PRAGMA table_info(book_bettors)")}:
+            c.execute("ALTER TABLE book_bettors ADD COLUMN code TEXT")
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_code ON book_bettors(code)")
+        for r in c.execute("SELECT id FROM book_bettors WHERE code IS NULL").fetchall():
+            c.execute("UPDATE book_bettors SET code = ? WHERE id = ?", (new_code(), r["id"]))
+        c.commit()
+
+
+_CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L
+
+
+def new_code() -> str:
+    """Account code like 'K7QM-2XPA' (40 bits): enough that nobody guesses someone else's."""
+    raw = "".join(secrets.choice(_CODE_CHARS) for _ in range(8))
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def clean_code(code: str) -> str:
+    raw = "".join(ch for ch in code.upper() if ch.isalnum())
+    return f"{raw[:4]}-{raw[4:]}"
 
 
 # =============================================================================
@@ -303,6 +325,9 @@ class Book:
     def bettor(self, bettor_id: int):
         return self.db.one("SELECT * FROM book_bettors WHERE id = ?", (bettor_id,))
 
+    def bettor_by_code(self, code: str):
+        return self.db.one("SELECT * FROM book_bettors WHERE code = ?", (clean_code(code),))
+
     def create_bettor(self, name: str) -> tuple[int, str]:
         name = " ".join(name.split())
         if not 1 <= len(name) <= 24:
@@ -310,8 +335,8 @@ class Book:
         if self.db.one("SELECT 1 FROM book_bettors WHERE name_key = ?", (name.lower(),)):
             raise BookError(f"Someone already goes by {name}. Pick another name.")
         token = secrets.token_urlsafe(32)
-        cur = self.db.x("INSERT INTO book_bettors(token, name, name_key, balance, created_at) VALUES(?,?,?,?,?)",
-                        (token, name, name.lower(), START_BALANCE, _now()))
+        cur = self.db.x("INSERT INTO book_bettors(token, code, name, name_key, balance, created_at) "
+                        "VALUES(?,?,?,?,?,?)", (token, new_code(), name, name.lower(), START_BALANCE, _now()))
         return cur.lastrowid, token
 
     def adjust_balance(self, bettor_id: int, amount: float) -> None:
@@ -376,13 +401,13 @@ class Book:
                         "JOIN book_matchups mu ON mu.id = m.matchup_id WHERE s.id = ?", (sel_id,))
         return dict(s) if s else None
 
-    def create_matchup(self, title: str, team1: str, team2: str, keys1: list[str], keys2: list[str],
-                       names=lambda k: k) -> int:
-        team1, team2 = team1.strip() or "Team 1", team2.strip() or "Team 2"
+    def create_matchup(self, title: str, keys1: list[str], keys2: list[str], names=lambda k: k) -> int:
+        """Two lineups. Teams are called "Team <first player>" until the game that settles it names them."""
         if not keys1 or not keys2:
             raise BookError("Each team needs at least one player.")
         if set(keys1) & set(keys2):
             raise BookError("A player can't be on both teams.")
+        team1, team2 = f"Team {names(keys1[0])}", f"Team {names(keys2[0])}"
         title = title.strip() or f"{team1} vs {team2}"
         base = self.db.one("SELECT COALESCE(MAX(id), 0) n FROM games")["n"]
         cur = self.db.x("INSERT INTO book_matchups(title, team1, team2, players1, players2, base_game_id, "
@@ -630,15 +655,34 @@ class Book:
                       "WHERE id = ?) AND status = 'settled'", (market_id,))
             c.commit()
 
-    def _team_scores(self, mu: dict, game) -> tuple[int, int] | None:
-        """(team1 score, team2 score) from a game, when the matchup's team names match the game's."""
+    @staticmethod
+    def _points_scored(lines: list[dict]) -> float:
+        """Points a lineup's own stats account for: 6 a touchdown (passing TDs cover the catches, so
+        receiving TDs aren't counted again), 3 a field goal, 2 a safety. Extra points aren't on the sheet."""
+        tds = ("pass_tds", "rush_tds", "def_tds", "kick_return_tds", "punt_return_tds")
+        return sum(6 * sum(ln["stats"].get(s) or 0 for s in tds) + 3 * (ln["stats"].get("fg_made") or 0)
+                   + 2 * (ln["stats"].get("safeties") or 0) for ln in lines)
+
+    def assign_sides(self, mu: dict, game, lines: dict[str, dict]) -> bool | None:
+        """Which side of the game each lineup played on, from its players: True = team 1 was the game's
+        first-listed (home) team, False = the second, None = can't tell.
+
+        Uses the players' team when the game reports it, otherwise matches each lineup's touchdowns,
+        field goals and safeties against the two final scores (the closer fit wins)."""
         h, a = game["home_team"].strip().lower(), game["away_team"].strip().lower()
-        t1, t2 = mu["team1"].strip().lower(), mu["team2"].strip().lower()
-        if (t1, t2) == (h, a):
-            return game["home_score"], game["away_score"]
-        if (t1, t2) == (a, h):
-            return game["away_score"], game["home_score"]
-        return None
+        sides = [[lines[k] for k in mu[p] if k in lines] for p in ("players1", "players2")]
+        teams = []
+        for side in sides:
+            named = [str(ln["team"]).strip().lower() for ln in side if ln.get("team")]
+            teams.append(max(set(named), key=named.count) if named else None)
+        if teams[0] in (h, a) and teams[1] in (h, a) and teams[0] != teams[1]:
+            return teams[0] == h
+        p1, p2 = (self._points_scored(side) for side in sides)
+        hs, as_ = game["home_score"], game["away_score"]
+        home_fit, away_fit = abs(p1 - hs) + abs(p2 - as_), abs(p1 - as_) + abs(p2 - hs)
+        if home_fit == away_fit:
+            return None
+        return home_fit < away_fit
 
     def settle_from_game(self, matchup_id: int, game_id: int) -> dict:
         """Settle every market a game's results can answer. Returns {"settled": n, "left": [titles]}."""
@@ -650,7 +694,22 @@ class Book:
             self.set_matchup_status(matchup_id, "locked")
         self.db.x("UPDATE book_matchups SET game_id = ? WHERE id = ?", (game_id, matchup_id))
         lines = {p["username_key"]: p for p in self.db.game_players(game_id)}
-        scores = self._team_scores(mu, game)
+        scores = None
+        first_home = self.assign_sides(mu, game, lines)
+        if first_home is not None:
+            # The lineups take the game's team names from here on
+            t1, t2 = (game["home_team"], game["away_team"]) if first_home else (game["away_team"], game["home_team"])
+            scores = (game["home_score"], game["away_score"]) if first_home else (game["away_score"], game["home_score"])
+            with self.db.lock:
+                c = self.db.conn
+                c.execute("UPDATE book_matchups SET team1 = ?, team2 = ? WHERE id = ?", (t1, t2, matchup_id))
+                for side, name in (("team1", t1), ("team2", t2)):
+                    # "Ravens (Team Jacob)", so bettors still recognise the lineup they picked
+                    c.execute("UPDATE book_selections SET label = ? || ' (' || label || ')' WHERE side = ? "
+                              "AND label LIKE 'Team %' AND market_id IN (SELECT id FROM book_markets "
+                              "WHERE matchup_id = ? AND kind = 'moneyline')", (name, side, matchup_id))
+                c.commit()
+            mu = self.matchup(matchup_id)
         settled, left = 0, []
         for m in self.markets(matchup_id):
             if m["status"] in ("settled", "void"):

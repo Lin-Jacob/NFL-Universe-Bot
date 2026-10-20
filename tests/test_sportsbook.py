@@ -66,7 +66,8 @@ def test_models_and_settlement(tmp_path):
     assert models.stat("wrone", "pass_yards")["mean"] == 0  # never threw: no invented yards
 
     book = Book(db)
-    mid = book.create_matchup("", "Ravens", "Bills", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    assert book.matchup(mid)["title"] == "Team qbone vs Team qbtwo"
     kinds = [m["kind"] for m in book.markets(mid)]
     assert kinds[:2] == ["moneyline", "total"] and kinds.count("prop") >= 8
     bettor, _ = book.create_bettor("Sam")
@@ -77,12 +78,20 @@ def test_models_and_settlement(tmp_path):
     book.place_bet(bettor, over["id"], 500)
     assert book.bettor(bettor)["balance"] == START_BALANCE - 1500
 
-    # a later game with these players settles everything; Ravens win 30-10, QBOne throws 999
-    g = _game(10, random.Random(1), score=(30, 10))
+    # a later game with these players settles everything; team 1 (QBOne's) played as the Bills (listed
+    # second) and won 30-10, which the bot works out from the TDs; QBOne throws 999
+    g = _game(10, random.Random(1), home="Ravens", away="Bills", score=(10, 30))
+    for p in g.players:
+        for k in ("pass_tds", "rec_tds", "rush_tds", "def_tds"):
+            p.stats.pop(k, None)
+    g.players[0].stats.update(pass_tds=4)  # QBOne: 24 points of team 1's 30
+    g.players[2].stats.update(pass_tds=1)  # QBTwo: 6 of team 2's 10
     g.players[0].stats["pass_yards"] = g.players[0].pos_stats["QB"]["pass_yards"] = 999
     gid, _ = db.save_game(g)
     assert book.on_game_saved(gid) == [mid]
     assert book.matchup(mid)["status"] == "settled"
+    assert (book.matchup(mid)["team1"], book.matchup(mid)["team2"]) == ("Bills", "Ravens")
+    assert book.market(ml["id"])["selections"][0]["label"] == "Bills (Team qbone)"
     win = round(1000 * decimal_odds(ml["selections"][0]["odds"]), 2) + round(500 * decimal_odds(over["odds"]), 2)
     assert book.bettor(bettor)["balance"] == round(START_BALANCE - 1500 + win, 2)
     assert book.market(prop["id"])["result"].startswith("999 Passing Yards")
@@ -105,7 +114,8 @@ def test_web_flow(tmp_path, monkeypatch):
             assert "Pick a name" in html and "$10,000.00" in html
             assert "Sportsbook" in await (await c.get("/")).text()
             r = await c.post("/book/join", data={"name": "<i>Ann</i>", "next": "/book"})
-            assert r.status == 200 and "&lt;i&gt;Ann&lt;/i&gt;" in await r.text()
+            html = await r.text()
+            assert r.status == 200 and "&lt;i&gt;Ann&lt;/i&gt;" in html and "account code is" in html
             assert (await c.post("/book/join", data={"name": "Ann2"})).status == 200  # already joined: no-op
             assert len(Book(db).leaderboard()) == 1
 
@@ -118,7 +128,7 @@ def test_web_flow(tmp_path, monkeypatch):
             assert "New matchup" in html
             csrf = re.search(r'name="csrf" value="(\w+)"', html).group(1)
             assert (await c.post("/admin/matchups", data={"csrf": "bad", "team1": "A", "team2": "B"})).status == 403
-            r = await c.post("/admin/matchups", data={"csrf": csrf, "team1": "Ravens", "team2": "Bills",
+            r = await c.post("/admin/matchups", data={"csrf": csrf,
                                                      "p:qbone": "1", "p:wrone": "1", "p:qbtwo": "2",
                                                      "extra2": "Newbie"})
             html = await r.text()
@@ -149,6 +159,13 @@ def test_web_flow(tmp_path, monkeypatch):
             assert "Bet placed" in await r.text()
             assert "$9,750.00" in await (await c.get("/book/me")).text()
             assert "Ann" in await (await c.get("/book/leaderboard")).text()
+
+            # the account comes back from its code in a fresh browser (e.g. after the tunnel link changed)
+            code = Book(db).leaderboard()[0]["code"]
+            async with TestClient(TestServer(srv.app)) as c2:
+                assert "No account has that code" in await (await c2.post("/book/code", data={"code": "zzzz"})).text()
+                r = await c2.post("/book/code", data={"code": code.lower().replace("-", " "), "next": "/book/me"})
+                assert "Welcome back" in (html := await r.text()) and "$9,750.00" in html
 
             # the game arrives by webhook and settles the matchup
             p = json.loads(SAMPLE.read_text())

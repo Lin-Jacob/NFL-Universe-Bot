@@ -9,6 +9,7 @@ sportsbook.START_BALANCE in fake money):
     GET  /book/me                  my balance and bets
     GET  /book/leaderboard         everyone's money
     GET  /book/join;  POST /book/join
+    POST /book/code                get your account back with its code (new link or device)
 
 Admin (user "admin", password ADMIN_PASSWORD in .env; off when it isn't set):
     GET  /admin                    login, matchups, create a matchup
@@ -114,6 +115,7 @@ class BookSite:
             web.get("/book", self.index),
             web.get("/book/join", self.join_form),
             web.post("/book/join", self.join),
+            web.post("/book/code", self.use_code),
             web.get("/book/matchups/{id}", self.matchup_page),
             web.get("/book/bet/{id}", self.slip),
             web.post("/book/bet/{id}", self.bet),
@@ -204,9 +206,13 @@ class BookSite:
                 f'<form class="inline" method="post" action="/book/join">'
                 f'<input type="hidden" name="next" value="{_e(nxt)}">'
                 f'<input name="name" maxlength="24" required placeholder="Your name" value="{_e(name)}">'
-                f"<button>Start betting</button></form>"
-                f'<p class="small muted">This browser remembers you. Clearing cookies or using another device '
-                f"starts a new account.</p></div>")
+                f"<button>Start betting</button></form></div>"
+                f"<div class='card'><p>Already have an account? Enter its code (on your My bets page) to get it "
+                f"back, e.g. when the website's link changed or you're on another device.</p>"
+                f'<form class="inline" method="post" action="/book/code">'
+                f'<input type="hidden" name="next" value="{_e(nxt)}">'
+                f'<input name="code" maxlength="12" required placeholder="ABCD-2345" autocomplete="off">'
+                f"<button class='sec'>Use my account</button></form></div>")
 
     # -------------------------------------------------------------- bettors
     async def index(self, request: web.Request) -> web.Response:
@@ -247,13 +253,41 @@ class BookSite:
             raise web.HTTPSeeOther(nxt)
         name = str(form.get("name", ""))
         try:
-            _, token = self.book.create_bettor(name)
+            bid, token = self.book.create_bettor(name)
         except BookError as e:
             return self._page("Join", self._join_html(nxt, str(e), name))
-        resp = web.HTTPSeeOther(nxt)
+        code = self.book.bettor(bid)["code"]
+        raise self._login_bettor(request, token, _redirect(
+            nxt, f"Welcome! Your account code is {code}. Save it: it gets your account back if the "
+                 f"website's link changes or you switch devices (it's also on My bets)."))
+
+    @staticmethod
+    def _login_bettor(request: web.Request, token: str, resp: web.HTTPException) -> web.HTTPException:
         resp.set_cookie(BETTOR_COOKIE, token, max_age=10 * 365 * 24 * 3600, httponly=True, samesite="Lax",
                         secure=_secure(request), path="/")
-        raise resp
+        return resp
+
+    def _too_many(self, key: str, failed: bool = False) -> bool:
+        """Per-address limit on wrong passwords / account codes (LOGIN_TRIES per LOGIN_WINDOW)."""
+        now = time.time()
+        recent = [t for t in self.failures.get(key, []) if now - t < LOGIN_WINDOW]
+        if failed:
+            recent.append(now)
+        self.failures[key] = recent
+        return len(recent) >= LOGIN_TRIES
+
+    async def use_code(self, request: web.Request) -> web.Response:
+        form = await request.post()
+        nxt = self._safe_next(form.get("next"))
+        ip = "code:" + (request.headers.get("CF-Connecting-IP") or request.remote or "?")
+        if self._too_many(ip):
+            return self._page("Join", self._join_html(nxt, "Too many wrong codes. Wait 10 minutes."))
+        b = self.book.bettor_by_code(str(form.get("code", "")))
+        if not b:
+            self._too_many(ip, failed=True)
+            await asyncio.sleep(1)
+            return self._page("Join", self._join_html(nxt, "No account has that code."))
+        raise self._login_bettor(request, b["token"], _redirect(nxt, f"Welcome back, {b['name']}!"))
 
     def _require_bettor(self, request: web.Request):
         bettor = self._bettor(request)
@@ -358,11 +392,14 @@ class BookSite:
         bets = self.book.bets_for(bettor["id"])
         at_risk = sum(b["stake"] for b in bets if b["status"] == "pending")
         worth = bettor["balance"] + at_risk
-        body = (self._bar(request, bettor) + f"<h1>My bets</h1><div class='card'>"
+        body = (self._bar(request, bettor) + _flash(request) + f"<h1>My bets</h1><div class='card'>"
                 f'<span class="stat"><b>{_money(bettor["balance"])}</b><span class="muted">to bet</span></span>'
                 f'<span class="stat"><b>{_money(at_risk)}</b><span class="muted">in open bets</span></span>'
                 f'<span class="stat"><b class="{"won" if worth >= START_BALANCE else "lost"}">'
-                f'{_money(worth - START_BALANCE)}</b><span class="muted">profit</span></span></div>'
+                f'{_money(worth - START_BALANCE)}</b><span class="muted">profit</span></span>'
+                f'<div class="small">Account code <b>{_e(bettor["code"])}</b>: enter it on the join page to get '
+                f"this account back if the website's link changes or you use another device. Keep it to "
+                f"yourself.</div></div>"
                 + self._bets_table(bets))
         return self._page("My bets", body)
 
@@ -404,16 +441,14 @@ class BookSite:
     async def admin_login(self, request: web.Request) -> web.Response:
         ip = request.headers.get("CF-Connecting-IP") or request.remote or "?"
         now = time.time()
-        recent = [t for t in self.failures.get(ip, []) if now - t < LOGIN_WINDOW]
-        self.failures[ip] = recent
         form = await request.post()
-        if len(recent) >= LOGIN_TRIES:
+        if self._too_many(ip):
             return self._page("Admin", self._login_html("Too many wrong passwords. Wait 10 minutes."))
         ok = (self.admin_password
               and hmac.compare_digest(str(form.get("username", "")).strip().lower(), ADMIN_USER)
               and hmac.compare_digest(str(form.get("password", "")).encode(), self.admin_password.encode()))
         if not ok:
-            recent.append(now)
+            self._too_many(ip, failed=True)
             await asyncio.sleep(1)
             return self._page("Admin", self._login_html("Wrong username or password."))
         exp = str(int(now) + ADMIN_SESSION_SECONDS)
@@ -450,11 +485,9 @@ class BookSite:
         create = (f'<div class="card"><h2 style="margin-top:0">New matchup</h2>'
                   f'<form method="post" action="/admin/matchups">{self._hidden(request, ADMIN_COOKIE)}'
                   f'<div class="inline" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">'
-                  f'<input name="title" placeholder="Title (optional)">'
-                  f'<input name="team1" placeholder="Team 1 name" required>'
-                  f'<input name="team2" placeholder="Team 2 name" required></div>'
-                  f'<p class="small muted">Use the NFL Universe team names the game will report (e.g. Ravens) and '
-                  f"the winner settles itself when the game comes in; otherwise settle the winner by hand.</p>"
+                  f'<input name="title" placeholder="Title (optional)"></div>'
+                  f'<p class="small muted">Put each player on Team 1 or Team 2. When the game comes in, the bot '
+                  f"works out which side each team played from its players and settles the winner.</p>"
                   f'<div class="scroll"><table class="pick">{pick}</table></div>'
                   f'<p class="small muted">Players with no games yet (comma-separated names):</p>'
                   f'<div style="display:flex;gap:8px;flex-wrap:wrap"><input name="extra1" placeholder="Team 1 extras">'
@@ -478,8 +511,7 @@ class BookSite:
                     if key not in sides[team]:
                         sides[team].append(key)
         try:
-            mid = self.book.create_matchup(str(form.get("title", "")), str(form.get("team1", "")),
-                                           str(form.get("team2", "")), sides["1"], sides["2"], self._names())
+            mid = self.book.create_matchup(str(form.get("title", "")), sides["1"], sides["2"], self._names())
         except BookError as e:
             raise _redirect("/admin", str(e), err=True)
         raise _redirect(f"/admin/matchups/{mid}", "Matchup created and open for betting. Check the lines below.")
