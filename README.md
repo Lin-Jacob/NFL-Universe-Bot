@@ -84,6 +84,20 @@ The bot then reads the posts from that webhook (set its ID as `NFLU_WEBHOOK_ID` 
 
 NFL Universe posts each game as two messages: a `.csv` file with every player's stats, then a "Team A vs Team B" embed with the score. The bot pairs them up. The CSV doesn't say which team a player was on, so player stats are saved without a team. Games posted while the bot was offline can be imported with `/admin backfill`.
 
+## 2b. Stats website
+
+The bot also serves a read-only stats website from the same web server, so it runs whenever the bot runs. No extra setup: start the bot and open it.
+
+| Who | Address |
+|---|---|
+| You, on the computer running the bot | `http://localhost:8080/` |
+| People on the same Wi-Fi / network | `http://<that computer's local IP>:8080/` (find the IP with `ipconfig` on Windows, `ipconfig getifaddr en0` on macOS). Allow Python through the firewall if Windows asks |
+| Anyone on the internet | The tunnel address **without** `/webhook/...`, e.g. `https://yourname.ngrok-free.app/`. `/website` in Discord posts it |
+
+Pages: home (latest games, fantasy and position leaders), every game with its box score and each player's points by position, every player with career totals and a game log showing how each game's points were scored, the fantasy board (points per 100 snaps), QB/RB/WR/DB/DL/ST rankings, leaders in any stat, and the scoring rules. Real names from the name mapping are shown everywhere, and times show in each visitor's own time zone. It works on phones and follows the visitor's light/dark setting.
+
+The site can only show data, never change it, and never shows the webhook secret or raw webhook payloads, so the base URL is safe to share. Keep sharing the full `/webhook/<secret>` URL with no one but the game. Set `WEBSITE=false` in `.env` to turn the site off (the address then only answers the health check). With `cloudflared` the address changes on every restart, so use `ngrok`'s free static domain if you want a link people can bookmark.
+
 ---
 
 ## 3. Webhook payload format
@@ -144,6 +158,7 @@ Notes:
 | `/points name [game_id]` | How a player's fantasy points were scored |
 | `/scoring` | Fantasy scoring rules |
 | `/names`, `/whois query` | Who's who |
+| `/website` | Link to the stats website |
 | `/help` | Command overview |
 
 Anywhere a player name is asked for you can type a mapped real name, a Roblox username, or an @mention, and it autocompletes.
@@ -239,6 +254,7 @@ nflu/analytics.py          totals and leaderboards
 nflu/commands.py           public slash commands
 nflu/admin.py              /admin slash commands
 nflu/webhook.py            aiohttp webhook server
+nflu/site.py               read-only stats website (same server)
 nflu/tunnel.py             starts cloudflared / ngrok
 samples/sample_game.json   example payload
 scripts/send_test_webhook.py

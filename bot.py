@@ -2,8 +2,8 @@
 NFL Universe league bot.
 
 Run:  python bot.py
-Starts the Discord bot, the webhook server (port WEBHOOK_PORT) and, if TUNNEL
-is set, a public tunnel to that port. See README.md.
+Starts the Discord bot, the webhook server + stats website (port WEBHOOK_PORT)
+and, if TUNNEL is set, a public tunnel to that port. See README.md.
 """
 
 from __future__ import annotations
@@ -44,9 +44,10 @@ class NFLUBot(commands.Bot):
         self.db = Database(os.getenv("DATABASE_PATH", "data/nfl_universe.db"))
         self.port = int(os.getenv("WEBHOOK_PORT", "8080"))
         self.secret = os.getenv("WEBHOOK_SECRET", "")
+        self.website = os.getenv("WEBSITE", "true").lower() != "false"
         self.webhook = WebhookServer(self.db, self.secret,
                                      host=os.getenv("WEBHOOK_HOST", "0.0.0.0"), port=self.port,
-                                     on_game=self.on_webhook_game)
+                                     on_game=self.on_webhook_game, site=self.website)
         self.tunnel = Tunnel(os.getenv("TUNNEL", "cloudflared"), self.port)
         self._notified = False
         self._pending_csv: discord.Message | None = None
@@ -128,9 +129,17 @@ class NFLUBot(commands.Bot):
         await super().close()
 
     # ----------------------------------------------------------------- helpers
-    def webhook_url(self) -> str | None:
+    def public_base(self) -> str | None:
         base = self.tunnel.public_url or os.getenv("PUBLIC_URL")
-        return f"{base.rstrip('/')}/webhook/{self.secret}" if base else None
+        return base.rstrip("/") if base else None
+
+    def webhook_url(self) -> str | None:
+        base = self.public_base()
+        return f"{base}/webhook/{self.secret}" if base else None
+
+    def site_url(self) -> str | None:
+        """Public address of the stats website (no secret in it), or None if there's no tunnel/PUBLIC_URL."""
+        return self.public_base() if self.website else None
 
     def webhook_info(self) -> str:
         url = self.webhook_url()
@@ -148,6 +157,10 @@ class NFLUBot(commands.Bot):
         print(f"\n{line}\n NFL Universe bot webhook")
         print(f"   local : http://localhost:{self.port}/webhook/<WEBHOOK_SECRET>")
         print(f"   public: {self.webhook_url() if url or os.getenv('PUBLIC_URL') else '(no tunnel running)'}")
+        if self.website:
+            print(" Stats website (safe to share)")
+            print(f"   local : http://localhost:{self.port}/   (others on your Wi-Fi: http://<this PC's IP>:{self.port}/)")
+            print(f"   public: {self.site_url() or '(no tunnel running)'}")
         print(f"{line}\n", flush=True)
 
     async def on_webhook_game(self, game_id: int, game: ParsedGame, replaced: bool) -> None:
