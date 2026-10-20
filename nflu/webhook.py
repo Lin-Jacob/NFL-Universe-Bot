@@ -7,6 +7,9 @@ Accepted URLs (all need the shared secret WEBHOOK_SECRET):
     POST /api/webhooks/<anything>/<secret>    looks like a Discord webhook URL, for games that
                                               only accept discord.com-style webhook links
     GET  /health                              liveness check, no secret needed
+
+With site=True (WEBSITE=true in .env, the default) the read-only stats website in site.py
+is served from the same server, so the same local / tunnel address opens it in a browser.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from aiohttp import web
 
 from .db import Database
 from .parser import ParseError, ParsedGame, parse_payload, payload_hash
+from .site import Site
 
 log = logging.getLogger("nflu.webhook")
 
@@ -70,7 +74,8 @@ def reparse_all(db: Database) -> dict[str, int]:
 
 class WebhookServer:
     def __init__(self, db: Database, secret: str,
-                 host: str = "0.0.0.0", port: int = 8080, on_game: OnGame | None = None):
+                 host: str = "0.0.0.0", port: int = 8080, on_game: OnGame | None = None,
+                 site: bool = True):
         if not secret or len(secret) < 12:
             raise ValueError("WEBHOOK_SECRET must be set in .env (at least 12 characters)")
         self.db = db
@@ -81,11 +86,11 @@ class WebhookServer:
         self.app = web.Application(client_max_size=MAX_BODY)
         self.app.add_routes([
             web.get("/health", self.health),
-            web.get("/", self.health),
             web.post("/webhook", self.handle),
             web.post("/webhook/{secret}", self.handle),
             web.post("/api/webhooks/{hook_id}/{secret}", self.handle),
         ])
+        self.app.add_routes(Site(db).routes() if site else [web.get("/", self.health)])
 
     async def start(self) -> None:
         self.runner = web.AppRunner(self.app, access_log=None)

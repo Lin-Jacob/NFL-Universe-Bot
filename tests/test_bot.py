@@ -122,3 +122,29 @@ def test_webhook_http(tmp_path):
             assert (await r.json())["status"] == "parsed"
         assert len(got) == 2
     asyncio.run(run())
+
+
+def test_website_pages(tmp_path):
+    async def run():
+        db = Database(tmp_path / "s.db")
+        ingest(db, SAMPLE.read_text(), "test")
+        db.set_name("QBKing_123", "<b>Jake</b>")  # names are escaped, not rendered as HTML
+        srv = WebhookServer(db, SECRET)
+        async with TestClient(TestServer(srv.app)) as c:
+            for path in ["/", "/games", "/games/1", "/players", "/players?q=jake", "/players/qbking_123",
+                         "/fantasy", "/positions", "/positions/qb", "/leaders", "/leaders?stat=pass_yards&per_game=1",
+                         "/leaders?stat=longest_pass", "/scoring"]:
+                r = await c.get(path)
+                html = await r.text()
+                assert r.status == 200, path
+                assert SECRET not in html and "<b>Jake</b>" not in html, path
+            assert "&lt;b&gt;Jake&lt;/b&gt;" in await (await c.get("/players/qbking_123")).text()
+            assert "Ravens" in await (await c.get("/games/1")).text()
+            for path in ["/games/99", "/games/x", "/players/nobody_here", "/positions/zz"]:
+                assert (await c.get(path)).status == 404, path
+            assert (await c.post(f"/webhook/{SECRET}", data=SAMPLE.read_text())).status == 200
+        off = WebhookServer(db, SECRET, site=False)
+        async with TestClient(TestServer(off.app)) as c:
+            assert (await (await c.get("/")).json())["ok"] is True
+            assert (await c.get("/games")).status == 404
+    asyncio.run(run())
