@@ -35,6 +35,7 @@ It runs entirely on your own computer. You do **not** need a domain: when the bo
    ```bash
    python bot.py
    ```
+   That one command starts the bot **and** the stats website (section 2b). Or just double-click `start.bat` (Windows) / run `./start.sh` (macOS/Linux): on the first run it also sets up `.venv` and installs the requirements.
    The console prints the public webhook URL (set `DM_ADMINS_WEBHOOK_URL=true` in `.env` to also have the bot DM it to every admin on startup). `/admin webhookurl` shows it again any time.
 7. **Paste that URL into NFL Universe's webhook setting**, then pick a channel for results with `/admin channel`.
 
@@ -243,7 +244,8 @@ Restart the bot or run `/admin recalc`. Commands like `/player` then accept eith
 ## 6. Files
 
 ```
-bot.py                     entry point: Discord bot + webhook server + tunnel
+bot.py                     entry point: Discord bot + webhook server + website + tunnel
+start.bat, start.sh        one-click start (sets up .venv on first run)
 config.py                  ADMIN_IDS, fantasy scoring, player names, NFL Universe webhook ID   <- edit me
 .env.example               copy to .env and fill in                     <- edit me
 nflu/parser.py             webhook JSON -> game + player stats
