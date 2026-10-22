@@ -85,6 +85,7 @@ input.big::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:36
 background:var(--accent);border:4px solid var(--card);box-shadow:0 1px 6px rgba(0,0,0,.45)}
 input.big::-moz-range-thumb{width:30px;height:30px;border-radius:50%;background:var(--accent);
 border:4px solid var(--card);box-shadow:0 1px 6px rgba(0,0,0,.45)}
+.pickbox select.add{display:block;width:100%;margin:6px 0}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden}
 .seg label{margin:0!important;position:relative}.seg input{position:absolute;opacity:0;width:1px;height:1px}
 .seg span{display:block;padding:10px 18px;min-width:64px;text-align:center;cursor:pointer;user-select:none}
@@ -509,7 +510,8 @@ class BookSite:
         for mu in live:
             markets = self.book.markets(mu["id"])
             markets = [m for m in markets if not m["parent_id"]]
-            main = [m for m in markets if m["kind"] in ("moneyline", "total")]
+            main = [m for m in markets if m["kind"] in ("moneyline", "spread") or (m["kind"] == "total"
+                                                                                  and not m["stat"])]
             n_props = len(markets) - len(main)
             text = " ".join([mu["title"], mu["team1"], mu["team2"]] + [name(k) for k in mu["players1"] + mu["players2"]])
             cards.append(
@@ -642,7 +644,8 @@ class BookSite:
         markets = [m for m in everything if not m["parent_id"]]
         groups: dict[str, list[dict]] = {}
         for m in markets:
-            head = ("Game" if m["kind"] in ("moneyline", "total") else
+            head = ("Game" if m["kind"] in ("moneyline", "spread") or (m["kind"] == "total" and not m["stat"]) else
+                    "Game props" if m["kind"] in ("total", "yesno") else
                     "Specials" if m["kind"] == "custom" else name(m["player_key"]))
             groups.setdefault(head, []).append(m)
         ctx = self._parlay_ctx(request, bettor)
@@ -655,7 +658,7 @@ class BookSite:
                 html = self._slider_row(m, name, ctx, self.book.ladder(m, models, alts.get(m["id"], [])))
             else:
                 html = self._market_row(m, mu, name, ctx)
-            kind = "game" if m["kind"] in ("moneyline", "total") else m["kind"]
+            kind = "game" if m["kind"] in ("moneyline", "spread", "total", "yesno") else m["kind"]
             text = " ".join([self._title(m, name)] + [x["label"] for x in m["selections"]]).lower()
             return (f'<div class="fr" data-k="{kind}" data-t="{side.get(m["player_key"], "")}" '
                     f'data-q="{_e(text)}">{html}</div>')
@@ -1261,8 +1264,13 @@ class BookSite:
                       f'{" checked" if on.get(k, "") == v else ""}><span>{_e(lbl)}</span></label>'
                       for v, lbl in (("", "Out"), ("1", t1), ("2", t2)))
             + "</div></td></tr>" for k, label in sorted(people.items(), key=lambda kv: name(kv[0]).lower()))
+        # Each team's card also has a dropdown to add a player straight to it, and a ✕ on each name
         order = (mu["players1"] + mu["players2"]) if mu else []
-        lists = "".join(f'<div class="card t{i}" style="margin:0"><b>{_e(t)}</b><ol id="pk{i}">'
+        everyone = sorted(people.items(), key=lambda kv: name(kv[0]).lower())
+        options = "".join(f'<option value="{_e(k)}">{_e(label)}</option>' for k, label in everyone)
+        lists = "".join(f'<div class="card t{i}" style="margin:0"><b>{_e(t)}</b>'
+                        f'<select class="add" data-t="{i}" aria-label="Add a player to {_e(t)}">'
+                        f'<option value="">＋ Add a player…</option>{options}</select><ol id="pk{i}">'
                         + "".join(f"<li>{_e(name(k))}</li>" for k in (mu[f"players{i}"] if mu else []))
                         + "</ol></div>" for i, t in ((1, t1), (2, t2)))
         return (f'<div class="pickbox"><input type="hidden" name="order" value="{_e(",".join(order))}">'
@@ -1274,7 +1282,15 @@ class BookSite:
                 "function draw(){[1,2].forEach(function(t){var ol=box.querySelector('#pk'+t);ol.innerHTML='';"
                 "o.forEach(function(k){var tr=box.querySelector('tr[data-k=\"'+CSS.escape(k)+'\"]'),"
                 "c=tr&&tr.querySelector('input:checked');if(c&&c.value==t){var li=document.createElement('li');"
-                "li.textContent=tr.dataset.n;ol.appendChild(li);}});});ord.value=o.join(',');}"
+                "li.textContent=tr.dataset.n+' ';var x=document.createElement('a');x.href='#';x.textContent='\\u2715';"
+                "x.title='Take off the team';x.className='small';x.onclick=function(e){e.preventDefault();set(k,'')};"
+                "li.appendChild(x);ol.appendChild(li);}});});ord.value=o.join(',');"
+                "box.querySelectorAll('select.add option[value]').forEach(function(op){if(op.value)"
+                "op.disabled=o.indexOf(op.value)>=0;});}"
+                "function set(k,t){var r=box.querySelector('tr[data-k=\"'+CSS.escape(k)+'\"] input[value=\"'+t+'\"]');"
+                "if(r){r.checked=true;r.dispatchEvent(new Event('change'));}}"
+                "box.querySelectorAll('select.add').forEach(function(sl){sl.addEventListener('change',function(){"
+                "if(sl.value)set(sl.value,sl.dataset.t);sl.value='';});});"
                 "box.querySelectorAll('.seg input').forEach(function(i){i.addEventListener('change',function(){"
                 "var k=i.closest('tr').dataset.k;o=o.filter(function(x){return x!==k});if(i.value)o.push(k);draw();});});"
                 "box.querySelector('.find').addEventListener('input',function(e){var q=e.target.value.toLowerCase();"
@@ -1314,7 +1330,7 @@ class BookSite:
         done = m["status"] in ("settled", "void")
         dis = " disabled" if done else ""
         line = (f'<label>Line <input class="n" name="line" value="{m["line"]:g}"{dis}></label>'
-                if m["kind"] in ("total", "prop") else "")
+                if m["kind"] in ("total", "prop", "spread") else "")
         odds = " ".join(
             f'<label>{_e(s["label"])} <input class="n" name="odds_{s["id"]}" value="{fmt_odds(s["odds"])}"{dis}>'
             f'</label><span class="small muted">{s["bets"]} bets · {_money(s["handle"])}'

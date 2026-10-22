@@ -69,7 +69,7 @@ def test_models_and_settlement(tmp_path):
     mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
     assert book.matchup(mid)["title"] == "Team qbone vs Team qbtwo"
     kinds = [m["kind"] for m in book.markets(mid)]
-    assert kinds[:2] == ["moneyline", "total"] and kinds.count("prop") >= 8
+    assert kinds[:3] == ["moneyline", "spread", "total"] and kinds.count("prop") >= 8
     bettor, _ = book.create_bettor("Sam")
     ml = book.markets(mid)[0]
     prop = next(m for m in book.markets(mid) if m["stat"] == "pass_yards" and m["player_key"] == "qbone")
@@ -548,3 +548,38 @@ def test_parlay_cart(tmp_path):
             assert r["ok"] and r["balance"] == START_BALANCE - 25
             assert (await (await c.get("/book/api/slip")).json())["legs"] == []
     asyncio.run(run())
+
+
+def test_spread_and_game_props(tmp_path):
+    from nflu.sportsbook import game_stat_value
+    line = lambda **st: {"stats": st}
+    # 3 TDs + a field goal = 21; 25 points means 4 after touchdowns, more than one a TD: a 2-pt try made
+    sheet = [line(pass_tds=2, fg_made=1), line(rec_tds=2), line(rush_tds=1)]
+    assert game_stat_value(sheet, "g:tds") == 3 and game_stat_value(sheet, "g:pat", 25) == 4
+    assert game_stat_value(sheet, "g:two_pt", 25) == 1 and game_stat_value(sheet, "g:two_pt", 21) == 0
+    assert game_stat_value(sheet, "g:two_pt", 23) is None and game_stat_value(sheet, "g:pat", 40) is None
+
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    ms = book.markets(mid)
+    spread = next(m for m in ms if m["kind"] == "spread")
+    assert spread["line"] % 1 == 0.5 and spread["selections"][0]["label"].startswith("Team qbone ")
+    tds = next(m for m in ms if m["stat"] == "g:tds")
+    two = next(m for m in ms if m["kind"] == "yesno")
+    assert tds["kind"] == "total" and book.ladder(tds)
+    book.update_market(spread["id"], -6.5, {}, reprice=True)
+    assert book.market(spread["id"])["selections"][1]["label"] == "Team qbtwo +6.5"
+
+    g = _game(10, random.Random(1), home="Ravens", away="Bills", score=(7, 32))
+    for p in g.players:
+        for k in ("pass_tds", "rec_tds", "rush_tds", "def_tds"):
+            p.stats.pop(k, None)
+    g.players[0].stats.update(pass_tds=4)  # team 1: 24 + 8 after TDs = 32, so a 2-pt try was made
+    g.players[2].stats.update(pass_tds=1)
+    gid, _ = db.save_game(g)
+    book.settle_from_game(mid, gid)
+    sp = book.market(spread["id"])
+    assert [s["outcome"] for s in sp["selections"]] == ["win", "lose"]  # won by 25, more than 6.5
+    assert book.market(tds["id"])["result"].startswith("5 touchdowns")
+    assert [s["outcome"] for s in book.market(two["id"])["selections"]] == ["win", "lose"]

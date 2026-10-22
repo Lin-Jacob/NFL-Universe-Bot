@@ -66,6 +66,25 @@ TD_STATS = ("rush_tds", "rec_tds", "def_tds", "kick_return_tds", "punt_return_td
 # Props created automatically for each player in a new matchup (only stats they have recorded)
 QB_PROPS = ("pass_yards", "pass_tds", "interceptions", "pass_completions")
 ALL_PROPS = ("receptions", "rec_yards", "any_td", "tackles", "sacks", "def_ints", "pass_deflections")
+# Game bets on what both teams do together, over/unders settled from the whole game's stat sheet.
+# Keys start "g:" (a market's stat); the sheet has no extra points or 2-point conversions, so
+# "Points after touchdowns" is worked out from the final score.
+GAME_STATS = {
+    "g:tds": "Touchdowns (both teams)",
+    "g:fg_made": "Field goals made",
+    "g:longest_fg": "Longest field goal (yards)",
+    "g:pat": "Points after touchdowns (extra points + 2-pt conversions)",
+    "g:sacks": "Sacks",
+    "g:turnovers": "Turnovers (interceptions + fumbles recovered)",
+    "g:punts": "Punts",
+    "g:ret_tds": "Defensive and return touchdowns",
+    "g:safeties": "Safeties",
+}
+# A past game can't say whether a 2-pt try was made (see game_stat_value), so this yes/no starts
+# from a guess that a few games tell apart
+TWO_PT_PRIOR = 0.3
+# Final-score margin spread assumed when fewer than 2 games are stored
+DEFAULT_MARGIN_SD = 14.0
 # Stats spread like yards (normal curve) rather than counts (Poisson)
 _CONTINUOUS_HINTS = ("yard", "yac", "fantasy", "longest")
 
@@ -287,7 +306,41 @@ def alt_lines(model: dict, main: float) -> list[float]:
 
 
 def stat_label(stat: str) -> str:
-    return DERIVED.get(stat) or label(stat)
+    return GAME_STATS.get(stat) or DERIVED.get(stat) or label(stat)
+
+
+def game_stat_value(lines: list[dict], stat: str, score: float | None = None) -> float | None:
+    """A game stat over every player's line in one game (score = both teams' points, needed for
+    "g:pat" and "g:two_pt"). Passing and catching both record a TD or an interception, so the larger
+    side counts, not both. None when it can't be told.
+
+    The points a touchdown's try added are the score less 6 a TD, 3 a field goal and 2 a safety.
+    "g:two_pt" is 1 (a 2-pt try was made) when those points beat one a TD, 0 when there were none,
+    and None otherwise (one 2-pt try and a missed kick look like two kicks)."""
+    def tot(*keys):
+        return sum(ln["stats"].get(k) or 0 for ln in lines for k in keys)
+    tds = max(tot("pass_tds"), tot("rec_tds")) + tot("rush_tds", "def_tds", "kick_return_tds", "punt_return_tds")
+    name = stat[2:]
+    if name == "tds":
+        return tds
+    if name == "longest_fg":
+        return max([ln["stats"].get("longest_fg") or 0 for ln in lines] or [0])
+    if name == "turnovers":
+        return max(tot("interceptions"), tot("def_ints")) + tot("fumble_recoveries")
+    if name == "sacks":
+        return max(tot("sacks"), tot("sacks_taken"))
+    if name == "ret_tds":
+        return tot("def_tds", "kick_return_tds", "punt_return_tds")
+    if name in ("pat", "two_pt"):
+        if score is None:
+            return None
+        extra = score - 6 * tds - 3 * tot("fg_made") - 2 * tot("safeties")
+        if not 0 <= extra <= 2 * tds:  # the sheet is missing someone's scoring
+            return None
+        if name == "pat":
+            return extra
+        return 1 if extra > tds else 0 if extra == 0 else None
+    return tot(name)
 
 
 def bettable_stats() -> list[tuple[str, str]]:
@@ -379,6 +432,64 @@ def moneyline_chances(db: Database, keys1: list[str], keys2: list[str]) -> tuple
     var = sum(ratings.get(k, league)["sd"] ** 2 for k in keys1 + keys2)
     p1, p2 = analytics.win_odds(proj[0]["total"], proj[1]["total"], var)
     return p1, p2, {"team1": proj[0]["total"], "team2": proj[1]["total"]}
+
+
+def _probit(p: float) -> float:
+    lo, hi = -8.0, 8.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if _phi(mid) < p else (lo, mid)
+    return (lo + hi) / 2
+
+
+def spread_model(db: Database, p1: float) -> dict:
+    """Team 1's final-score margin as a normal curve: as spread out as past games' margins, centred
+    where team 1 wins as often as the winner odds say."""
+    margins = [r["m"] for r in db.q("SELECT home_score - away_score m FROM games")]
+    if len(margins) < 2:
+        sd = DEFAULT_MARGIN_SD
+    else:
+        mean = sum(margins) / len(margins)
+        sd = max((sum((m - mean) ** 2 for m in margins) / (len(margins) - 1)) ** 0.5, 3.0)
+    p1 = min(max(p1, 0.01), 0.99)
+    return {"mean": sd * _probit(p1), "sd": sd, "dist": "normal"}
+
+
+def spread_line(model: dict) -> float:
+    """Team 1's handicap: the .5 line closest to an even bet (−3.5 = team 1 has to win by 4)."""
+    return -(math.floor(model["mean"]) + 0.5)
+
+
+def p_cover(model: dict, line: float) -> float:
+    """Chance team 1 wins by more than its handicap (margin + line > 0)."""
+    return 1 - _phi((-line - model["mean"]) / max(model["sd"], 1e-6))
+
+
+def _game_values(db: Database, stat: str) -> list[float]:
+    """The stat in each stored game with stat lines (None ones, which can't be told, left out)."""
+    by_game: dict[int, list[dict]] = defaultdict(list)
+    for ln in db.all_player_lines():
+        by_game[ln["game_id"]].append(ln)
+    scores = {r["id"]: r["home_score"] + r["away_score"] for r in db.q("SELECT id, home_score, away_score FROM games")}
+    vals = (game_stat_value(lines, stat, scores.get(gid)) for gid, lines in by_game.items())
+    return [v for v in vals if v is not None]
+
+
+def game_stat_model(db: Database, stat: str) -> dict:
+    """A game stat in past games, as a curve (counts are Poisson, yards and big numbers normal)."""
+    vals = _game_values(db, stat)
+    n = len(vals)
+    mean = sum(vals) / n if n else 0.0
+    sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5 if n > 1 else max(mean, 1.0) ** 0.5
+    continuous = any(h in stat for h in _CONTINUOUS_HINTS) or mean >= 10
+    return {"mean": mean, "sd": max(sd, 0.5), "dist": "normal" if continuous else "poisson", "games": n,
+            "any": any(vals)}
+
+
+def two_pt_chance(db: Database) -> float:
+    """How often a 2-pt try is made, from the past games that show it, pulled toward TWO_PT_PRIOR."""
+    vals = _game_values(db, "g:two_pt")
+    return (sum(vals) + 3 * TWO_PT_PRIOR) / (len(vals) + 3)
 
 
 def total_model(db: Database) -> dict:
@@ -555,10 +666,39 @@ class Book:
         o1, o2 = price([p1, p2])
         self._add_market(matchup_id, "moneyline", "Winner",
                          [("team1", mu["team1"], o1, p1), ("team2", mu["team2"], o2, p2)], sort=0)
+        sm = spread_model(self.db, p1)
+        self._add_spread(matchup_id, mu, sm, spread_line(sm))
         tm = total_model(self.db)
         line = default_line(tm)
         self._add_total(matchup_id, tm, line)
+        self._game_props(matchup_id)
         self._player_props(matchup_id, mu["players1"] + mu["players2"], names)
+
+    def _add_spread(self, matchup_id: int, mu: dict, model: dict, line: float) -> int:
+        pc = p_cover(model, line)
+        o1, o2 = price([pc, 1 - pc])
+        return self._add_market(matchup_id, "spread", "Spread",
+                                [("team1", f"{mu['team1']} {line:+g}", o1, pc),
+                                 ("team2", f"{mu['team2']} {-line:+g}", o2, 1 - pc)], line=line, sort=1)
+
+    def _game_props(self, matchup_id: int) -> None:
+        """Over/unders on the whole game (stats some past game has recorded), and a 2-pt yes/no."""
+        if self.db.one("SELECT COUNT(*) n FROM games")["n"] < 2:
+            return
+        for sort, stat in enumerate(GAME_STATS, start=3):
+            model = game_stat_model(self.db, stat)
+            if not model["any"]:
+                continue
+            line = default_line(model)
+            po = p_over(model, line)
+            oo, ou = price([po, 1 - po])
+            self._add_market(matchup_id, "total", stat_label(stat),
+                             [("over", f"Over {line:g}", oo, po), ("under", f"Under {line:g}", ou, 1 - po)],
+                             stat=stat, line=line, sort=sort)
+        py = two_pt_chance(self.db)
+        oy, on = price([py, 1 - py])
+        self._add_market(matchup_id, "yesno", "A 2-point conversion is made", [("yes", "Yes", oy, py),
+                         ("no", "No", on, 1 - py)], stat="g:two_pt", sort=3 + len(GAME_STATS))
 
     def _player_props(self, matchup_id: int, keys: list[str], names=lambda k: k, first_sort: int = 10) -> None:
         """The usual props for these players: fantasy points plus the stats each has recorded."""
@@ -597,6 +737,10 @@ class Book:
                 c.execute("UPDATE book_selections SET label = ? WHERE side = ? AND market_id IN "
                           "(SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'moneyline')",
                           (name, side, matchup_id))
+                c.execute("UPDATE book_selections SET label = ? || ' ' || (SELECT printf('%+g', "
+                          "CASE WHEN ? = 'team1' THEN line ELSE -line END) FROM book_markets m WHERE m.id = market_id) "
+                          "WHERE side = ? AND market_id IN (SELECT id FROM book_markets WHERE matchup_id = ? "
+                          "AND kind = 'spread')", (name, side, side, matchup_id))
             c.commit()
         for m in self.db.q("SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'prop' AND player_key IN "
                            f"({','.join('?' * len(removed))}) AND status IN ('open', 'locked')",
@@ -607,8 +751,8 @@ class Book:
                                 "AND sort < 90", (matchup_id,))["n"]
             self._player_props(matchup_id, added, names, first_sort=first)
         if removed or added or moved:
-            for m in self.db.q("SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'moneyline' "
-                               "AND status IN ('open', 'locked')", (matchup_id,)):
+            for m in self.db.q("SELECT id FROM book_markets WHERE matchup_id = ? AND kind IN ('moneyline', "
+                               "'spread') AND status IN ('open', 'locked')", (matchup_id,)):
                 self.update_market(m["id"], None, {}, reprice=True)
         parts = [f"{len(added)} player{'s' * (len(added) != 1)} added"] if added else []
         parts += [f"{len(removed)} taken out (their props voided)"] if removed else []
@@ -640,7 +784,7 @@ class Book:
         oo, ou = price([po, 1 - po])
         return self._add_market(matchup_id, "total", "Total points (both teams)",
                                 [("over", f"Over {line:g}", oo, po), ("under", f"Under {line:g}", ou, 1 - po)],
-                                line=line, sort=1)
+                                line=line, sort=2)
 
     def add_prop(self, matchup_id: int, key: str, stat: str, line: float | None = None, names=lambda k: k,
                  models: Models | None = None, sort: int = 50) -> int:
@@ -717,7 +861,7 @@ class Book:
 
     def model_for(self, market: dict, models: Models | None = None) -> dict | None:
         if market["kind"] == "total":
-            return total_model(self.db)
+            return game_stat_model(self.db, market["stat"]) if market["stat"] else total_model(self.db)
         if market["kind"] == "prop":
             return (models or Models(self.db)).stat(market["player_key"], market["stat"])
         return None
@@ -731,6 +875,14 @@ class Book:
             raise BookError("This market is already settled.")
         with self.db.lock:
             c = self.db.conn
+            if line is not None and m["kind"] == "spread":
+                mu = self.matchup(m["matchup_id"])
+                c.execute("UPDATE book_markets SET line = ? WHERE id = ?", (line, market_id))
+                for s in m["selections"]:
+                    first = s["side"] == "team1"
+                    c.execute("UPDATE book_selections SET label = ? WHERE id = ?",
+                              (f"{mu['team1'] if first else mu['team2']} {(line if first else -line):+g}", s["id"]))
+                m["line"] = line
             if line is not None and m["kind"] in ("total", "prop"):  # a whole-number line can push
                 c.execute("UPDATE book_markets SET line = ? WHERE id = ?", (line, market_id))
                 for s in m["selections"]:
@@ -744,6 +896,22 @@ class Book:
                     over = s["side"] == "over"
                     c.execute("UPDATE book_selections SET odds = ?, fair_p = ? WHERE id = ?",
                               (oo if over else ou, po if over else 1 - po, s["id"]))
+            elif reprice and m["kind"] == "spread":
+                mu = self.matchup(m["matchup_id"])
+                p1, _, _ = moneyline_chances(self.db, mu["players1"], mu["players2"])
+                pc = p_cover(spread_model(self.db, p1), m["line"])
+                o1, o2 = price([pc, 1 - pc])
+                for s in m["selections"]:
+                    first = s["side"] == "team1"
+                    c.execute("UPDATE book_selections SET odds = ?, fair_p = ? WHERE id = ?",
+                              (o1 if first else o2, pc if first else 1 - pc, s["id"]))
+            elif reprice and m["kind"] == "yesno":
+                py = two_pt_chance(self.db)
+                oy, on = price([py, 1 - py])
+                for s in m["selections"]:
+                    yes = s["side"] == "yes"
+                    c.execute("UPDATE book_selections SET odds = ?, fair_p = ? WHERE id = ?",
+                              (oy if yes else on, py if yes else 1 - py, s["id"]))
             elif reprice and m["kind"] == "moneyline":
                 mu = self.matchup(m["matchup_id"])
                 p1, p2, _ = moneyline_chances(self.db, mu["players1"], mu["players2"])
@@ -1207,7 +1375,7 @@ class Book:
                     # "Ravens (Team Jacob)", so bettors still recognise the lineup they picked
                     c.execute("UPDATE book_selections SET label = ? || ' (' || label || ')' WHERE side = ? "
                               "AND label LIKE 'Team %' AND market_id IN (SELECT id FROM book_markets "
-                              "WHERE matchup_id = ? AND kind = 'moneyline')", (name, side, matchup_id))
+                              "WHERE matchup_id = ? AND kind IN ('moneyline', 'spread'))", (name, side, matchup_id))
                 c.commit()
             mu = self.matchup(matchup_id)
         settled, left = 0, []
@@ -1228,9 +1396,38 @@ class Book:
     def _settle_one(self, m: dict, game, game_id: int, lines: dict[str, dict], scores, mu: dict) -> bool:
         """Grade one market from a game. False if the game can't answer it (settle it by hand)."""
         sels = {s["side"]: s["id"] for s in m["selections"]}
+        score = game["home_score"] + game["away_score"]
+        if m["kind"] == "yesno":
+            if not lines:
+                return False
+            made = game_stat_value(list(lines.values()), m["stat"], score)
+            if made is None:
+                self._grade(m["id"], {sid: "void" for sid in sels.values()},
+                            f"Void: game #{game_id}'s stat sheet can't tell, stakes returned", status="void")
+                return True
+            self._grade(m["id"], {sels["yes"]: "win" if made else "lose", sels["no"]: "lose" if made else "win"},
+                        f"{'Yes' if made else 'No'} (game #{game_id})")
+            return True
+        if m["kind"] == "spread":
+            if not scores and game["home_score"] != game["away_score"]:
+                return False
+            s1, s2 = scores or (game["home_score"], game["away_score"])  # a tie is a tie either way round
+            o1 = "win" if s1 + m["line"] > s2 else "lose" if s1 + m["line"] < s2 else "push"
+            self._grade(m["id"], {sels["team1"]: o1, sels["team2"]: {"win": "lose", "lose": "win", "push": "push"}[o1]},
+                        f"{mu['team1']} {s1} – {s2} {mu['team2']} (game #{game_id})")
+            return True
         if m["kind"] in ("prop", "total"):
-            if m["kind"] == "total":
-                value, what = game["home_score"] + game["away_score"], "points"
+            if m["kind"] == "total" and m["stat"]:
+                if not lines:
+                    return False
+                value = game_stat_value(list(lines.values()), m["stat"], score)
+                if value is None:
+                    self._grade(m["id"], {sid: "void" for sid in sels.values()},
+                                f"Void: game #{game_id}'s stat sheet can't tell, stakes returned", status="void")
+                    return True
+                what = stat_label(m["stat"]).split(" (")[0].lower()
+            elif m["kind"] == "total":
+                value, what = score, "points"
             else:
                 ln = lines.get(m["player_key"])
                 if ln is None:
