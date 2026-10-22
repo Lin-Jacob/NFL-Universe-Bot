@@ -98,6 +98,16 @@ border:4px solid var(--card);box-shadow:0 1px 6px rgba(0,0,0,.45)}
 .tabs{display:flex;gap:6px;margin:0 0 12px}.tabs a{padding:6px 14px;border:1px solid var(--line);border-radius:999px}
 .tabs a.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 button.ad.in{background:var(--win)}
+.filters{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;position:sticky;top:0;z-index:5}
+.filters .fq{flex:1 1 220px}
+#betcard{position:fixed;z-index:50;width:320px;max-width:calc(100vw - 20px);background:var(--card);color:var(--text);
+border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.35);display:none}
+#betcard .bh{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);cursor:move;
+touch-action:none;user-select:none;font-weight:700}#betcard .bh span{flex:1}
+#betcard .bh button{padding:2px 9px;background:var(--chip);color:var(--text);border:1px solid var(--line)}
+#betcard .bb{padding:12px;display:grid;gap:10px}#betcard .pick{font-size:18px;font-weight:700}
+#betcard .q{display:flex;gap:6px;flex-wrap:wrap}#betcard .q button{padding:4px 10px}
+#betcard .bm{min-height:1.2em}
 .opts label{display:flex;gap:8px;align-items:center;margin:4px 0}
 </style>"""
 
@@ -108,7 +118,8 @@ _STATUS = {"open": "Open", "locked": "Betting closed", "settled": "Settled", "vo
 LIVE_JS = """<div id="live" class="msg" style="display:none;position:sticky;bottom:10px">Odds or bets just changed.
 <a href="" onclick="location.reload();return false">Reload to see them</a></div>
 <script>(function(){var v=null;function busy(){var a=document.activeElement;if(a&&a.tagName=='INPUT')return true;
-var s=document.getElementById('stake');return !!(s&&s.value);}
+var s=document.getElementById('stake'),c=document.getElementById('betcard');
+return !!(s&&s.value)||!!(c&&c.style.display==='block');}
 function tick(){if(document.hidden)return;fetch('/book/version',{cache:'no-store'}).then(function(r){return r.json()})
 .then(function(d){if(v===null){v=d.v;return;}if(d.v!==v){if(busy()){document.getElementById('live').style.display='block';}
 else{location.reload();}}}).catch(function(){});}
@@ -123,6 +134,76 @@ f.elements.line.value=x[0];var lb=f.querySelectorAll('.lb'),b=f.querySelectorAll
 ['Over','Under'].forEach(function(w,j){lb[j].textContent=w+' '+x[0];b[j].textContent=fo(x[1+j]);
 var inn=x[3+j]!==null&&slip.indexOf(x[3+j])>=0;ad[j].textContent=inn?'\u2713':'+';ad[j].className=(inn?'in':'sec')+' ad';});}
 r.addEventListener('input',u);u();});})();</script>"""
+
+
+# Search box + filter buttons (see BookSite._filter_bar)
+FILTER_JS = """<script>(function(){var bar=document.currentScript.previousElementSibling,q=bar.querySelector('.fq'),
+t=bar.querySelector('.ft'),n=bar.querySelector('.fn'),kind='';
+function run(){var s=q.value.trim().toLowerCase(),tm=t?t.value:'',shown=0,all=document.querySelectorAll('.fr');
+all.forEach(function(r){var ok=(!kind||r.dataset.k===kind)&&(!tm||r.dataset.t===tm)&&
+s.split(/\\s+/).every(function(w){return r.dataset.q.indexOf(w)>=0});r.style.display=ok?'':'none';if(ok)shown++;});
+document.querySelectorAll('.fg').forEach(function(g){g.style.display=g.querySelector('.fr:not([style*="none"])')?'':'none'});
+n.textContent=(s||kind||tm)?shown+' of '+all.length:'';}
+bar.querySelectorAll('[data-f]').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();
+kind=a.dataset.f;bar.querySelectorAll('[data-f]').forEach(function(b){b.className=b===a?'on':''});run();});});
+q.addEventListener('input',run);if(t)t.addEventListener('change',run);})();</script>"""
+
+# The bet card: tapping odds opens a small card you can drag anywhere (it remembers where) to bet
+# without leaving the page. Links still work without JavaScript (they open /book/bet/<id>).
+BETCARD_JS = """<script>(function(){var c=document.getElementById('betcard'),cs=c.dataset.csrf,sel=null;
+var H={'X-Requested-With':'fetch'};function $(x){return c.querySelector(x)}
+function f(v){return '$'+v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+function fo(o){return(o>0?'+':'')+o}function stake(){return parseFloat(($('.st').value||'').replace(/[$,]/g,''))||0}
+function upd(){if(!sel)return;var s=stake(),d=sel.decimal;$('.win').textContent=f(s*(d-1));$('.ret').textContent=f(s*d);}
+function msg(t,bad){var m=$('.bm');m.textContent=t;m.className='bm small '+(bad?'lost':'won');}
+function money(b){var e=document.querySelector('.bar .money');if(e&&b!=null)e.textContent=f(b);}
+function slipCount(n){document.querySelectorAll('a[href="/book/parlay"]').forEach(function(a){
+if(/slip/i.test(a.textContent))a.textContent=a.textContent.replace(/\\(\\d+\\)/,'('+n+')');});}
+function place(){try{var p=JSON.parse(localStorage.getItem('betcard-pos'));if(p){c.style.left=Math.min(p[0],innerWidth-60)+'px';
+c.style.top=Math.min(p[1],innerHeight-60)+'px';return;}}catch(e){}c.style.left=Math.max(10,innerWidth-340)+'px';c.style.top='90px';}
+function open(id){fetch('/book/api/sel/'+id,{headers:H,cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+if(!d.ok){location.href='/book/bet/'+id;return;}sel=d;$('.mt').textContent=d.matchup;$('.tt').textContent=d.title;
+$('.pick').innerHTML='';$('.pick').append(d.label+' ');var o=document.createElement('span');o.className='odds';
+o.textContent=fo(d.odds);$('.pick').append(o);$('.bal').textContent=f(d.balance);$('.ad').textContent=d.in_slip?
+'\\u2713 In your parlay slip':'+ Add to parlay';$('.ad').disabled=d.in_slip;msg('');
+$('.go').disabled=!d.open;if(!d.open)msg('Betting on this is closed.',true);c.style.display='block';place();upd();$('.st').focus();});}
+document.addEventListener('click',function(e){var a=e.target.closest('a.sel[href^="/book/bet/"]');
+if(a&&!e.ctrlKey&&!e.metaKey){e.preventDefault();open(a.getAttribute('href').split('/').pop());return;}
+var b=e.target.closest('form.alt button[value$=":bet"]');if(b){e.preventDefault();var fm=new FormData(b.form);
+fm.set('pick',b.value);fetch(b.form.action,{method:'POST',body:fm,headers:H}).then(function(r){return r.json()})
+.then(function(d){if(d.ok)open(d.sel);else alertless(d.msg);});}});
+function alertless(t){c.style.display='block';place();msg(t,true);}
+$('.x').addEventListener('click',function(){c.style.display='none'});
+document.addEventListener('keydown',function(e){if(e.key==='Escape')c.style.display='none'});
+$('.st').addEventListener('input',upd);
+c.querySelectorAll('.q button').forEach(function(b){b.addEventListener('click',function(){
+$('.st').value=b.dataset.v==='max'?String(sel?sel.balance:0):String(stake()+(+b.dataset.v));upd();});});
+$('.go').addEventListener('click',function(){if(!sel)return;var fd=new FormData();fd.set('csrf',cs);fd.set('odds',sel.odds);
+fd.set('stake',$('.st').value);$('.go').disabled=true;fetch('/book/bet/'+sel.id,{method:'POST',body:fd,headers:H})
+.then(function(r){return r.json()}).then(function(d){$('.go').disabled=false;msg(d.msg,!d.ok);money(d.balance);
+if(d.ok){sel.balance=d.balance;$('.bal').textContent=f(d.balance);$('.st').value='';upd();}else if(d.odds){sel.odds=d.odds;
+sel.decimal=d.decimal;$('.pick .odds').textContent=fo(d.odds);upd();}});});
+$('.ad').addEventListener('click',function(){if(!sel)return;var fd=new FormData();fd.set('csrf',cs);fd.set('next','/book');
+fetch('/book/parlay/add/'+sel.id,{method:'POST',body:fd,headers:H}).then(function(r){return r.json()}).then(function(d){
+msg(d.msg,!d.ok);if(d.ok){$('.ad').textContent='\\u2713 In your parlay slip';$('.ad').disabled=true;slipCount(d.count);}});});
+var h=$('.bh'),dx=0,dy=0,drag=false;h.addEventListener('pointerdown',function(e){if(e.target.closest('button'))return;
+drag=true;dx=e.clientX-c.offsetLeft;dy=e.clientY-c.offsetTop;h.setPointerCapture(e.pointerId);});
+h.addEventListener('pointermove',function(e){if(!drag)return;var x=Math.max(0,Math.min(innerWidth-60,e.clientX-dx)),
+y=Math.max(0,Math.min(innerHeight-40,e.clientY-dy));c.style.left=x+'px';c.style.top=y+'px';});
+h.addEventListener('pointerup',function(){if(!drag)return;drag=false;try{localStorage.setItem('betcard-pos',
+JSON.stringify([c.offsetLeft,c.offsetTop]));}catch(e){}});})();</script>"""
+
+BETCARD_HTML = """<div id="betcard" role="dialog" aria-label="Bet slip" data-csrf="{csrf}">
+<div class="bh" title="Drag to move"><span>⠿ Bet slip</span><button class="x" type="button" aria-label="Close">✕</button></div>
+<div class="bb"><div><div class="small muted mt"></div><div class="small tt"></div><div class="pick"></div></div>
+<label class="small">Stake ($) <span class="muted">· you have <b class="bal"></b></span><br>
+<input class="st" inputmode="decimal" placeholder="100" autocomplete="off"></label>
+<div class="q"><button type="button" class="sec" data-v="10">+$10</button><button type="button" class="sec" data-v="50">+$50</button>
+<button type="button" class="sec" data-v="100">+$100</button><button type="button" class="sec" data-v="500">+$500</button>
+<button type="button" class="sec" data-v="max">Max</button></div>
+<div class="small">To win <b class="win">$0.00</b> · paid back <b class="ret">$0.00</b></div>
+<button type="button" class="go">Place bet</button><button type="button" class="sec ad">+ Add to parlay</button>
+<div class="bm small"></div></div></div>"""
 
 
 def _money(v: float) -> str:
@@ -155,6 +236,11 @@ def _flash(request: web.Request) -> str:
     if m := request.query.get("err"):
         return f'<div class="msg err">{_e(m)}</div>'
     return ""
+
+
+def _ajax(request: web.Request) -> bool:
+    """A request from the bet card's script, which wants JSON back instead of a page."""
+    return request.headers.get("X-Requested-With") == "fetch"
 
 
 def _secure(request: web.Request) -> bool:
@@ -190,6 +276,7 @@ class BookSite:
             web.post("/book/parlay/clear", self.parlay_clear),
             web.post("/book/alt/{id}", self.alt_pick),
             web.get("/book/feed", self.feed),
+            web.get("/book/api/sel/{id}", self.api_selection),
             web.post("/book/tail/{kind}/{id}", self.tail),
             web.get("/book/me", self.me),
             web.get("/book/leaderboard", self.leaderboard),
@@ -255,7 +342,8 @@ class BookSite:
                 f'<a href="/book/me">My bets</a><a href="/book/feed">Everyone\'s bets</a>'
                 f'<a href="/book/leaderboard">Leaderboard</a>'
                 f'<form method="post" action="/book/logout" style="margin:0 0 0 auto">'
-                f'{self._hidden(request, BETTOR_COOKIE)}<button class="sec">Log out</button></form></div>')
+                f'{self._hidden(request, BETTOR_COOKIE)}<button class="sec">Log out</button></form></div>'
+                + BETCARD_HTML.replace("{csrf}", self._csrf(request, BETTOR_COOKIE)) + BETCARD_JS)
 
     def _slip_ids(self, bettor) -> set[int]:
         return {r["selection_id"] for r in self.db.q("SELECT selection_id FROM book_slip WHERE bettor_id = ?",
@@ -330,20 +418,26 @@ class BookSite:
         if not bettor:
             return self._page("Sportsbook", _flash(request) + self._join_html())
         cards, name, ctx = [], self._names(), self._parlay_ctx(request, bettor)
-        for mu in self.book.matchups(("open", "locked")):
+        live = self.book.matchups(("open", "locked"))
+        for mu in live:
             markets = self.book.markets(mu["id"])
             markets = [m for m in markets if not m["parent_id"]]
             main = [m for m in markets if m["kind"] in ("moneyline", "total")]
             n_props = len(markets) - len(main)
+            text = " ".join([mu["title"], mu["team1"], mu["team2"]] + [name(k) for k in mu["players1"] + mu["players2"]])
             cards.append(
-                f'<div class="card"><h2 style="margin-top:0"><a href="/book/matchups/{mu["id"]}">{_e(mu["title"])}</a> '
+                f'<div class="card fr" data-k="{mu["status"]}" data-q="{_e(text.lower())}">'
+                f'<h2 style="margin-top:0"><a href="/book/matchups/{mu["id"]}">#{mu["id"]} {_e(mu["title"])}</a> '
                 f'<span class="chip">{_STATUS[mu["status"]]}</span></h2>'
+                f'<p class="small muted" style="margin-top:-6px">{self._lineups(mu, name)}</p>'
                 + "".join(self._market_row(m, mu, name, ctx) for m in main)
                 + f'<p class="small"><a href="/book/matchups/{mu["id"]}">All {len(markets)} bets'
                   f'{f" ({n_props} player props and more)" if n_props else ""} →</a></p></div>')
         recent = self.book.matchups(("settled",))[:5]
         past = "".join(f'<li><a href="/book/matchups/{mu["id"]}">{_e(mu["title"])}</a></li>' for mu in recent)
-        body = (self._bar(request, bettor) + _flash(request) + "<h1>Sportsbook</h1>"
+        tools = self._filter_bar("Search games or players", [("", "All"), ("open", "Open"),
+                                                              ("locked", "Betting closed")]) if len(live) > 1 else ""
+        body = (self._bar(request, bettor) + _flash(request) + "<h1>Sportsbook</h1>" + tools
                 + ("".join(cards) or "<p class='muted'>No games are open for betting right now. Check back soon.</p>")
                 + (f"<h2>Recently settled</h2><ul>{past}</ul>" if past else ""))
         return self._page("Sportsbook", body, live=True)
@@ -467,24 +561,50 @@ class BookSite:
         ctx = self._parlay_ctx(request, bettor)
         models = Models(self.db)
 
+        side = {k: "1" for k in mu["players1"]} | {k: "2" for k in mu["players2"]}
+
         def row(m: dict) -> str:
             if m["kind"] in ("prop", "total") and m["status"] == "open" and mu["status"] == "open":
-                return self._slider_row(m, name, ctx, self.book.ladder(m, models, alts.get(m["id"], [])))
-            return self._market_row(m, mu, name, ctx)
-        cards = "".join(f'<div class="card"><h2 style="margin-top:0">{_e(head)}</h2>'
+                html = self._slider_row(m, name, ctx, self.book.ladder(m, models, alts.get(m["id"], [])))
+            else:
+                html = self._market_row(m, mu, name, ctx)
+            kind = "game" if m["kind"] in ("moneyline", "total") else m["kind"]
+            text = " ".join([self._title(m, name)] + [x["label"] for x in m["selections"]]).lower()
+            return (f'<div class="fr" data-k="{kind}" data-t="{side.get(m["player_key"], "")}" '
+                    f'data-q="{_e(text)}">{html}</div>')
+        cards = "".join(f'<div class="card fg"><h2 style="margin-top:0">{_e(head)}</h2>'
                         + "".join(row(m) for m in ms) + "</div>" for head, ms in groups.items())
-        lineups = " · ".join(f'<b>{_e(mu[t])}</b>: ' + ", ".join(_e(name(k)) for k in mu[p])
-                             for t, p in (("team1", "players1"), ("team2", "players2")))
+        lineups = self._lineups(mu, name)
+        tools = self._filter_bar("Search players or stats, e.g. passing yards",
+                                 [("", "All"), ("game", "Game"), ("prop", "Player props"), ("custom", "Specials")],
+                                 [("", "Both teams"), ("1", mu["team1"]), ("2", mu["team2"])])
         body = (self._bar(request, bettor) + _flash(request)
-                + f'<p class="small"><a href="/book">← all games</a></p><h1>{_e(mu["title"])} '
+                + f'<p class="small"><a href="/book">← all games</a></p><h1>#{mu["id"]} {_e(mu["title"])} '
                   f'<span class="chip">{_STATUS[mu["status"]]}</span></h1>'
-                  f'<p class="muted small">{lineups}</p>'
+                  f'<p class="small">{lineups}</p>'
                   f'<p class="small muted">Lines and odds come from each player\'s past games. Props settle on the '
                   f'stat in the game; a player who doesn\'t play has their props voided (stakes returned). '
                   f'Tap a pick to bet it alone, or <b>+</b> to add it to a <a href="/book/parlay">parlay</a>. '
                   f'Drag a slider for other lines: a higher line pays more on the over, less on the under.</p>'
-                + cards + (SLIDER_JS if "data-l=" in cards else ""))
+                + tools + cards + (SLIDER_JS if "data-l=" in cards else ""))
         return self._page(mu["title"], body, live=True)
+
+    @staticmethod
+    def _lineups(mu: dict, name) -> str:
+        """Each team (its in-game name once a game has named it) on its own line with its players."""
+        return "<br>".join(f'<b>{_e(mu[t])}</b>: ' + _e(", ".join(name(k) for k in mu[p]))
+                           for t, p in (("team1", "players1"), ("team2", "players2")))
+
+    @staticmethod
+    def _filter_bar(placeholder: str, kinds: list[tuple[str, str]], teams: list[tuple[str, str]] | None = None) -> str:
+        """Search box and filter buttons over the page's .fr rows (data-q text, data-k kind, data-t team);
+        a .fg card whose rows are all hidden hides too."""
+        chips = "".join(f'<a href="#" data-f="{k}"{" class=on" if not k else ""}>{_e(lbl)}</a>' for k, lbl in kinds)
+        team = ("" if not teams else '<select class="ft" aria-label="Team">'
+                + "".join(f'<option value="{k}">{_e(lbl)}</option>' for k, lbl in teams) + "</select>")
+        return (f'<div class="card filters"><input class="fq" type="search" placeholder="{_e(placeholder)}" '
+                f'aria-label="Search"><div class="tabs" style="margin:0">{chips}</div>{team}'
+                f'<span class="small muted fn"></span></div>' + FILTER_JS)
 
     def _slider_row(self, m: dict, name, ctx: dict, ladder: list[dict]) -> str:
         """An over/under with a big slider through its lines; the pick buttons follow the slider."""
@@ -527,6 +647,8 @@ class BookSite:
             m = self.book.market(self.book.alt_market(_int(request.match_info["id"], 0), line))
             sel = next(x for x in m["selections"] if x["side"] == side)
             if what == "bet":
+                if _ajax(request):
+                    return web.json_response({"ok": True, "sel": sel["id"]})
                 raise web.HTTPSeeOther(f"/book/bet/{sel['id']}")
             if sel["id"] in self._slip_ids(bettor):
                 self.book.slip_remove(bettor["id"], sel["id"])
@@ -536,8 +658,23 @@ class BookSite:
                 n = len(self._slip_ids(bettor))
                 msg = f"Added {sel['label']} to your parlay slip ({n} pick{'s' * (n != 1)})."
         except BookError as e:
+            if _ajax(request):
+                return web.json_response({"ok": False, "msg": str(e)})
             raise _redirect(nxt, str(e), err=True)
         raise _redirect(nxt, msg)
+
+    async def api_selection(self, request: web.Request) -> web.Response:
+        """What the bet card shows for one pick."""
+        bettor = self._bettor(request)
+        s = self.book.selection(_int(request.match_info["id"], 0))
+        if not bettor or not s:
+            return web.json_response({"ok": False})
+        return web.json_response({
+            "ok": True, "id": s["id"], "label": s["label"], "odds": s["odds"], "decimal": decimal_odds(s["odds"]),
+            "title": self._title(s), "matchup": f'#{s["matchup_id"]} {s["matchup_title"]}',
+            "open": s["matchup_status"] == "open" and s["market_status"] == "open",
+            "in_slip": s["id"] in self._slip_ids(bettor), "balance": bettor["balance"]},
+            headers={"Cache-Control": "no-store"})
 
     async def slip(self, request: web.Request, error: str = "", stake: str = "") -> web.Response:
         bettor = self._require_bettor(request)
@@ -584,8 +721,17 @@ class BookSite:
                 raise BookError("Enter how much to bet.")
             self.book.place_bet(bettor["id"], sel_id, stake, _int(form.get("odds")))
         except BookError as e:
+            if _ajax(request):
+                s = self.book.selection(sel_id)
+                return web.json_response({"ok": False, "msg": str(e), "balance": self.book.bettor(bettor["id"])["balance"],
+                                          "odds": s["odds"] if s else None,
+                                          "decimal": decimal_odds(s["odds"]) if s else None})
             return await self.slip(request, str(e), str(form.get("stake", "")))
         s = self.book.selection(sel_id)
+        if _ajax(request):
+            return web.json_response({"ok": True, "balance": self.book.bettor(bettor["id"])["balance"],
+                                      "msg": f"Bet placed: {_money(stake)} on {s['label']} ({fmt_odds(s['odds'])}). "
+                                             f"Good luck!"})
         raise _redirect(f"/book/matchups/{s['matchup_id']}",
                         f"Bet placed: {_money(stake)} on {s['label']} ({fmt_odds(s['odds'])}), "
                         f"{self._title(s)}.")
@@ -751,7 +897,11 @@ class BookSite:
         try:
             msg = fn(bettor["id"])
         except BookError as e:
+            if _ajax(request):
+                return web.json_response({"ok": False, "msg": str(e)})
             raise _redirect(nxt, str(e), err=True)
+        if _ajax(request):
+            return web.json_response({"ok": True, "msg": msg or "", "count": len(self._slip_ids(bettor))})
         raise _redirect(nxt, msg) if msg else web.HTTPSeeOther(nxt)
 
     async def parlay_add(self, request: web.Request) -> web.Response:
@@ -1114,6 +1264,10 @@ class BookSite:
                 f'<textarea name="options" rows="3" required placeholder="One option per line: label | odds&#10;'
                 f'Yes | +400&#10;No | -600"></textarea><button name="action" value="custom">Add custom bet'
                 f"</button></form></div>")
+        controls.append(
+            f'<form class="inline" method="post" action="{act}" onsubmit="return confirm(\'Delete matchup #{mu["id"]}? '
+            f'Open bets on it are refunded, then it and its bets are removed for good, and the matchups after it '
+            f'move up a number.\')">{csrf}<button class="bad" name="action" value="delete">Delete matchup</button></form>')
         auto = ("Auto-settle is <b>on</b>: the next game with at least half of these players settles it."
                 if mu["auto_settle"] else "Auto-settle is <b>off</b>.")
         lineups = "<br>".join(f'<b>{_e(mu[t])}</b>: ' + ", ".join(_e(name(k)) for k in mu[p])
@@ -1202,6 +1356,10 @@ class BookSite:
                 sides = self._sides(form)
                 msg = self.book.edit_matchup(mid, str(form.get("title", "")), str(form.get("team1", "")),
                                              str(form.get("team2", "")), sides["1"], sides["2"], self._names())
+            elif action == "delete":
+                self.book.delete_matchup(mid)
+                raise _redirect("/admin", f"Deleted matchup #{mid} ({mu['title']}); open bets on it were refunded "
+                                          f"and the matchups after it moved up a number.")
             elif action == "auto":
                 self.book.set_auto_settle(mid, not mu["auto_settle"])
                 msg = "Auto-settle turned " + ("off." if mu["auto_settle"] else "on.")

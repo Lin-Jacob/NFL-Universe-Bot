@@ -464,3 +464,48 @@ def test_league_player_logins(tmp_path, monkeypatch):
             assert "Welcome back, Jacob" in await r.text()
             assert {b["name"] for b in Book(db).leaderboard()} == {"Nate", "Jacob"}
     asyncio.run(run())
+
+
+def test_delete_renumbers_and_bet_card_api(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADMIN_PASSWORD", PASSWORD)
+    db = _db(tmp_path)
+    book = Book(db)
+    for _ in range(3):
+        book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    zed, _ = book.create_bettor("Zed")
+    third = book.markets(3)[0]
+    book.place_bet(zed, book.markets(2)[0]["selections"][0]["id"], 100)
+    book.place_bet(zed, third["selections"][0]["id"], 50)
+
+    async def run():
+        async with TestClient(TestServer(WebhookServer(db, SECRET).app)) as c:
+            await c.post("/book/login", data={"name": "zed", "password": "pw12"})  # claims the account
+            html = await (await c.get("/book/matchups/3")).text()
+            assert 'id="betcard"' in html and 'class="fq"' in html and "Player props" in html
+            bcsrf = re.search(r'data-csrf="(\w+)"', html).group(1)
+            sid = third["selections"][1]["id"]
+            d = await (await c.get(f"/book/api/sel/{sid}")).json()
+            assert d["ok"] and d["open"] and d["balance"] == START_BALANCE - 150
+            ajax = {"X-Requested-With": "fetch"}
+            d = await (await c.post(f"/book/bet/{sid}", data={"csrf": bcsrf, "odds": "1", "stake": "10"},
+                                    headers=ajax)).json()
+            assert not d["ok"] and "odds changed" in d["msg"] and d["odds"] == third["selections"][1]["odds"]
+            d = await (await c.post(f"/book/bet/{sid}", data={"csrf": bcsrf, "odds": str(d["odds"]), "stake": "10"},
+                                    headers=ajax)).json()
+            assert d["ok"] and d["balance"] == START_BALANCE - 160
+            d = await (await c.post(f"/book/parlay/add/{sid}", data={"csrf": bcsrf, "next": "/book"},
+                                    headers=ajax)).json()
+            assert d["ok"] and d["count"] == 1
+
+            html = await (await c.post("/admin/login", data={"username": "admin", "password": PASSWORD})).text()
+            csrf = re.search(r'name="csrf" value="(\w+)"', html).group(1)
+            assert "Delete matchup" in await (await c.get("/admin/matchups/2")).text()
+            r = await c.post("/admin/matchups/2", data={"csrf": csrf, "action": "delete"})
+            assert "Deleted matchup #2" in await r.text()
+    asyncio.run(run())
+    # #2's bet was refunded and removed; #3 is now #2 with its markets and bets
+    assert [m["id"] for m in book.matchups()] == [2, 1]
+    assert book.markets(2)[0]["id"] == third["id"]
+    assert book.bettor(zed)["balance"] == START_BALANCE - 60
+    assert {b["matchup_id"] for b in book.bets_for(zed)} == {2}
+    assert book.create_matchup("", ["qbone"], ["qbtwo"]) == 3
