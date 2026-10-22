@@ -95,6 +95,18 @@ GAME_STATS = {
 }
 # Game stats that also get an "exact number" bet (0, 1, 2 ... or more), when they're low counts
 EXACT_STATS = ("g:tds", "g:fg_made", "g:turnovers", "g:sacks")
+# Yes/no "does it happen at all" bets on rare game stats
+ANY_STATS = {"g:ret_tds": "Any defensive or return touchdown", "g:safeties": "Any safety"}
+# Player milestones ("300+ passing yards"): the steps offered for each stat, where the player has a
+# fair shot (MILESTONE_CHANCE) at them
+MILESTONES = {
+    "pass_yards": (200, 250, 300, 350, 400), "rush_yards": (50, 75, 100, 125, 150),
+    "rec_yards": (50, 75, 100, 125, 150), "receptions": (4, 6, 8, 10), "any_td": (2, 3),
+    "pass_tds": (2, 3, 4),
+}
+MILESTONE_CHANCE = (0.04, 0.75)
+# Head-to-head player bets: each team's best player at the stat against the other's
+H2H_STATS = ("pass_yards", "rush_yards", "rec_yards", "fantasy")
 # Winning-margin bands for each team (the last runs on: 14+)
 MARGIN_BANDS = ((1, 6), (7, 13), (14, None))
 # A past game can't say whether a 2-pt try was made (see game_stat_value), so this yes/no starts
@@ -605,6 +617,50 @@ def margin_side(margin: float) -> str:
     return f"{t}:{lo}-{hi}" if hi else f"{t}:{lo}+"
 
 
+def band_outcomes(model: dict) -> list[tuple[str, str, float]]:
+    """[(side, label, chance)] for the total-points range bet: four ranges, split at a standard
+    deviation either side of the average ("r:0-20", ..., "r:45+")."""
+    cuts = sorted({max(1, round(model["mean"] + k * model["sd"])) for k in (-1, 0, 1)})
+    edges = [0] + cuts
+    out = []
+    for i, lo in enumerate(edges):
+        hi = edges[i + 1] - 1 if i + 1 < len(edges) else None
+        out.append((f"r:{lo}-{hi}" if hi is not None else f"r:{lo}+", f"{lo}-{hi}" if hi is not None else f"{lo}+", 0.0))
+    return band_chances(model, [side for side, *_ in out], [lbl for _, lbl, _ in out])
+
+
+def band_chances(model: dict, sides: list[str], labels: list[str] | None = None) -> list[tuple[str, str, float]]:
+    """Chances for range sides like "r:21-34" / "r:45+" on a normal curve (half a point either side)."""
+    out = []
+    for i, side in enumerate(sides):
+        lo, _, hi = side[2:].rstrip("+").partition("-")
+        a = 0.0 if int(lo) == 0 else _phi((int(lo) - 0.5 - model["mean"]) / model["sd"])
+        b = 1.0 if not hi else _phi((int(hi) + 0.5 - model["mean"]) / model["sd"])
+        out.append((side, labels[i] if labels else side[2:], max(b - a, 0.005)))
+    return out
+
+
+def band_side(sides, value: float) -> str | None:
+    """Which range side the value falls in."""
+    for side in sides:
+        lo, _, hi = side[2:].rstrip("+").partition("-")
+        if value >= int(lo) and (not hi or value <= int(hi)):
+            return side
+    return None
+
+
+def h2h_chance(a: dict, b: dict) -> float:
+    """Chance player A out-does player B at a stat (each a curve from their past games)."""
+    sd = max((a["sd"] ** 2 + b["sd"] ** 2) ** 0.5, 1e-6)
+    return min(max(_phi((a["mean"] - b["mean"]) / sd), 0.02), 0.98)
+
+
+def any_chance(model: dict) -> float:
+    """Chance a rare game stat happens at all."""
+    p = 1 - math.exp(-model["mean"]) if model["dist"] == "poisson" else p_over(model, 0.5)
+    return min(max(p, 0.04), 0.96)
+
+
 def total_model(db: Database) -> dict:
     """Combined final score of past games, as a normal curve."""
     totals = [r["t"] for r in db.q("SELECT home_score + away_score t FROM games")]
@@ -841,6 +897,14 @@ class Book:
             if model["any"] and model["dist"] == "poisson":
                 self._add_choice(matchup_id, "exact", f"Exact: {stat_label(stat)}", exact_outcomes(model["mean"]),
                                  stat=stat, sort=4 + len(GAME_STATS))
+        for stat, title in ANY_STATS.items():
+            model = game_stat_model(self.db, stat)
+            if model["any"]:  # only once some past game has had one
+                py = any_chance(model)
+                self._add_choice(matchup_id, "yesno", title, [("yes", "Yes", py), ("no", "No", 1 - py)],
+                                 stat=stat, sort=3 + len(GAME_STATS))
+        self._add_choice(matchup_id, "band", "Total points range", band_outcomes(total_model(self.db)),
+                         sort=4 + len(GAME_STATS))
 
     def _add_choice(self, matchup_id: int, kind: str, title: str, outcomes: list[tuple[str, str, float]],
                     **kw) -> int:
@@ -903,13 +967,47 @@ class Book:
                                  stat=f"{t}:tds", line=line, sort=sort)
             self._add_choice(matchup_id, "yesno", "Both teams score a touchdown",
                              self._team_fair({"kind": "yesno", "stat": "g:both_td"}, mu), stat="g:both_td", sort=sort)
+        for t in ("t1", "t2"):
+            model = self.team_points_model(mu, t)
+            line = default_line(model)
+            po = p_over(model, line)
+            oo, ou = price([po, 1 - po])
+            self._add_market(matchup_id, "total", f"{mu['team' + t[1]]} points",
+                             [("over", f"Over {line:g}", oo, po), ("under", f"Under {line:g}", ou, 1 - po)],
+                             stat=f"{t}:pts", line=line, sort=sort)
         self._add_choice(matchup_id, "margin", "Winning margin", self._team_fair({"kind": "margin"}, mu), sort=sort + 1)
+        self._h2h(matchup_id, mu, names, sort + 2)
         if len(mu["players1"]) + len(mu["players2"]) >= 3:
             self._add_choice(matchup_id, "leader", "Most fantasy points (players in this game)",
                              self._team_fair({"kind": "leader"}, mu, names), sort=sort + 1)
 
+    def team_points_model(self, mu: dict, t: str) -> dict:
+        """One lineup's points ("t1"/"t2"): half the expected total, plus or minus half the expected margin."""
+        tm = total_model(self.db)
+        p1, _, _ = moneyline_chances(self.db, mu["players1"], mu["players2"])
+        margin = spread_model(self.db, p1)["mean"]
+        mean = (tm["mean"] + (margin if t == "t1" else -margin)) / 2
+        return {"mean": max(mean, 1.0), "sd": max(tm["sd"] / 2 ** 0.5, 3.0), "dist": "normal"}
+
+    def _h2h(self, matchup_id: int, mu: dict, names, sort: int) -> None:
+        """Head-to-heads: for each H2H_STATS stat, each team's best player at it against the other's."""
+        models = Models(self.db)
+        for stat in H2H_STATS:
+            best = []
+            for p in ("players1", "players2"):
+                have = [k for k in mu[p] if stat == "fantasy" or models.has_recorded(k, stat)]
+                best.append(max(have, key=lambda k: models.stat(k, stat)["mean"]) if have else None)
+            if None in best:
+                continue
+            a, b = best
+            pa = h2h_chance(models.stat(a, stat), models.stat(b, stat))
+            self._add_choice(matchup_id, "h2h", f"{stat_label(stat)}: {names(a)} vs {names(b)}",
+                             [(f"p:{a}", names(a), pa), (f"p:{b}", names(b), 1 - pa)], stat=stat, sort=sort,
+                             player_key=f"{a}|{b}")
+
     def _player_props(self, matchup_id: int, keys: list[str], names=lambda k: k, first_sort: int = 10) -> None:
-        """The usual props for these players: fantasy points plus the stats each has recorded."""
+        """The usual props for these players: fantasy points plus the stats each has recorded, and
+        milestones (300+ passing yards...) they have a fair shot at."""
         models = Models(self.db)
         rr, _ = analytics.role_ratings(self.db)
         for i, key in enumerate(keys):
@@ -917,6 +1015,42 @@ class Book:
                                    if models.has_recorded(key, s)]
             for stat in stats:
                 self.add_prop(matchup_id, key, stat, names=names, models=models, sort=first_sort + i)
+            for stat in MILESTONES:
+                if (stat in stats or stat in ("rush_yards",)) and models.has_recorded(key, stat):
+                    self.add_milestone(matchup_id, key, stat, names, models, sort=first_sort + i)
+
+    def milestone_fair(self, key: str, stat: str, models: Models | None = None,
+                       steps: list[int] | None = None) -> list[tuple[str, str, float]]:
+        """[(side "ge:N", label "N+", chance)] for a player's milestones; each is its own yes bet."""
+        model = (models or Models(self.db)).stat(key, stat)
+        lo, hi = MILESTONE_CHANCE
+        out = []
+        for n in steps if steps is not None else MILESTONES[stat]:
+            p = p_over(model, n - 0.5)
+            if steps is not None or lo <= p <= hi:
+                out.append((f"ge:{n}", f"{n}+", min(max(p, 0.01), 0.99)))
+        return out
+
+    def add_milestone(self, matchup_id: int, key: str, stat: str, names=lambda k: k,
+                      models: Models | None = None, sort: int = 50) -> int | None:
+        fair = self.milestone_fair(key, stat, models)
+        if not fair:
+            return None
+        return self._add_market(matchup_id, "milestone", f"{names(key)}: {stat_label(stat)} milestones",
+                                [(side, lbl, price([p, 1 - p])[0], p) for side, lbl, p in fair],
+                                player_key=key, stat=stat, sort=sort)
+
+    def player_market_ids(self, matchup_id: int, keys) -> list[int]:
+        """Main markets on these players' own stats: props, milestones and head-to-heads."""
+        keys = list(keys)
+        if not keys:
+            return []
+        marks = ",".join("?" * len(keys))
+        return [r["id"] for r in self.db.q(
+            f"SELECT id FROM book_markets m WHERE matchup_id = ? AND parent_id IS NULL AND ("
+            f"(kind IN ('prop', 'milestone') AND player_key IN ({marks})) OR (kind = 'h2h' AND EXISTS ("
+            f"SELECT 1 FROM book_selections s WHERE s.market_id = m.id AND substr(s.side, 3) IN ({marks}))))",
+            (matchup_id, *keys, *keys))]
 
     def edit_matchup(self, matchup_id: int, title: str, team1: str, team2: str, keys1: list[str],
                      keys2: list[str], names=lambda k: k) -> str:
@@ -950,10 +1084,9 @@ class Book:
                           "WHERE side = ? AND market_id IN (SELECT id FROM book_markets WHERE matchup_id = ? "
                           "AND kind = 'spread')", (name, side, side, matchup_id))
             c.commit()
-        for m in self.db.q("SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'prop' AND player_key IN "
-                           f"({','.join('?' * len(removed))}) AND status IN ('open', 'locked')",
-                           (matchup_id, *removed)) if removed else []:
-            self.void_market(m["id"], "player taken out of the matchup")
+        for mid in self.player_market_ids(matchup_id, removed):
+            if self.db.one("SELECT status FROM book_markets WHERE id = ?", (mid,))["status"] in ("open", "locked"):
+                self.void_market(mid, "player taken out of the matchup")
         if added:
             first = self.db.one("SELECT COALESCE(MAX(sort), 9) + 1 n FROM book_markets WHERE matchup_id = ? "
                                 "AND sort < 90", (matchup_id,))["n"]
@@ -963,6 +1096,8 @@ class Book:
             for t, name in (("t1", team1), ("t2", team2)):
                 c.execute("UPDATE book_markets SET title = ? WHERE matchup_id = ? AND stat = ?",
                           (f"{name} touchdowns", matchup_id, f"{t}:tds"))
+                c.execute("UPDATE book_markets SET title = ? WHERE matchup_id = ? AND stat = ?",
+                          (f"{name} points", matchup_id, f"{t}:pts"))
                 c.execute("UPDATE book_selections SET label = ? || ' by ' || substr(side, 4) WHERE side LIKE ? "
                           "AND market_id IN (SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'margin')",
                           (name, f"{t}:%", matchup_id))
@@ -976,7 +1111,7 @@ class Book:
                                      self._team_fair({"kind": "leader"}, self.matchup(matchup_id), names), sort=m["sort"])
         if removed or added or moved:
             for m in self.db.q("SELECT id FROM book_markets WHERE matchup_id = ? AND (kind IN ('moneyline', "
-                               "'spread', 'margin') OR stat IN ('g:both_td', 't1:tds', 't2:tds')) "
+                               "'spread', 'margin') OR stat IN ('g:both_td', 't1:tds', 't2:tds', 't1:pts', 't2:pts')) "
                                "AND parent_id IS NULL AND status IN ('open', 'locked')", (matchup_id,)):
                 self.update_market(m["id"], None, {}, reprice=True)
         parts = [f"{len(added)} player{'s' * (len(added) != 1)} added"] if added else []
@@ -1093,6 +1228,8 @@ class Book:
             mu = self.matchup(market["matchup_id"])
             p1, _, _ = moneyline_chances(self.db, mu["players1"], mu["players2"])
             return spread_model(self.db, p1) | {"spread": True}
+        if market["kind"] == "total" and market["stat"] in ("t1:pts", "t2:pts"):
+            return self.team_points_model(self.matchup(market["matchup_id"]), market["stat"][:2])
         if market["kind"] == "total" and market["stat"] and market["stat"][:3] in ("t1:", "t2:"):
             means = self.team_td_means(self.matchup(market["matchup_id"]))
             mean = means[int(market["stat"][1]) - 1] if means else 0.5
@@ -1141,8 +1278,25 @@ class Book:
                 sels = [x for x in m["selections"] if x["side"] in fair]
                 for x, o in zip(sels, price([fair[x["side"]] for x in sels])):
                     c.execute("UPDATE book_selections SET odds = ?, fair_p = ? WHERE id = ?", (o, fair[x["side"]], x["id"]))
+            elif reprice and m["kind"] in ("milestone", "h2h", "band"):
+                if m["kind"] == "milestone":
+                    fair = {side: p for side, _, p in self.milestone_fair(
+                        m["player_key"], m["stat"], steps=[int(x["side"][3:]) for x in m["selections"]])}
+                    for x in m["selections"]:
+                        c.execute("UPDATE book_selections SET odds = ?, fair_p = ? WHERE id = ?",
+                                  (price([fair[x["side"]], 1 - fair[x["side"]]])[0], fair[x["side"]], x["id"]))
+                else:
+                    if m["kind"] == "h2h":
+                        models = Models(self.db)
+                        a, b = (x["side"][2:] for x in m["selections"])
+                        pa = h2h_chance(models.stat(a, m["stat"]), models.stat(b, m["stat"]))
+                        fair = [pa, 1 - pa]
+                    else:
+                        fair = [p for *_, p in band_chances(total_model(self.db), [x["side"] for x in m["selections"]])]
+                    for x, o, p in zip(m["selections"], price(fair), fair):
+                        c.execute("UPDATE book_selections SET odds = ?, fair_p = ? WHERE id = ?", (o, p, x["id"]))
             elif reprice and m["kind"] == "yesno":
-                py = two_pt_chance(self.db)
+                py = two_pt_chance(self.db) if m["stat"] == "g:two_pt" else any_chance(game_stat_model(self.db, m["stat"]))
                 oy, on = price([py, 1 - py])
                 for s in m["selections"]:
                     yes = s["side"] == "yes"
@@ -1242,13 +1396,18 @@ class Book:
             if s["player_key"] in mates and BLOCK_TEAMMATE_PROPS:
                 return "You can't bet on a teammate's stats."
             return None
+        if kind == "milestone":
+            return Book.insider_reason(key, dict(s, kind="prop"), mu)
         if kind == "leader":
             return "You can't bet on your own stats." if s["side"] == f"p:{key}" and BLOCK_OWN_PROPS else None
+        if kind == "h2h":  # either side of a head-to-head they're in is their own stats ("a|b")
+            mine = key in (s["player_key"] or "").split("|")
+            return "You can't bet on your own stats." if mine and BLOCK_OWN_PROPS else None
         if kind in ("moneyline", "spread", "margin"):
             mine = team if kind != "margin" else "t" + team[-1]
             against = s["side"] != "tie" and not s["side"].startswith(mine)
             return "You can't bet against your own team." if against and BLOCK_BET_AGAINST_SELF else None
-        if kind in ("total", "yesno") and BLOCK_OWN_GAME_PROPS:
+        if kind in ("total", "yesno", "band") and BLOCK_OWN_GAME_PROPS:
             return "You're playing in this game, so you can't bet on its totals or game props."
         return None
 
@@ -1434,8 +1593,8 @@ class Book:
         mu = self.matchup(matchup_id)
         if not mu or key not in mu["players1"] + mu["players2"]:
             raise BookError("That player isn't in this matchup.")
-        mids = [r["id"] for r in self.db.q("SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'prop' "
-                                           "AND player_key = ?", (matchup_id, key))]
+        mids = [r["id"] for r in self.db.q("SELECT id FROM book_markets WHERE parent_id IN ({0}) OR id IN ({0})".format(
+            ",".join(map(str, self.player_market_ids(matchup_id, [key]))) or "NULL"))]
         marks = ",".join("?" * len(mids)) or "NULL"
         sel = f"SELECT s.id FROM book_selections s WHERE s.market_id IN ({marks})"
         n_bets = self.db.one(f"SELECT COUNT(*) n FROM book_bets WHERE status != 'void' AND NOT admin_void "
@@ -1609,12 +1768,14 @@ class Book:
             c.commit()
         return legs
 
-    def feed(self, limit: int = 60, pending: bool | None = None) -> list[dict]:
+    def feed(self, limit: int = 60, pending: bool | None = None, bettor_id: int | None = None) -> list[dict]:
         """Everyone's latest bets and parlays, newest first: {"kind": "bet" | "parlay", "id", "name",
         "bettor_id", "stake", "status", "payout", "placed_at", "decimal", "legs": [...]}; a leg has the
         pick, its odds when placed and whether betting on it is still open. pending=True keeps only
-        open bets, False only settled ones."""
-        only = "" if pending is None else f"WHERE status {'=' if pending else '!='} 'pending' "
+        open bets, False only settled ones. bettor_id keeps only that bettor's."""
+        conds = ([] if pending is None else [f"status {'=' if pending else '!='} 'pending'"]) \
+            + ([] if bettor_id is None else [f"bettor_id = {int(bettor_id)}"])
+        only = f"WHERE {' AND '.join(conds)} " if conds else ""
         leg_sql = ("SELECT {odds} AS odds, s.id AS selection_id, s.label, s.outcome, m.title AS market_title, "
                    "m.result, m.kind, m.player_key, m.stat, m.status AS market_status, mu.status AS matchup_status, "
                    "mu.title AS matchup_title, mu.id AS matchup_id FROM {src} JOIN book_selections s "
@@ -1622,12 +1783,12 @@ class Book:
                    "JOIN book_matchups mu ON mu.id = m.matchup_id WHERE {where} ORDER BY {order}")
         out = []
         for r in self.db.q("SELECT b.*, u.name FROM book_bets b JOIN book_bettors u ON u.id = b.bettor_id "
-                           + only.replace("status", "b.status") + "ORDER BY b.id DESC LIMIT ?", (limit,)):
+                           + only.replace("status", "b.status").replace("bettor_id", "b.bettor_id") + "ORDER BY b.id DESC LIMIT ?", (limit,)):
             legs = self.db.q(leg_sql.format(odds="b.odds", src="book_bets b", sel="b.selection_id",
                                             where="b.id = ?", order="b.id"), (r["id"],))
             out.append(dict(r, kind="bet", legs=[dict(x) for x in legs], decimal=decimal_odds(r["odds"])))
         for r in self.db.q("SELECT p.*, u.name FROM book_parlays p JOIN book_bettors u ON u.id = p.bettor_id "
-                           + only.replace("status", "p.status") + "ORDER BY p.id DESC LIMIT ?", (limit,)):
+                           + only.replace("status", "p.status").replace("bettor_id", "p.bettor_id") + "ORDER BY p.id DESC LIMIT ?", (limit,)):
             legs = [dict(x) for x in self.db.q(leg_sql.format(odds="l.odds", src="book_parlay_legs l",
                                                               sel="l.selection_id", where="l.parlay_id = ?",
                                                               order="l.id"), (r["id"],))]
@@ -1776,8 +1937,14 @@ class Book:
         """Settle an over/under and all its alt lines by hand from what the stat came to. Returns how
         many markets were settled."""
         m = self.market(market_id)
+        if m and m["kind"] in ("milestone", "band") and m["status"] not in ("settled", "void"):
+            pick = band_side([x["side"] for x in m["selections"]], value) if m["kind"] == "band" else None
+            self._grade(m["id"], {x["id"]: "win" if (x["side"] == pick if pick or m["kind"] == "band"
+                                                     else value >= int(x["side"][3:])) else "lose"
+                                  for x in m["selections"]}, f"{value:g} (settled by admin)")
+            return 1
         if not m or m["kind"] not in ("prop", "total"):
-            raise BookError("Only over/unders settle from a number.")
+            raise BookError("Only over/unders, milestones and ranges settle from a number.")
         n = 0
         for x in [m] if m["parent_id"] else [m] + self._alts(m["id"]):
             if x["status"] in ("settled", "void"):
@@ -1883,6 +2050,39 @@ class Book:
         score = game["home_score"] + game["away_score"]
         team_lines = [[lines[k] for k in mu[p] if k in lines] for p in ("players1", "players2")]
         void = f"Void: game #{game_id}'s stat sheet can't tell, stakes returned"
+        flip = {"win": "lose", "lose": "win", "push": "push"}
+        if m["kind"] == "band":
+            pick = band_side(sels, score)
+            self._grade(m["id"], {sid: "win" if side == pick else "lose" for side, sid in sels.items()},
+                        f"{score} points (game #{game_id})")
+            return True
+        if m["stat"] in ("t1:pts", "t2:pts"):
+            if not scores and game["home_score"] != game["away_score"]:
+                return False
+            value = (scores or (game["home_score"], game["away_score"]))[int(m["stat"][1]) - 1]
+            over = "win" if value > m["line"] else "lose" if value < m["line"] else "push"
+            self._grade(m["id"], {sels["over"]: over, sels["under"]: flip[over]},
+                        f"{mu['team' + m['stat'][1]]} scored {value} (game #{game_id})")
+            return True
+        if m["kind"] in ("milestone", "h2h"):
+            if not lines:
+                return False
+            keys = [m["player_key"]] if m["kind"] == "milestone" else [side[2:] for side in sels]
+            if any(k not in lines for k in keys):
+                self._grade(m["id"], {sid: "void" for sid in sels.values()},
+                            f"Void: didn't play in game #{game_id}, stakes returned", status="void")
+                return True
+            vals = {k: round(stat_value(lines[k], m["stat"]), 2) for k in keys}
+            if m["kind"] == "milestone":
+                v = vals[m["player_key"]]
+                self._grade(m["id"], {sid: "win" if v >= int(side[3:]) else "lose" for side, sid in sels.items()},
+                            f"{v:g} {stat_label(m['stat'])} in game #{game_id}")
+                return True
+            a, b = keys
+            oa = "win" if vals[a] > vals[b] else "lose" if vals[a] < vals[b] else "push"
+            self._grade(m["id"], {sels[f"p:{a}"]: oa, sels[f"p:{b}"]: flip[oa]},
+                        f"{vals[a]:g} – {vals[b]:g} {stat_label(m['stat'])} (game #{game_id})")
+            return True
         if m["kind"] in ("margin", "leader", "exact") or m["stat"] in ("g:both_td", "t1:tds", "t2:tds"):
             if not lines:
                 return False

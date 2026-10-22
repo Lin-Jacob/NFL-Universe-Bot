@@ -208,7 +208,7 @@ def test_parlays(tmp_path):
     book = Book(db)
     mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
     bettor, _ = book.create_bettor("Pat")
-    mk = {(m["player_key"], m["stat"]): m for m in book.markets(mid)}
+    mk = {(m["player_key"], m["stat"]): m for m in book.markets(mid) if m["kind"] != "milestone"}
     py = mk[("qbone", "pass_yards")]
     rec = mk[("wrone", "receptions")]
     tk = mk[("wrtwo", "tackles")]
@@ -338,7 +338,7 @@ def test_alt_lines_round_robin_tail_and_house(tmp_path):
     mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
     ann, _ = book.create_bettor("Ann")
     bob, _ = book.create_bettor("Bob")
-    mk = {(m["player_key"], m["stat"]): m for m in book.markets(mid)}
+    mk = {(m["player_key"], m["stat"]): m for m in book.markets(mid) if m["kind"] != "milestone"}
     py = mk[("qbone", "pass_yards")]
 
     # the slider: lines both sides of the main one, overs pay more as the line goes up
@@ -620,6 +620,7 @@ def test_inside_betting(tmp_path):
         book.place_bet(zork, sel, 10)
     mine = {x["id"] for m in ms if m["player_key"] == "qbone" for x in m["selections"]}
     mine |= {x["id"] for m in ms if m["kind"] == "leader" for x in m["selections"] if x["side"] == "p:qbone"}
+    mine |= {x["id"] for m in ms if m["kind"] == "h2h" and "qbone" in m["player_key"].split("|") for x in m["selections"]}
     assert set(book.blocked(zork, mid)) == mine and not book.blocked(fan, mid)
 
     # an account the admin says isn't a player is free; one linked by hand is limited
@@ -779,3 +780,66 @@ def test_alt_spreads_and_newer_bet_types(tmp_path):
     a = book.market(alt["id"])
     won = 24 + a["line"] > 0
     assert a["selections"][0]["outcome"] == ("win" if won else "lose")
+
+
+def test_h2h_milestones_ranges_team_points_and_bettor_page(tmp_path):
+    from nflu.sportsbook import band_outcomes, band_side
+    bands = band_outcomes({"mean": 40.0, "sd": 10.0})
+    assert [s for s, *_ in bands] == ["r:0-29", "r:30-39", "r:40-49", "r:50+"]
+    assert abs(sum(p for *_, p in bands) - 1) < 0.02 and band_side([s for s, *_ in bands], 45) == "r:40-49"
+
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    ms = book.markets(mid)
+    h2h = {m["stat"]: m for m in ms if m["kind"] == "h2h"}
+    assert h2h["pass_yards"]["player_key"] == "qbone|qbtwo" and h2h["rec_yards"]["player_key"] == "wrone|wrtwo"
+    assert "fantasy" in h2h
+    miles = {(m["player_key"], m["stat"]): m for m in ms if m["kind"] == "milestone"}
+    py = miles[("qbone", "pass_yards")]
+    assert all(s["side"].startswith("ge:") and s["label"].endswith("+") for s in py["selections"])
+    odds = [s["odds"] for s in py["selections"]]
+    assert odds == sorted(odds)  # higher milestones pay more
+    band = next(m for m in ms if m["kind"] == "band")
+    pts = {m["stat"]: m for m in ms if m["stat"] in ("t1:pts", "t2:pts")}
+    assert pts["t1:pts"]["title"] == "Team qbone points" and book.ladder(pts["t1:pts"])
+    assert not any(m["stat"] == "g:ret_tds" and m["kind"] == "yesno" for m in ms)  # no past game had one
+    # the player filter finds head-to-heads either player is in; a player can't bet on their own
+    zork, _ = book.create_bettor("Zork")
+    book.set_player_key(zork, "qbtwo")
+    assert {x["id"] for x in h2h["pass_yards"]["selections"]} <= set(book.blocked(zork, mid))
+    # injury insurance voids the player's milestones and head-to-heads too
+    book.injury(mid, "wrtwo")
+    assert book.market(h2h["rec_yards"]["id"])["status"] == "void"
+    assert all(book.market(m["id"])["status"] == "void" for (k, _), m in miles.items() if k == "wrtwo")
+
+    # team 1 = the Bills, 31-7; QBOne throws for 320
+    g = _game(10, random.Random(1), home="Ravens", away="Bills", score=(7, 31))
+    g.players[0].stats.update(pass_yards=320)
+    g.players[2].stats.update(pass_yards=150)
+    for p in g.players:
+        for k in ("pass_tds", "rec_tds", "rush_tds", "def_tds"):
+            p.stats.pop(k, None)
+    g.players[0].stats.update(pass_tds=4)
+    g.players[2].stats.update(pass_tds=1)
+    gid, _ = db.save_game(g)
+    book.settle_from_game(mid, gid)
+    out = lambda m: {s["side"]: s["outcome"] for s in book.market(m["id"])["selections"]}
+    assert out(h2h["pass_yards"]) == {"p:qbone": "win", "p:qbtwo": "lose"}
+    assert all(o == ("win" if int(side[3:]) <= 320 else "lose") for side, o in out(py).items())
+    assert out(band)[band_side(list(out(band)), 38)] == "win"
+    t1 = pts["t1:pts"]
+    assert out(t1)["over" if 31 > t1["line"] else "under"] == "win"
+
+    # the leaderboard links each name to that bettor's bets: open ones (with Tail) and settled ones
+    async def run():
+        srv = WebhookServer(db, SECRET)
+        async with TestClient(TestServer(srv.app)) as c:
+            await c.post("/book/join", data={"name": "Ann", "password": "pass1"})
+            other = book.create_matchup("", ["qbone"], ["qbtwo"])
+            book.place_bet(zork, book.markets(other)[0]["selections"][0]["id"], 25)
+            html = await (await c.get("/book/leaderboard")).text()
+            assert f'href="/book/feed?who={zork}"' in html
+            html = await (await c.get(f"/book/feed?who={zork}")).text()
+            assert "Zork's bets" in html and "$25.00" in html and "Tail" in html and "Ann" not in html.split("<h1>")[1]
+    asyncio.run(run())
