@@ -41,8 +41,9 @@ from .db import Database
 from .embeds import Names
 from . import players
 from .site import _e, _page, _time
-from .sportsbook import (MAX_PARLAY_LEGS, MAX_SLIP_BETS, START_BALANCE, Book, BookError, Models,
-                         american_from_decimal, bettable_stats, decimal_odds, fmt_odds, stat_label)
+from .sportsbook import (MAX_PARLAY_LEGS, MAX_SLIP_BETS, PARLAY_BOOSTS, PROMO_KINDS, START_BALANCE, Book, BookError,
+                         Models, american_from_decimal, bettable_stats, decimal_odds, fmt_odds, parlay_boost,
+                         stat_label)
 
 BETTOR_COOKIE = "nflu_bettor"
 ADMIN_COOKIE = "nflu_admin"
@@ -111,6 +112,7 @@ touch-action:none;user-select:none;font-weight:700}#betcard .bh span{flex:1}
 #betcard .bb{padding:12px;display:grid;gap:10px}#betcard .pick{font-size:18px;font-weight:700}
 #betcard .q{display:flex;gap:6px;flex-wrap:wrap}#betcard .q button{padding:4px 10px}
 #betcard .bm{min-height:1.2em}
+a.sel.boost{border-color:#e67e22}
 .sel.locked{opacity:.55;cursor:not-allowed}
 #cartbtn{position:fixed;right:16px;bottom:16px;z-index:40;border-radius:999px;padding:12px 18px;
 box-shadow:0 6px 20px rgba(0,0,0,.3);background:var(--chip);color:var(--text);border:1px solid var(--line)}
@@ -184,7 +186,11 @@ BETCARD_JS = """<script>(function(){var c=document.getElementById('betcard'),cs=
 var H={'X-Requested-With':'fetch'};function $(x){return c.querySelector(x)}
 function f(v){return '$'+v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
 function fo(o){return(o>0?'+':'')+o}function stake(){return parseFloat(($('.st').value||'').replace(/[$,]/g,''))||0}
-function upd(){if(!sel)return;var s=stake(),d=sel.decimal;$('.win').textContent=f(s*(d-1));$('.ret').textContent=f(s*d);}
+function pct(){var o=$('.pr').selectedOptions[0];return o?+(o.dataset.pct||0):0}
+function upd(){if(!sel)return;var s=stake(),w=s*(sel.decimal-1)*(1+pct()/100);$('.win').textContent=f(w);$('.ret').textContent=f(s+w);}
+function promos(list){var p=$('.pr');p.innerHTML='<option value="">None</option>';(list||[]).forEach(function(x){
+var o=document.createElement('option');o.value=x.id;o.textContent=x.label;o.dataset.pct=x.kind==='profit'?x.pct:0;p.appendChild(o);});
+$('.prw').style.display=(list||[]).length?'':'none';}
 function msg(t,bad){var m=$('.bm');m.textContent=t;m.className='bm small '+(bad?'lost':'won');}
 function money(b){var e=document.querySelector('.bar .money');if(e&&b!=null)e.textContent=f(b);}
 function slipCount(n){document.querySelectorAll('a[href="/book/parlay"]').forEach(function(a){
@@ -194,8 +200,11 @@ c.style.top=Math.min(p[1],innerHeight-60)+'px';return;}}catch(e){}c.style.left=M
 function open(id){fetch('/book/api/sel/'+id,{headers:H,cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
 if(!d.ok){location.href='/book/bet/'+id;return;}sel=d;$('.mt').textContent=d.matchup;$('.tt').textContent=d.title;
 $('.pick').innerHTML='';$('.pick').append(d.label+' ');var o=document.createElement('span');o.className='odds';
-o.textContent=fo(d.odds);$('.pick').append(o);$('.bal').textContent=f(d.balance);$('.ad').textContent=d.in_slip?
+o.textContent=fo(d.odds);$('.pick').append(o);if(d.boost){var b=document.createElement('div');b.className='small';
+b.textContent='\\ud83d\\udd25 Odds boost (was '+fo(d.boost.from)+'): single bets only'+(d.boost.max?', up to '+f(d.boost.max):'');
+$('.pick').append(b);}promos(d.promos);$('.bal').textContent=f(d.balance);$('.ad').textContent=d.in_slip?
 '\\u2713 In your parlay slip':'+ Add to parlay';$('.ad').disabled=d.in_slip;msg('');
+if(d.boost){$('.ad').disabled=true;$('.ad').textContent='Single bets only';}
 $('.go').disabled=!d.open||!!d.why;if(d.why){$('.ad').disabled=true;msg(d.why,true);}
 else if(!d.open)msg('Betting on this is closed.',true);c.style.display='block';place();upd();$('.st').focus();});}
 document.addEventListener('click',function(e){var a=e.target.closest('a.sel[href^="/book/bet/"]');
@@ -206,13 +215,14 @@ fm.set('pick',b.value);fetch(b.form.action,{method:'POST',body:fm,headers:H}).th
 function alertless(t){c.style.display='block';place();msg(t,true);}
 $('.x').addEventListener('click',function(){c.style.display='none'});
 document.addEventListener('keydown',function(e){if(e.key==='Escape')c.style.display='none'});
-$('.st').addEventListener('input',upd);
+$('.st').addEventListener('input',upd);$('.pr').addEventListener('change',upd);
 c.querySelectorAll('.q button').forEach(function(b){b.addEventListener('click',function(){
 $('.st').value=b.dataset.v==='max'?String(sel?sel.balance:0):String(stake()+(+b.dataset.v));upd();});});
 $('.go').addEventListener('click',function(){if(!sel)return;var fd=new FormData();fd.set('csrf',cs);fd.set('odds',sel.odds);
-fd.set('stake',$('.st').value);$('.go').disabled=true;fetch('/book/bet/'+sel.id,{method:'POST',body:fd,headers:H})
+fd.set('stake',$('.st').value);fd.set('promo',$('.pr').value);$('.go').disabled=true;fetch('/book/bet/'+sel.id,{method:'POST',body:fd,headers:H})
 .then(function(r){return r.json()}).then(function(d){$('.go').disabled=false;msg(d.msg,!d.ok);money(d.balance);
-if(d.ok){sel.balance=d.balance;$('.bal').textContent=f(d.balance);$('.st').value='';upd();}else if(d.odds){sel.odds=d.odds;
+if(d.ok){sel.balance=d.balance;$('.bal').textContent=f(d.balance);$('.st').value='';var u=$('.pr').selectedOptions[0];
+if(u&&u.value){u.remove();if($('.pr').options.length<2)$('.prw').style.display='none';}upd();}else if(d.odds){sel.odds=d.odds;
 sel.decimal=d.decimal;$('.pick .odds').textContent=fo(d.odds);upd();}});});
 $('.ad').addEventListener('click',function(){if(!sel)return;var fd=new FormData();fd.set('csrf',cs);fd.set('next','/book');
 fetch('/book/parlay/add/'+sel.id,{method:'POST',body:fd,headers:H}).then(function(r){return r.json()}).then(function(d){
@@ -233,7 +243,8 @@ CART_HTML = """<button id="cartbtn" type="button" aria-label="Parlay slip">🧾 
 <span class="small muted cc"></span><button type="button" class="sec x" aria-label="Close">✕</button></div>
 <div class="cl"></div><div class="cf"><div class="co"></div>
 <label class="small">Stake ($) <input class="cs" inputmode="decimal" placeholder="100" autocomplete="off"></label>
-<div class="small">To win <b class="cw">$0.00</b> · paid back <b class="cr">$0.00</b></div>
+<label class="small cpw" style="display:none">🎁 Promo <select class="cpr"></select></label>
+<div class="small">To win <b class="cw">$0.00</b> · paid back <b class="cr">$0.00</b> <span class="cb"></span></div>
 <button type="button" class="cp">Place parlay</button><div class="cm small"></div>
 <div class="small"><a href="/book/parlay">Round robins and more →</a> · <a href="#" class="cx">Clear</a></div></div></div>"""
 
@@ -243,8 +254,9 @@ function f(v){return '$'+v.toLocaleString(undefined,{minimumFractionDigits:2,max
 function post(url,data){var fd=new FormData();fd.set('csrf',cs);fd.set('next','/book');for(var k in data)fd.set(k,data[k]);
 return fetch(url,{method:'POST',body:fd,headers:H}).then(function(r){return r.json()});}
 function show(o){c.style.display=o?'flex':'none';try{sessionStorage.setItem('cart-open',o?'1':'')}catch(e){}}
-function upd(){if(!S)return;var s=parseFloat(($('.cs').value||'').replace(/[$,]/g,''))||0,d=S.decimal;
-$('.cw').textContent=f(s*(d-1));$('.cr').textContent=f(s*d);}
+function upd(){if(!S)return;var s=parseFloat(($('.cs').value||'').replace(/[$,]/g,''))||0,d=S.decimal,
+o=$('.cpr').selectedOptions[0],b=(S.legs.length>1?S.boost:0)+(o?+(o.dataset.pct||0):0),w=s*(d-1)*(1+b/100);
+$('.cw').textContent=f(w);$('.cr').textContent=f(s+w);$('.cb').textContent=S.boost&&S.legs.length>1?'\\ud83d\\ude80 +'+S.boost+'% parlay boost':'';}
 function mark(ids){document.querySelectorAll('form.addp').forEach(function(fm){var m=fm.action.match(/\\/parlay\\/(add|remove)\\/(\\d+)/);
 if(!m)return;var inn=ids.indexOf(+m[2])>=0,b=fm.querySelector('button');fm.action='/book/parlay/'+(inn?'remove':'add')+'/'+m[2];
 if(!/tail/.test(fm.action)){b.textContent=inn?'\\u2713':'+';b.className=inn?'in':'sec';}});
@@ -263,14 +275,17 @@ t.lastChild.appendChild(z);}var x=document.createElement('button');x.type='butto
 x.title='Remove';x.onclick=function(){post('/book/parlay/remove/'+g.id).then(refresh)};row.appendChild(t);row.appendChild(x);l.appendChild(row);});
 $('.co').innerHTML=n>=2?'<b>'+n+'-pick parlay</b> <span class="odds">'+fo(d.american)+'</span>':
 '<span class="small muted">'+(n?'Add one more pick to make a parlay.':'')+'</span>';$('.cp').disabled=n<2;
-$('.cf').style.display=n?'grid':'none';mark(d.legs.map(function(g){return g.id}));upd();}
+$('.cf').style.display=n?'grid':'none';var p=$('.cpr'),keep=p.value;p.innerHTML='<option value="">None</option>';
+(d.promos||[]).forEach(function(x){var o=document.createElement('option');o.value=x.id;o.textContent=x.label;
+o.dataset.pct=x.kind==='profit'?x.pct:0;p.appendChild(o);});p.value=keep;$('.cpw').style.display=(d.promos||[]).length?'':'none';
+mark(d.legs.map(function(g){return g.id}));upd();}
 function refresh(openIt){return fetch('/book/api/slip',{headers:H,cache:'no-store'}).then(function(r){return r.json()})
 .then(function(d){if(d.ok){draw(d);if(openIt===true)show(true);}});}
 window.bookCart={refresh:refresh};
-btn.onclick=function(){show(c.style.display!=='flex')};$('.x').onclick=function(){show(false)};$('.cs').oninput=upd;
+btn.onclick=function(){show(c.style.display!=='flex')};$('.x').onclick=function(){show(false)};$('.cs').oninput=upd;$('.cpr').onchange=upd;
 $('.cx').onclick=function(e){e.preventDefault();post('/book/parlay/clear').then(refresh)};
 $('.cp').onclick=function(){if(!S)return;$('.cp').disabled=true;post('/book/parlay',{stake:$('.cs').value,seen:S.seen,
-size:S.legs.length}).then(function(d){var m=$('.cm');m.textContent=d.msg;m.className='cm small '+(d.ok?'won':'lost');
+size:S.legs.length,promo:$('.cpr').value}).then(function(d){var m=$('.cm');m.textContent=d.msg;m.className='cm small '+(d.ok?'won':'lost');
 if(d.ok){$('.cs').value='';var e=document.querySelector('.bar .money');if(e)e.textContent=f(d.balance);}refresh();});};
 document.addEventListener('submit',function(e){var fm=e.target;if(!fm.matches('form.addp')||/tail/.test(fm.action))return;
 e.preventDefault();post(fm.action,{}).then(function(d){if(!d.ok){alertMsg(d.msg)}refresh(/\\/add\\//.test(fm.action));});});
@@ -289,6 +304,7 @@ BETCARD_HTML = """<div id="betcard" role="dialog" aria-label="Bet slip" data-csr
 <div class="q"><button type="button" class="sec" data-v="10">+$10</button><button type="button" class="sec" data-v="50">+$50</button>
 <button type="button" class="sec" data-v="100">+$100</button><button type="button" class="sec" data-v="500">+$500</button>
 <button type="button" class="sec" data-v="max">Max</button></div>
+<label class="small prw" style="display:none">🎁 Promo <select class="pr"></select></label>
 <div class="small">To win <b class="win">$0.00</b> · paid back <b class="ret">$0.00</b></div>
 <button type="button" class="go">Place bet</button><button type="button" class="sec ad">+ Add to parlay</button>
 <div class="bm small"></div></div></div>"""
@@ -368,6 +384,9 @@ class BookSite:
             web.get("/book/api/slip", self.api_slip),
             web.post("/book/tail/{kind}/{id}", self.tail),
             web.get("/book/me", self.me),
+            web.get("/book/promos", self.promos_page),
+            web.get("/admin/promos", self.admin_promos),
+            web.post("/admin/promos", self.admin_promos_action),
             web.get("/book/leaderboard", self.leaderboard),
             web.get("/book/version", self.version),
             web.get("/admin", self.admin),
@@ -429,6 +448,7 @@ class BookSite:
                 f'<span class="money">{_money(bettor["balance"])}</span>'
                 f'<a href="/book">Bets</a><a href="/book/parlay">Parlay slip ({len(self._slip_ids(bettor))})</a>'
                 f'<a href="/book/me">My bets</a><a href="/book/feed">Everyone\'s bets</a>'
+                f'<a href="/book/promos">🎁 Promos{f" ({n})" if (n := len(self.book.promos(bettor["id"], unused=True))) else ""}</a>'
                 f'<a href="/book/leaderboard">Leaderboard</a>'
                 f'<form method="post" action="/book/logout" style="margin:0 0 0 auto">'
                 f'{self._hidden(request, BETTOR_COOKIE)}<button class="sec">Log out</button></form></div>'
@@ -450,6 +470,11 @@ class BookSite:
     @staticmethod
     def _sel_button(s: dict, open_: bool, ctx: dict | None = None) -> str:
         inner = f'<span>{_e(s["label"])}</span><b>{fmt_odds(s["odds"])}</b>'
+        if open_ and s.get("boost_from") is not None:
+            inner = (f'<span>🔥 {_e(s["label"])}</span><s class="muted">{fmt_odds(s["boost_from"])}</s>'
+                     f'<b>{fmt_odds(s["odds"])}</b>')
+            if not (ctx and ctx["blocked"].get(s["id"])):
+                return f'<a class="sel boost" href="/book/bet/{s["id"]}" title="Odds boost: single bets only">{inner}</a>'
         if open_ and ctx and (why := ctx["blocked"].get(s["id"])):
             return f'<span class="sel locked" title="{_e(why)}">🔒 {inner}</span>'
         if open_:
@@ -662,7 +687,7 @@ class BookSite:
 
         def row(m: dict) -> str:
             if (m["kind"] in ("prop", "total") and m["status"] == "open" and mu["status"] == "open"
-                    and not any(x["id"] in ctx["blocked"] for x in m["selections"])):
+                    and not any(x["id"] in ctx["blocked"] or x["boost_from"] is not None for x in m["selections"])):
                 html = self._slider_row(m, name, ctx, self.book.ladder(m, models, alts.get(m["id"], [])))
             else:
                 html = self._market_row(m, mu, name, ctx)
@@ -673,6 +698,10 @@ class BookSite:
         cards = "".join(f'<div class="card fg"><h2 style="margin-top:0">{_e(head)}</h2>'
                         + "".join(row(m) for m in ms) + "</div>" for head, ms in groups.items())
         lineups = self._lineups(mu, name)
+        for k in json.loads(mu.get("injured") or "[]"):
+            lineups += (f'<div class="msg">🚑 {_e(name(k))} left the game hurt (injury insurance): single bets on '
+                        f'{_e(name(k))}\'s stats are void with stakes returned, and parlays carry on without that '
+                        f'pick at the odds of the picks left.</div>')
         if ctx["blocked"].keys() & {x["id"] for m in markets for x in m["selections"]}:
             lineups += ('<div class="msg">🔒 You\'re playing in this game, so the picks you could sway are '
                         'locked. Everything else is open.</div>')
@@ -779,8 +808,39 @@ class BookSite:
             "title": self._title(s), "matchup": f'#{s["matchup_id"]} {s["matchup_title"]}',
             "open": s["matchup_status"] == "open" and s["market_status"] == "open",
             "why": self.book._insider(bettor["id"], s),
+            "boost": None if s["boost_from"] is None else {"from": s["boost_from"], "max": s["boost_max"]},
+            "promos": self._promo_json(bettor),
             "in_slip": s["id"] in self._slip_ids(bettor), "balance": bettor["balance"]},
             headers={"Cache-Control": "no-store"})
+
+    def _promo_json(self, bettor) -> list[dict]:
+        return [{"id": p["id"], "label": self.book.promo_label(p), "kind": p["kind"], "pct": p["pct"],
+                 "max": p["max_stake"]} for p in self.book.promos(bettor["id"], unused=True)]
+
+    def _promo_select(self, bettor) -> str:
+        """A promo picker for a bet form (nothing when the bettor has none)."""
+        ps = self.book.promos(bettor["id"], unused=True)
+        if not ps:
+            return ""
+        return ('<label class="small">🎁 Promo <select name="promo" id="promo"><option value="">None</option>'
+                + "".join(f'<option value="{p["id"]}" data-pct="{p["pct"] if p["kind"] == "profit" else 0}">'
+                          f'{_e(self.book.promo_label(p))}</option>' for p in ps) + "</select></label>")
+
+    @staticmethod
+    def _perks(b) -> str:
+        """Tags for a bet's boosts and promos."""
+        out = []
+        if b.get("boost"):
+            out.append(f"🚀 +{b['boost']:g}% winnings")
+        if b.get("nosweat"):
+            out.append("🛡️ No sweat")
+        if b.get("admin_void") and b["status"] == "void":
+            out.append("Refunded")
+        return f' <span class="chip">{" · ".join(out)}</span>' if out else ""
+
+    @staticmethod
+    def _to_win(b, dec: float) -> float:
+        return b["stake"] * (dec - 1) * (1 + (b.get("boost") or 0) / 100)
 
     async def api_slip(self, request: web.Request) -> web.Response:
         """The parlay cart: the picks in the slip with their current odds."""
@@ -792,6 +852,7 @@ class BookSite:
         return web.json_response({
             "ok": True, "decimal": dec, "american": american_from_decimal(dec) if dec > 1 else 0,
             "seen": ",".join(f'{s["id"]}:{s["odds"]}' for s in legs), "balance": bettor["balance"],
+            "boost": parlay_boost(len(legs)) if len(legs) >= 2 else 0, "promos": self._promo_json(bettor),
             "legs": [{"id": s["id"], "label": s["label"], "odds": s["odds"], "title": self._title(s),
                       "matchup": f'#{s["matchup_id"]} {s["matchup_title"]}',
                       "open": s["matchup_status"] == "open" and s["market_status"] == "open"} for s in legs]},
@@ -808,7 +869,10 @@ class BookSite:
             error, open_ = error or why, False
         err = f'<div class="msg err">{_e(error)}</div>' if error else ""
         inside = s["id"] in self._slip_ids(bettor)
-        parlay = ("" if not open_ else
+        boost = ("" if s["boost_from"] is None else
+                 f'<p class="msg">🔥 Odds boost: {fmt_odds(s["boost_from"])} → <b>{fmt_odds(s["odds"])}</b>. Single bets '
+                 f'only' + (f', up to {_money(s["boost_max"])}' if s["boost_max"] else "") + ".</p>")
+        parlay = ("" if not open_ or s["boost_from"] is not None else
                   f'<p class="small">✓ In your <a href="/book/parlay">parlay slip</a>.</p>' if inside else
                   f'<form method="post" action="/book/parlay/add/{s["id"]}" style="margin-top:12px">'
                   f'{self._hidden(request, BETTOR_COOKIE)}<input type="hidden" name="next" value="/book/parlay">'
@@ -817,20 +881,23 @@ class BookSite:
                 f'<input type="hidden" name="odds" value="{s["odds"]}">'
                 f'<label>Stake ($)<br><input id="stake" name="stake" inputmode="decimal" required '
                 f'value="{_e(stake)}" placeholder="100"></label>'
+                f'{self._promo_select(bettor)}'
                 f'<div>To win <b id="win">$0.00</b>, paid back <b id="ret">$0.00</b></div>'
                 f"<button>Place bet</button></form>"
                 f"<script>(function(){{var i=document.getElementById('stake'),d={dec};"
                 f"function f(v){{return '$'+v.toLocaleString(undefined,{{minimumFractionDigits:2,maximumFractionDigits:2}})}}"
-                f"function u(){{var s=parseFloat((i.value||'').replace(/[$,]/g,''))||0;"
-                f"document.getElementById('win').textContent=f(s*(d-1));document.getElementById('ret').textContent=f(s*d);}}"
-                f"i.addEventListener('input',u);u();}})();</script>"
+                f"function u(){{var s=parseFloat((i.value||'').replace(/[$,]/g,''))||0,pr=document.getElementById('promo'),"
+                f"b=pr&&pr.selectedOptions[0]?+(pr.selectedOptions[0].dataset.pct||0):0,w=s*(d-1)*(1+b/100);"
+                f"document.getElementById('win').textContent=f(w);document.getElementById('ret').textContent=f(s+w);}}"
+                f"i.addEventListener('input',u);var pr=document.getElementById('promo');if(pr)pr.addEventListener('change',u);"
+                f"u();}})();</script>"
                 if open_ else "<p class='muted'>Betting on this is closed.</p>")
         body = (self._bar(request, bettor) + err
                 + f'<p class="small"><a href="/book/matchups/{s["matchup_id"]}">← {_e(s["matchup_title"])}</a></p>'
                   f'<h1>Bet slip</h1><div class="card"><div class="muted small">{_e(self._title(s))}</div>'
                   f'<div class="score">{_e(s["label"])} <span class="odds">{fmt_odds(s["odds"])}</span></div>'
                   f'<p class="small muted">Decimal {dec:.2f}: a $100 bet pays back {_money(100 * dec)}. '
-                  f'You have {_money(bettor["balance"])}.</p>{form}{parlay}</div>')
+                  f'You have {_money(bettor["balance"])}.</p>{boost}{form}{parlay}</div>')
         return self._page("Bet slip", body, live=True)
 
     async def bet(self, request: web.Request) -> web.Response:
@@ -842,7 +909,7 @@ class BookSite:
         try:
             if stake is None:
                 raise BookError("Enter how much to bet.")
-            self.book.place_bet(bettor["id"], sel_id, stake, _int(form.get("odds")))
+            self.book.place_bet(bettor["id"], sel_id, stake, _int(form.get("odds")), _int(form.get("promo")))
         except BookError as e:
             if _ajax(request):
                 s = self.book.selection(sel_id)
@@ -865,13 +932,14 @@ class BookSite:
         rows, name = [], self._names()
         for b in bets:
             if b["status"] == "pending":
-                res = f'<span class="muted">Pending · to win {_money(b["stake"] * (decimal_odds(b["odds"]) - 1))}</span>'
+                res = f'<span class="muted">Pending · to win {_money(self._to_win(b, decimal_odds(b["odds"])))}</span>'
             elif b["status"] == "won":
                 res = f'<span class="won">Won {_money(b["payout"] - b["stake"])}</span>'
             elif b["status"] == "lost":
-                res = f'<span class="lost">Lost {_money(b["stake"])}</span>'
+                res = f'<span class="lost">Lost {_money(b["stake"] - b["payout"])}</span>'
             else:
                 res = f'<span class="muted">{"Push" if b["status"] == "push" else "Void"}, stake returned</span>'
+            res += self._perks(b)
             result = f'<br><span class="small muted">{_e(b["result"])}</span>' if b["result"] else ""
             rows.append(f'<tr><td><a href="/book/matchups/{b["matchup_id"]}">{_e(b["matchup_title"])}</a><br>'
                         f'<span class="small">{_e(self._title(b, name))}</span></td>'
@@ -912,13 +980,14 @@ class BookSite:
         rows = []
         for p in parlays:
             if p["status"] == "pending":
-                res = f'<span class="muted">Pending · to win {_money(p["stake"] * (p["decimal"] - 1))}</span>'
+                res = f'<span class="muted">Pending · to win {_money(self._to_win(p, p["decimal"]))}</span>'
             elif p["status"] == "won":
                 res = f'<span class="won">Won {_money(p["payout"] - p["stake"])}</span>'
             elif p["status"] == "lost":
-                res = f'<span class="lost">Lost {_money(p["stake"])}</span>'
+                res = f'<span class="lost">Lost {_money(p["stake"] - p["payout"])}</span>'
             else:
                 res = '<span class="muted">Void, stake returned</span>'
+            res += self._perks(p)
             legs = "<br>".join(
                 f'{icon.get(leg["outcome"], "")} <a href="/book/matchups/{leg["matchup_id"]}">{_e(self._title(leg, name))}'
                 f'</a>: {_e(leg["label"])} <span class="odds">{fmt_odds(leg["odds"])}</span>'
@@ -976,6 +1045,7 @@ class BookSite:
                 f'<div class="opts"><b>Bet</b>{"".join(options)}</div>'
                 f'<label>Stake per bet ($)<br><input id="stake" name="stake" inputmode="decimal" required '
                 f'value="{_e(stake)}" placeholder="100"></label>'
+                f'{self._promo_select(bettor)}'
                 f'<label class="small"><input type="checkbox" name="keep" value="1"> Keep these picks in my slip '
                 f'(to bet them again another way)</label>'
                 f'<div><b id="nb">1 bet</b> · total <b id="cost">$0.00</b> · pays back up to <b id="ret">$0.00</b> '
@@ -994,6 +1064,7 @@ class BookSite:
                 f'<div class="card scroll"><table class="legs">{"".join(rows)}</table></div>'
                 f'<div class="card"><div class="score">{n} pick{"s" * (n != 1)}'
                 + (f' · <span class="odds">{fmt_odds(american_from_decimal(dec))}</span>' if n >= 2 else "")
+                + (f' · <span class="chip">🚀 +{parlay_boost(n):g}% parlay boost</span>' if n >= 2 and parlay_boost(n) else "")
                 + f'</div><p class="small muted">A parlay multiplies the odds of every pick and pays only if they all '
                   f"win; a pick that pushes or is voided drops out and the rest still count. A round robin bets "
                   f"every smaller parlay from your picks, so one miss doesn't sink everything. Tick as many as you "
@@ -1061,7 +1132,8 @@ class BookSite:
                 sizes = [len(seen)]  # an older page without the options: the whole slip as one parlay
             if not sizes:
                 raise BookError("Pick what to bet: the parlay, a round robin or each pick alone.")
-            res = self.book.place_slip(bettor["id"], stake, seen, sizes, keep=bool(form.get("keep")))
+            res = self.book.place_slip(bettor["id"], stake, seen, sizes, keep=bool(form.get("keep")),
+                                       promo_id=_int(form.get("promo")))
         except BookError as e:
             if _ajax(request):
                 return web.json_response({"ok": False, "msg": str(e)})
@@ -1164,6 +1236,108 @@ class BookSite:
     async def version(self, request: web.Request) -> web.Response:
         return web.json_response({"v": self.book.version(), "f": self.book.feed_version()}, headers={"Cache-Control": "no-store"})
 
+    async def promos_page(self, request: web.Request) -> web.Response:
+        """Your promos, today's odds boosts, and the parlay boost ladder."""
+        bettor = self._require_bettor(request)
+        name = self._names()
+        mine = self.book.promos(bettor["id"])
+        rows = "".join(f'<tr><td>{"🚀" if p["kind"] == "profit" else "🛡️"} {_e(self.book.promo_label(p))}</td>'
+                       f'<td class="small muted">{"Used" if p["used_at"] else "Ready: pick it when you bet"}</td></tr>'
+                       for p in mine)
+        yours = (f'<div class="card scroll"><table>{rows}</table></div>' if rows else
+                 "<p class='muted'>No promos yet. The admin hands them out.</p>")
+        boosts = "".join(
+            f'<div class="mk"><div class="t"><a href="/book/matchups/{b["matchup_id"]}">#{b["matchup_id"]} '
+            f'{_e(b["matchup_title"])}</a><div class="small">{_e(self._title(b, name))}</div></div>'
+            f'<div>{self._sel_button(b, True)}'
+            + (f'<div class="small muted">Up to {_money(b["boost_max"])}</div>' if b["boost_max"] else "")
+            + "</div></div>" for b in self.book.boosts())
+        ladder = " · ".join(f"{k}+ picks: <b>+{v:g}%</b>" for k, v in sorted(PARLAY_BOOSTS.items(), key=lambda kv: int(kv[0])))
+        body = (self._bar(request, bettor) + _flash(request) + "<h1>🎁 Promos</h1>"
+                "<h2>Your promos</h2><p class='small muted'>A <b>profit boost</b> adds that much to your winnings "
+                "if the bet wins. A <b>no-sweat bet</b> gives your stake back if it loses. Pick one in the bet "
+                "slip or parlay slip; each is used once, on one bet or one parlay.</p>" + yours
+                + "<h2>🔥 Odds boosts</h2><p class='small muted'>Better odds on these picks, single bets only.</p>"
+                + (f'<div class="card">{boosts}</div>' if boosts else "<p class='muted'>None right now.</p>")
+                + (f"<h2>🚀 Parlay boost</h2><div class='card'><p>Every parlay gets more winnings the more picks "
+                   f"it has: {ladder}. It's added automatically, and a pick that pushes or is voided drops out of "
+                   f"the count.</p></div>" if PARLAY_BOOSTS else ""))
+        return self._page("Promos", body, live=True)
+
+    async def admin_promos(self, request: web.Request) -> web.Response:
+        self._need_admin(request)
+        csrf = self._hidden(request, ADMIN_COOKIE)
+        name = self._names()
+        bettors = "".join(f'<option value="{r["id"]}">{_e(r["name"])}</option>'
+                          for r in sorted(self.book.leaderboard(), key=lambda r: r["name"].lower()))
+        give = (f'<div class="card"><h2 style="margin-top:0">Give a promo</h2>'
+                f'<form class="inline" method="post" action="/admin/promos">{csrf}'
+                f'<select name="who"><option value="all">Everyone</option>{bettors}</select>'
+                f'<select name="kind">' + "".join(f'<option value="{k}">{v}</option>' for k, v in PROMO_KINDS.items())
+                + '</select><input class="n" name="pct" placeholder="% (boost)" value="25">'
+                  '<input class="n" name="max" placeholder="Max stake">'
+                  '<input name="note" placeholder="Note, e.g. Week 4 special" maxlength="80">'
+                  '<button name="action" value="give">Give</button></form>'
+                  '<p class="small muted">Profit boost: the % is added to the winnings if the bet wins. No-sweat: '
+                  'the stake comes back if the bet loses. Max stake limits the bet it can be used on (blank = any).</p>'
+                  f'<h2>Bonus money</h2><form class="inline" method="post" action="/admin/promos">{csrf}'
+                  '<input class="n" name="amount" placeholder="+500"><button name="action" value="bonus">'
+                  'Give to everyone</button></form></div>')
+        boosts = "".join(
+            f'<tr><td><a href="/admin/matchups/{b["matchup_id"]}">#{b["matchup_id"]}</a> {_e(self._title(b, name))}: '
+            f'{_e(b["label"])}</td><td>{fmt_odds(b["boost_from"])} → <b>{fmt_odds(b["odds"])}</b></td>'
+            f'<td class="n">{_money(b["boost_max"]) if b["boost_max"] else "any"}</td>'
+            f'<td><form class="inline" style="margin:0" method="post" action="/admin/promos">{csrf}'
+            f'<input type="hidden" name="sel" value="{b["id"]}"><button class="sec" name="action" value="unboost">'
+            f'Remove</button></form></td></tr>' for b in self.book.boosts())
+        promos = "".join(
+            f'<tr><td>{_e(p["name"])}</td><td>{_e(self.book.promo_label(p))}</td>'
+            f'<td class="small muted">{"Used " + _time(p["used_at"]) if p["used_at"] else "Not used yet"}</td><td>'
+            + ("" if p["used_at"] else
+               f'<form class="inline" style="margin:0" method="post" action="/admin/promos">{csrf}'
+               f'<input type="hidden" name="promo" value="{p["id"]}"><button class="sec" name="action" '
+               f'value="delete">Take back</button></form>') + "</td></tr>" for p in self.book.promos())
+        ladder = ", ".join(f"{k}+ picks +{v:g}%" for k, v in sorted(PARLAY_BOOSTS.items(), key=lambda kv: int(kv[0])))
+        body = (self._admin_bar(request) + _flash(request) + "<h1>Promos and boosts</h1>" + give
+                + "<h2>🔥 Odds boosts</h2><p class='small muted'>Add one from a matchup's page (Odds boost). "
+                  "Boosted picks are single bets only.</p>"
+                + (f'<div class="card scroll"><table><tr><th>Pick</th><th>Odds</th><th class="n">Max bet</th><th></th>'
+                   f'</tr>{boosts}</table></div>' if boosts else "<p class='muted'>None right now.</p>")
+                + f"<h2>🚀 Parlay boost</h2><p class='small muted'>Automatic: {ladder or 'off'}. Change it with "
+                  f"<code>BOOK_PARLAY_BOOSTS</code> in config.py.</p>"
+                + "<h2>Promos given</h2>"
+                + (f'<div class="card scroll"><table><tr><th>Bettor</th><th>Promo</th><th>Status</th><th></th></tr>'
+                   f'{promos}</table></div>' if promos else "<p class='muted'>None yet.</p>"))
+        return self._page("Promos", body)
+
+    async def admin_promos_action(self, request: web.Request) -> web.Response:
+        self._need_admin(request)
+        form = await request.post()
+        self._check_csrf(request, form, ADMIN_COOKIE)
+        action = form.get("action")
+        try:
+            if action == "give":
+                who = str(form.get("who", "all"))
+                mx = _float(form.get("max")) if str(form.get("max", "")).strip() else None
+                n = self.book.give_promo(None if who == "all" else _int(who, 0), str(form.get("kind", "")),
+                                         _float(form.get("pct"), 0) or 0, mx, str(form.get("note", "")))
+                msg = f"Gave {n} promo{'s' * (n != 1)}."
+            elif action == "bonus":
+                amount = _float(form.get("amount"))
+                n = self.book.bonus_all(amount or 0)
+                msg = f"Gave {_money(amount)} to {n} bettor{'s' * (n != 1)}."
+            elif action == "unboost":
+                self.book.unboost_odds(_int(form.get("sel"), 0))
+                msg = "Boost removed; the odds are back to normal."
+            elif action == "delete":
+                self.book.delete_promo(_int(form.get("promo"), 0))
+                msg = "Promo taken back."
+            else:
+                raise BookError("Unknown action.")
+        except BookError as e:
+            raise _redirect("/admin/promos", str(e), err=True)
+        raise _redirect("/admin/promos", msg)
+
     async def leaderboard(self, request: web.Request) -> web.Response:
         body = (self._bar(request, self._bettor(request)) + "<h1>Sportsbook leaderboard</h1>"
                 "<p class='muted'>Total = money left to bet plus money in open bets.</p>"
@@ -1173,7 +1347,7 @@ class BookSite:
     # ---------------------------------------------------------------- admin
     def _admin_bar(self, request: web.Request) -> str:
         return (f'<div class="card bar"><b>Sportsbook admin</b><a href="/admin">Matchups</a>'
-                f'<a href="/admin/bettors">Bettors</a><a href="/book">Bettor view</a>'
+                f'<a href="/admin/bettors">Bettors</a><a href="/admin/promos">Promos</a><a href="/book">Bettor view</a>'
                 f'<form method="post" action="/admin/logout" style="margin-left:auto">'
                 f'{self._hidden(request, ADMIN_COOKIE)}<button class="sec">Log out</button></form></div>')
 
@@ -1390,6 +1564,29 @@ class BookSite:
             markets += [m] + sorted((a for a in everything if a["parent_id"] == m["id"]), key=lambda a: a["line"])
         live = mu["status"] in ("open", "locked")
         controls = []
+        if mu["status"] != "void":
+            hurt = set(json.loads(mu.get("injured") or "[]"))
+            ppl = "".join(f'<option value="{_e(k)}">{_e(name(k))}</option>'
+                          for k in mu["players1"] + mu["players2"] if k not in hurt)
+            picks = "".join(f'<option value="{x["id"]}">{_e(self._title(m, name))}: {_e(x["label"])} '
+                            f'({fmt_odds(x["odds"])}{", boosted" if x["boost_from"] is not None else ""})</option>'
+                            for m in everything if not m["parent_id"] and m["status"] == "open"
+                            for x in m["selections"])
+            controls.append(
+                f'<div class="card"><h2 style="margin-top:0">🚑 Injury insurance</h2><p class="small muted">A player '
+                f'left mid-game? Like the big books: single bets on their stats are voided (stakes back), and '
+                f'parlays with one of their picks carry on without it, re-priced at the odds of the picks left.'
+                + (f' Already applied: {_e(", ".join(name(k) for k in hurt))}.' if hurt else "") + '</p>'
+                + (f'<form class="inline" method="post" action="{act}" onsubmit="return confirm(\'Apply injury '
+                   f'insurance? Bets on this player\\\'s stats are voided.\')">{csrf}<select name="player">{ppl}</select>'
+                   f'<button class="bad" name="action" value="injury">Player left the game</button></form>' if ppl else "")
+                + (f'<h2>🔥 Odds boost</h2><form class="inline" method="post" action="{act}">{csrf}'
+                   f'<select name="sel" style="max-width:420px">{picks}</select>'
+                   f'<input class="n" name="odds" placeholder="New odds, e.g. +200">'
+                   f'<input class="n" name="max" placeholder="Max bet (blank = any)">'
+                   f'<button name="action" value="boost">Boost</button></form><p class="small muted">Better odds '
+                   f'on one pick, single bets only. Remove boosts on the <a href="/admin/promos">Promos</a> page.</p>'
+                   if picks else "") + "</div>")
         if inside := self.book.insider_bets(mu["id"]):
             rows = "".join(
                 f'<tr><td>{_e(b["name"])}</td><td class="small">{_e(b["label"])}'
@@ -1525,6 +1722,19 @@ class BookSite:
                 self.book.delete_matchup(mid)
                 raise _redirect("/admin", f"Deleted matchup #{mid} ({mu['title']}); open bets on it were refunded "
                                           f"and the matchups after it moved up a number.")
+            elif action == "injury":
+                key = str(form.get("player", ""))
+                res = self.book.injury(mid, key)
+                msg = (f"Injury insurance for {self._names()(key)}: {res['bets']} single bet"
+                       f"{'s' * (res['bets'] != 1)} voided, {res['parlays']} parlay{'s' * (res['parlays'] != 1)} "
+                       f"re-priced without the pick.")
+            elif action == "boost":
+                odds = _int(form.get("odds"))
+                mx = _float(form.get("max")) if str(form.get("max", "")).strip() else None
+                if odds is None:
+                    raise BookError("Enter the boosted odds, like +200.")
+                self.book.boost_odds(_int(form.get("sel"), 0), odds, mx)
+                msg = "Odds boosted."
             elif action == "void_bet":
                 kind, _, bid = str(form.get("bet", "")).partition(":")
                 self.book.void_bet(kind, _int(bid, 0))

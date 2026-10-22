@@ -74,6 +74,11 @@ BLOCK_BET_AGAINST_SELF: bool = getattr(config, "BOOK_BLOCK_BET_AGAINST_SELF", Fa
 BLOCK_OWN_GAME_PROPS: bool = getattr(config, "BOOK_BLOCK_OWN_GAME_PROPS", False) # totals and game props of their game
 BLOCK_TEAMMATE_PROPS: bool = getattr(config, "BOOK_BLOCK_TEAMMATE_PROPS", False)  # a teammate's stats
 
+# Parlay profit boost by number of picks, like the big books: {picks: % more winnings}; a parlay
+# gets the boost of the largest count it reaches. {} turns it off.
+PARLAY_BOOSTS: dict[int, float] = getattr(config, "BOOK_PARLAY_BOOSTS", {3: 10, 4: 15, 5: 20, 6: 25, 8: 30, 10: 40})
+PROMO_KINDS = {"profit": "Profit boost", "nosweat": "No-sweat bet"}
+
 # Game bets on what both teams do together, over/unders settled from the whole game's stat sheet.
 # Keys start "g:" (a market's stat); the sheet has no extra points or 2-point conversions, so
 # "Points after touchdowns" is worked out from the final score.
@@ -169,6 +174,19 @@ CREATE TABLE IF NOT EXISTS book_parlay_legs (
     odds          INTEGER NOT NULL                     -- odds when the parlay was placed
 );
 CREATE INDEX IF NOT EXISTS idx_book_legs_sel ON book_parlay_legs(selection_id);
+-- Promos the admin hands out: a profit boost (pct% more winnings) or a no-sweat bet (stake back
+-- if it loses, up to max_stake), each used on one bet or parlay
+CREATE TABLE IF NOT EXISTS book_promos (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    bettor_id   INTEGER NOT NULL REFERENCES book_bettors(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,                         -- profit | nosweat
+    pct         REAL NOT NULL DEFAULT 0,
+    max_stake   REAL,                                  -- biggest stake it can be used on (NULL = any)
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    used_at     TEXT,
+    used_on     TEXT                                   -- "bet:12" or "parlay:4"
+);
 -- Picks a bettor is collecting for their next parlay
 CREATE TABLE IF NOT EXISTS book_slip (
     bettor_id     INTEGER NOT NULL REFERENCES book_bettors(id) ON DELETE CASCADE,
@@ -205,9 +223,22 @@ def ensure_schema(db: Database) -> None:
             # The league player an account belongs to: NULL = worked out from its name, '' = nobody
             c.execute("ALTER TABLE book_bettors ADD COLUMN player_key TEXT")
         for table in ("book_bets", "book_parlays"):
-            if "admin_void" not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
-                # Voided by the admin (an inside bet): settling and undoing leave it alone
+            cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+            if "admin_void" not in cols:
+                # Voided by the admin (an inside bet, injury insurance): settling and undoing leave it alone
                 c.execute(f"ALTER TABLE {table} ADD COLUMN admin_void INTEGER NOT NULL DEFAULT 0")
+            if "boost" not in cols:
+                # boost = % more winnings (parlay boost + profit boost promo); nosweat = paid back if it loses
+                c.execute(f"ALTER TABLE {table} ADD COLUMN boost REAL NOT NULL DEFAULT 0")
+                c.execute(f"ALTER TABLE {table} ADD COLUMN nosweat REAL NOT NULL DEFAULT 0")
+                c.execute(f"ALTER TABLE {table} ADD COLUMN promo_id INTEGER")
+        sel_cols = {r["name"] for r in c.execute("PRAGMA table_info(book_selections)")}
+        if "boost_from" not in sel_cols:
+            # An odds boost: the odds before it, and the biggest stake allowed at the boosted odds
+            c.execute("ALTER TABLE book_selections ADD COLUMN boost_from INTEGER")
+            c.execute("ALTER TABLE book_selections ADD COLUMN boost_max REAL")
+        if "injured" not in {r["name"] for r in c.execute("PRAGMA table_info(book_matchups)")}:
+            c.execute("ALTER TABLE book_matchups ADD COLUMN injured TEXT NOT NULL DEFAULT '[]'")
         if "parent_id" not in {r["name"] for r in c.execute("PRAGMA table_info(book_markets)")}:
             c.execute("ALTER TABLE book_markets ADD COLUMN parent_id INTEGER")
         for r in c.execute("SELECT id FROM book_bettors WHERE code IS NULL").fetchall():
@@ -318,6 +349,22 @@ def alt_lines(model: dict, main: float) -> list[float]:
             continue
         out.append(line)
     return out
+
+
+def parlay_boost(n_legs: int) -> float:
+    """The automatic profit boost (%) for a parlay of this many picks."""
+    return max((pct for k, pct in PARLAY_BOOSTS.items() if n_legs >= int(k)), default=0.0)
+
+
+def payout_for(bet, outcome: str, dec: float) -> float:
+    """What a bet or parlay pays back: win = stake + winnings with its profit boost; lose = its no-sweat
+    refund (if any); push or void = the stake."""
+    stake = bet["stake"]
+    if outcome == "win":
+        return round(stake + stake * (dec - 1) * (1 + (bet["boost"] or 0) / 100), 2)
+    if outcome == "lose":
+        return round(min(stake, bet["nosweat"] or 0), 2)
+    return round(stake, 2)
 
 
 def stat_label(stat: str) -> str:
@@ -941,6 +988,7 @@ class Book:
                         raise BookError("Odds must be +100 or more, or -100 or less (e.g. -110, +150).")
                     c.execute("UPDATE book_selections SET odds = ? WHERE id = ? AND market_id = ?",
                               (o, sid, market_id))
+            c.execute("UPDATE book_selections SET boost_from = NULL, boost_max = NULL WHERE market_id = ?", (market_id,))
             c.commit()
 
     def set_market_status(self, market_id: int, status: str) -> None:
@@ -1079,7 +1127,8 @@ class Book:
             c.execute("UPDATE book_bettors SET balance = round(balance + ?, 2) WHERE id = ?", (b["stake"], b["bettor_id"]))
             c.commit()
 
-    def place_bet(self, bettor_id: int, sel_id: int, stake: float, seen_odds: int | None = None) -> int:
+    def place_bet(self, bettor_id: int, sel_id: int, stake: float, seen_odds: int | None = None,
+                  promo_id: int | None = None) -> int:
         stake = round(stake, 2)
         if not stake >= MIN_STAKE:
             raise BookError(f"The smallest bet is ${MIN_STAKE:,.0f}.")
@@ -1094,14 +1143,135 @@ class Book:
                 raise BookError(why)
             if seen_odds is not None and seen_odds != s["odds"]:
                 raise BookError(f"The odds changed to {fmt_odds(s['odds'])}. Check them and bet again.")
+            if s["boost_from"] is not None and s["boost_max"] and stake > s["boost_max"] + 1e-9:
+                raise BookError(f"The most you can bet on a boost is ${s['boost_max']:,.2f}.")
+            promo = self._promo_for(bettor_id, promo_id, stake)
             b = c.execute("SELECT balance FROM book_bettors WHERE id = ?", (bettor_id,)).fetchone()
             if not b or b["balance"] + 1e-9 < stake:
                 raise BookError(f"You only have ${b['balance'] if b else 0:,.2f}.")
             c.execute("UPDATE book_bettors SET balance = round(balance - ?, 2) WHERE id = ?", (stake, bettor_id))
-            bid = c.execute("INSERT INTO book_bets(bettor_id, selection_id, stake, odds, placed_at) "
-                            "VALUES(?,?,?,?,?)", (bettor_id, sel_id, stake, s["odds"], _now())).lastrowid
+            boost, nosweat = self._promo_terms(promo, stake)
+            bid = c.execute("INSERT INTO book_bets(bettor_id, selection_id, stake, odds, placed_at, boost, nosweat, "
+                            "promo_id) VALUES(?,?,?,?,?,?,?,?)", (bettor_id, sel_id, stake, s["odds"], _now(), boost,
+                                                                   nosweat, promo_id if promo else None)).lastrowid
+            if promo:
+                c.execute("UPDATE book_promos SET used_at = ?, used_on = ? WHERE id = ?", (_now(), f"bet:{bid}", promo["id"]))
             c.commit()
             return bid
+
+    # ------------------------------------------------------------- promos
+    def _promo_for(self, bettor_id: int, promo_id: int | None, stake: float):
+        """The bettor's unused promo to put on a bet of this stake (None for no promo)."""
+        if not promo_id:
+            return None
+        p = self.db.one("SELECT * FROM book_promos WHERE id = ? AND bettor_id = ?", (promo_id, bettor_id))
+        if not p or p["used_at"]:
+            raise BookError("That promo has already been used.")
+        if p["max_stake"] and stake > p["max_stake"] + 1e-9:
+            raise BookError(f"That promo is for bets up to ${p['max_stake']:,.2f}.")
+        return p
+
+    @staticmethod
+    def _promo_terms(promo, stake: float, boost: float = 0.0) -> tuple[float, float]:
+        """(profit boost %, no-sweat refund) for a bet with this promo on top of a parlay boost."""
+        if not promo:
+            return boost, 0.0
+        if promo["kind"] == "profit":
+            return boost + promo["pct"], 0.0
+        return boost, stake
+
+    def promos(self, bettor_id: int | None = None, unused: bool = False) -> list[dict]:
+        sql = "SELECT p.*, u.name FROM book_promos p JOIN book_bettors u ON u.id = p.bettor_id WHERE 1=1"
+        args: list = []
+        if bettor_id is not None:
+            sql += " AND p.bettor_id = ?"
+            args.append(bettor_id)
+        if unused:
+            sql += " AND p.used_at IS NULL"
+        return [dict(r) for r in self.db.q(sql + " ORDER BY p.id DESC LIMIT 300", tuple(args))]
+
+    @staticmethod
+    def promo_label(p) -> str:
+        cap = f" (bets up to ${p['max_stake']:,.0f})" if p["max_stake"] else ""
+        what = f"{p['pct']:g}% profit boost" if p["kind"] == "profit" else "No-sweat bet: stake back if it loses"
+        return what + cap + (f" · {p['note']}" if p["note"] else "")
+
+    def give_promo(self, bettor_id: int | None, kind: str, pct: float, max_stake: float | None, note: str = "") -> int:
+        """Give one bettor (or everyone, bettor_id None) a promo. Returns how many were given."""
+        if kind not in PROMO_KINDS:
+            raise BookError("Pick a promo type.")
+        if kind == "profit" and not 0 < pct <= 500:
+            raise BookError("A profit boost is between 1% and 500%.")
+        if max_stake is not None and max_stake < MIN_STAKE:
+            raise BookError(f"The stake limit must be at least ${MIN_STAKE:,.0f}.")
+        ids = ([bettor_id] if bettor_id is not None else
+               [r["id"] for r in self.db.q("SELECT id FROM book_bettors")])
+        with self.db.lock:
+            c = self.db.conn
+            for bid in ids:
+                c.execute("INSERT INTO book_promos(bettor_id, kind, pct, max_stake, note, created_at) VALUES(?,?,?,?,?,?)",
+                          (bid, kind, pct if kind == "profit" else 0, max_stake, note.strip()[:80], _now()))
+            c.commit()
+        return len(ids)
+
+    def delete_promo(self, promo_id: int) -> None:
+        self.db.x("DELETE FROM book_promos WHERE id = ? AND used_at IS NULL", (promo_id,))
+
+    def bonus_all(self, amount: float) -> int:
+        """Bonus money to every bettor. Returns how many got it."""
+        if not amount:
+            raise BookError("Enter an amount.")
+        return self.db.x("UPDATE book_bettors SET balance = round(balance + ?, 2)", (amount,)).rowcount
+
+    def boost_odds(self, sel_id: int, odds: int, max_stake: float | None) -> None:
+        """An odds boost on one pick: better odds (single bets only), up to max_stake a bet."""
+        s = self.selection(sel_id)
+        if not s:
+            raise BookError("No such pick.")
+        base = s["boost_from"] if s["boost_from"] is not None else s["odds"]
+        if -100 < odds < 100 or decimal_odds(odds) <= decimal_odds(base):
+            raise BookError(f"A boost needs better odds than {fmt_odds(base)}.")
+        self.db.x("UPDATE book_selections SET odds = ?, boost_from = ?, boost_max = ? WHERE id = ?",
+                  (odds, base, max_stake, sel_id))
+        self.db.x("DELETE FROM book_slip WHERE selection_id = ?", (sel_id,))
+
+    def unboost_odds(self, sel_id: int) -> None:
+        self.db.x("UPDATE book_selections SET odds = boost_from, boost_from = NULL, boost_max = NULL "
+                  "WHERE id = ? AND boost_from IS NOT NULL", (sel_id,))
+
+    def boosts(self) -> list[dict]:
+        """Every pick with an odds boost on a matchup still open."""
+        return [dict(r) for r in self.db.q(
+            "SELECT s.*, m.title AS market_title, m.kind, m.player_key, m.stat, mu.id AS matchup_id, "
+            "mu.title AS matchup_title FROM book_selections s JOIN book_markets m ON m.id = s.market_id "
+            "JOIN book_matchups mu ON mu.id = m.matchup_id WHERE s.boost_from IS NOT NULL "
+            "AND mu.status IN ('open', 'locked') AND m.status IN ('open', 'locked') ORDER BY mu.id, s.id")]
+
+    # ------------------------------------------------------------- injury insurance
+    def injury(self, matchup_id: int, key: str) -> dict:
+        """A player left the game hurt (injury insurance, like the big books): single bets on their
+        stats are voided (stakes back), and in a parlay their pick drops out and the rest of the parlay
+        stands at the odds of the picks left (all of it back if nothing else is left). Returns
+        {"bets": n singles refunded, "parlays": n parlays recalculated}."""
+        mu = self.matchup(matchup_id)
+        if not mu or key not in mu["players1"] + mu["players2"]:
+            raise BookError("That player isn't in this matchup.")
+        mids = [r["id"] for r in self.db.q("SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'prop' "
+                                           "AND player_key = ?", (matchup_id, key))]
+        marks = ",".join("?" * len(mids)) or "NULL"
+        sel = f"SELECT s.id FROM book_selections s WHERE s.market_id IN ({marks})"
+        n_bets = self.db.one(f"SELECT COUNT(*) n FROM book_bets WHERE status != 'void' AND NOT admin_void "
+                             f"AND selection_id IN ({sel})", tuple(mids))["n"]
+        n_parlays = self.db.one(f"SELECT COUNT(DISTINCT parlay_id) n FROM book_parlay_legs l JOIN book_parlays p "
+                                f"ON p.id = l.parlay_id WHERE NOT p.admin_void AND l.selection_id IN ({sel})",
+                                tuple(mids))["n"]
+        for mid in mids:
+            if self.db.one("SELECT parent_id FROM book_markets WHERE id = ?", (mid,))["parent_id"] is None:
+                self.void_market(mid, "left the game hurt: injury insurance")
+        hurt = json.loads(mu.get("injured") or "[]")
+        if key not in hurt:
+            self.db.x("UPDATE book_matchups SET injured = ? WHERE id = ?", (json.dumps(hurt + [key]), matchup_id))
+        return {"bets": n_bets, "parlays": n_parlays}
 
     def bets_for(self, bettor_id: int) -> list[dict]:
         return [dict(r) for r in self.db.q(
@@ -1127,6 +1297,8 @@ class Book:
             raise BookError("Betting on this is closed.")
         if why := self._insider(bettor_id, s):
             raise BookError(why)
+        if s["boost_from"] is not None:
+            raise BookError("Odds boosts are single bets only. Tap the pick to bet it on its own.")
         with self.db.lock:
             c = self.db.conn
             c.execute("DELETE FROM book_slip WHERE bettor_id = ? AND selection_id IN "
@@ -1164,7 +1336,7 @@ class Book:
         return sum(math.comb(n_legs, k) for k in set(sizes) if 1 <= k <= n_legs)
 
     def place_slip(self, bettor_id: int, stake: float, seen: list[tuple[int, int]] | None = None,
-                   sizes: list[int] | None = None, keep: bool = False) -> dict:
+                   sizes: list[int] | None = None, keep: bool = False, promo_id: int | None = None) -> dict:
         """Bet the slip, stake on each bet: sizes [n] = one parlay of every pick; add 1 for each pick
         on its own, or any k for every k-pick parlay from the slip (a round robin), all at once.
         seen = [(selection id, odds)] the bettor was shown; if any pick or its odds changed since,
@@ -1193,6 +1365,12 @@ class Book:
             if seen is not None and sorted(seen) != sorted((s["id"], s["odds"]) for s in legs):
                 raise BookError("Your picks or their odds changed. Check the slip and bet again.")
             n_bets = self.slip_bets(len(legs), sizes)
+            boosted = [s["label"] for s in legs if s["boost_from"] is not None]
+            if boosted:
+                raise BookError("Odds boosts are single bets only: take " + ", ".join(boosted) + " out of your slip.")
+            promo = self._promo_for(bettor_id, promo_id, stake)
+            if promo and n_bets != 1:
+                raise BookError("A promo goes on one bet: place the parlay on its own to use it.")
             if n_bets > MAX_SLIP_BETS:
                 raise BookError(f"That's {n_bets} bets; the most at once is {MAX_SLIP_BETS}. Pick fewer sizes.")
             cost = round(stake * n_bets, 2)
@@ -1204,17 +1382,23 @@ class Book:
             now, singles, parlays = _now(), [], []
             for k in sizes:
                 for combo in itertools.combinations(legs, k):
+                    boost, nosweat = self._promo_terms(promo, stake, parlay_boost(k) if k > 1 else 0.0)
                     if k == 1:
                         singles.append(c.execute("INSERT INTO book_bets(bettor_id, selection_id, stake, odds, "
-                                                 "placed_at) VALUES(?,?,?,?,?)",
-                                                 (bettor_id, combo[0]["id"], stake, combo[0]["odds"], now)).lastrowid)
+                                                 "placed_at, boost, nosweat, promo_id) VALUES(?,?,?,?,?,?,?,?)",
+                                                 (bettor_id, combo[0]["id"], stake, combo[0]["odds"], now, boost,
+                                                  nosweat, promo["id"] if promo else None)).lastrowid)
                         continue
-                    pid = c.execute("INSERT INTO book_parlays(bettor_id, stake, placed_at) VALUES(?,?,?)",
-                                    (bettor_id, stake, now)).lastrowid
+                    pid = c.execute("INSERT INTO book_parlays(bettor_id, stake, placed_at, boost, nosweat, promo_id) "
+                                    "VALUES(?,?,?,?,?,?)", (bettor_id, stake, now, boost, nosweat,
+                                                            promo["id"] if promo else None)).lastrowid
                     for s in combo:
                         c.execute("INSERT INTO book_parlay_legs(parlay_id, selection_id, odds) VALUES(?,?,?)",
                                   (pid, s["id"], s["odds"]))
                     parlays.append(pid)
+            if promo:
+                c.execute("UPDATE book_promos SET used_at = ?, used_on = ? WHERE id = ?",
+                          (now, f"parlay:{parlays[0]}" if parlays else f"bet:{singles[0]}", promo["id"]))
             if not keep:
                 c.execute("DELETE FROM book_slip WHERE bettor_id = ?", (bettor_id,))
             c.commit()
@@ -1332,13 +1516,17 @@ class Book:
                              "ON s.id = l.selection_id WHERE l.parlay_id = ?", (p["id"],)).fetchall()
             outcomes = [leg["outcome"] for leg in legs]
             if "lose" in outcomes:
-                status, payout = "lost", 0.0
+                status, payout = "lost", payout_for(p, "lose", 1.0)
             elif None in outcomes:
                 status, payout = "pending", 0.0
             elif "win" in outcomes:
                 status = "won"
-                payout = round(p["stake"] * self.parlay_decimal([leg["odds"] for leg in legs
-                                                                 if leg["outcome"] == "win"]), 2)
+                won = [leg["odds"] for leg in legs if leg["outcome"] == "win"]
+                # the parlay boost follows the picks that won (pushed or voided ones drop out of it)
+                placed = parlay_boost(len(legs)) if p["boost"] >= parlay_boost(len(legs)) else 0.0  # 0: older parlay
+                boost = p["boost"] - placed + (parlay_boost(len(won)) if placed else 0.0)
+                payout = payout_for({"stake": p["stake"], "boost": boost, "nosweat": 0}, "win",
+                                    self.parlay_decimal(won))
             else:
                 status, payout = "void", p["stake"]
             if (status, payout) != (p["status"], p["payout"]):
@@ -1349,7 +1537,6 @@ class Book:
     # --------------------------------------------------------------- settlement
     def _grade(self, market_id: int, outcomes: dict[int, str], result: str | None, status: str = "settled") -> None:
         """Set each selection's outcome and pay its bets (caller checked the market isn't settled)."""
-        pay = {"win": None, "push": 1.0, "void": 1.0, "lose": 0.0}
         bet_status = {"win": "won", "push": "push", "void": "void", "lose": "lost"}
         with self.db.lock:
             c = self.db.conn
@@ -1357,8 +1544,7 @@ class Book:
                 c.execute("UPDATE book_selections SET outcome = ? WHERE id = ?", (outcome, sid))
                 for bet in c.execute("SELECT * FROM book_bets WHERE selection_id = ? AND status = 'pending'",
                                      (sid,)).fetchall():
-                    mult = decimal_odds(bet["odds"]) if outcome == "win" else pay[outcome]
-                    payout = round(bet["stake"] * mult, 2)
+                    payout = payout_for(bet, outcome, decimal_odds(bet["odds"]))
                     c.execute("UPDATE book_bets SET status = ?, payout = ? WHERE id = ?",
                               (bet_status[outcome], payout, bet["id"]))
                     if payout:
