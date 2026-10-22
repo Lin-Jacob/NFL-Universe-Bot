@@ -118,6 +118,8 @@ An empty `password` means the player's Discord ID, once an admin has linked thei
 
 **Parlays:** the **+** next to any pick adds it to the bettor's parlay slip (`/book/parlay`, saved with their account). Two to ten picks, one per bet; the odds multiply and it pays only if every pick wins. A pick that pushes or is voided drops out and the rest still count. Parlays settle by themselves as their picks settle, and undoing a pick's settlement re-grades them.
 
+**Parlay cart:** the 🧾 Parlay button in the bottom corner of every sportsbook page opens the slip like a shopping cart. Tapping **+** (or a slider's + parlay) adds the pick without leaving the page and opens the cart; tap it again, or ✕ in the cart, to take it out. The cart shows each pick with its odds, the combined parlay odds, and what your stake pays as you type, and **Place parlay** bets it right there. It stays open as you move between pages. Round robins and straight bets from the slip are on the full slip page (link in the cart).
+
 **Bet card:** tapping any odds opens a small bet card on the same page instead of a new one. Drag it anywhere by its top bar (it remembers where). It has quick stake buttons (+$10 … Max), shows what the bet pays as you type, places the bet or adds the pick to your parlay slip, and updates your balance on the spot. Esc or ✕ closes it.
 
 **Search and filters:** the sportsbook home page can search games by title, team or player and filter Open / Betting closed. Each matchup page has a search box (e.g. "passing yards" or a player's name) and filters for Game, Player props and Specials, plus a team filter. Both teams are always listed with their players, under their in-game names once a game has named them.
