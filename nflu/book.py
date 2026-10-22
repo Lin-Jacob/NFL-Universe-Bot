@@ -170,15 +170,18 @@ r.addEventListener('input',u);u();});})();</script>"""
 
 # Search box + filter buttons (see BookSite._filter_bar)
 FILTER_JS = """<script>(function(){var bar=document.currentScript.previousElementSibling,q=bar.querySelector('.fq'),
-t=bar.querySelector('.ft'),n=bar.querySelector('.fn'),kind='';
-function run(){var s=q.value.trim().toLowerCase(),tm=t?t.value:'',shown=0,all=document.querySelectorAll('.fr');
-all.forEach(function(r){var ok=(!kind||r.dataset.k===kind)&&(!tm||r.dataset.t===tm)&&
+t=bar.querySelector('.ft'),pl=bar.querySelector('.fp'),n=bar.querySelector('.fn'),kind='';
+function team(){if(!pl)return;var tm=t.value;pl.querySelectorAll('option[data-t]').forEach(function(o){
+o.hidden=o.disabled=!!tm&&o.dataset.t!==tm;});if(pl.selectedOptions[0]&&pl.selectedOptions[0].hidden)pl.value='';}
+function run(){var s=q.value.trim().toLowerCase(),tm=t?t.value:'',p=pl?pl.value:'',shown=0,all=document.querySelectorAll('.fr');
+all.forEach(function(r){var ok=(!kind||r.dataset.k===kind)&&(!tm||r.dataset.t===tm)&&(!p||r.dataset.p===p)&&
 s.split(/\\s+/).every(function(w){return r.dataset.q.indexOf(w)>=0});r.style.display=ok?'':'none';if(ok)shown++;});
 document.querySelectorAll('.fg').forEach(function(g){g.style.display=g.querySelector('.fr:not([style*="none"])')?'':'none'});
-n.textContent=(s||kind||tm)?shown+' of '+all.length:'';}
+n.textContent=(s||kind||tm||p)?shown+' of '+all.length:'';}
 bar.querySelectorAll('[data-f]').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();
 kind=a.dataset.f;bar.querySelectorAll('[data-f]').forEach(function(b){b.className=b===a?'on':''});run();});});
-q.addEventListener('input',run);if(t)t.addEventListener('change',run);})();</script>"""
+q.addEventListener('input',run);if(t)t.addEventListener('change',function(){team();run();});
+if(pl)pl.addEventListener('change',run);})();</script>"""
 
 # The bet card: tapping odds opens a small card you can drag anywhere (it remembers where) to bet
 # without leaving the page. Links still work without JavaScript (they open /book/bet/<id>).
@@ -677,7 +680,7 @@ class BookSite:
         groups: dict[str, list[dict]] = {}
         for m in markets:
             head = ("Game" if m["kind"] in ("moneyline", "spread") or (m["kind"] == "total" and not m["stat"]) else
-                    "Game props" if m["kind"] in ("total", "yesno") else
+                    "Game props" if m["kind"] in ("total", "yesno", "exact", "margin", "leader") else
                     "Specials" if m["kind"] == "custom" else name(m["player_key"]))
             groups.setdefault(head, []).append(m)
         ctx = self._parlay_ctx(request, bettor)
@@ -691,9 +694,10 @@ class BookSite:
                 html = self._slider_row(m, name, ctx, self.book.ladder(m, models, alts.get(m["id"], [])))
             else:
                 html = self._market_row(m, mu, name, ctx)
-            kind = "game" if m["kind"] in ("moneyline", "spread", "total", "yesno") else m["kind"]
+            kind = "game" if m["kind"] in ("moneyline", "spread", "total", "yesno", "exact", "margin", "leader") else m["kind"]
             text = " ".join([self._title(m, name)] + [x["label"] for x in m["selections"]]).lower()
             return (f'<div class="fr" data-k="{kind}" data-t="{side.get(m["player_key"], "")}" '
+                    f'data-p="{_e(m["player_key"] or "")}" '
                     f'data-q="{_e(text)}">{html}</div>')
         cards = "".join(f'<div class="card fg"><h2 style="margin-top:0">{_e(head)}</h2>'
                         + "".join(row(m) for m in ms) + "</div>" for head, ms in groups.items())
@@ -707,7 +711,8 @@ class BookSite:
                         'locked. Everything else is open.</div>')
         tools = self._filter_bar("Search players or stats, e.g. passing yards",
                                  [("", "All"), ("game", "Game"), ("prop", "Player props"), ("custom", "Specials")],
-                                 [("", "Both teams"), ("1", mu["team1"]), ("2", mu["team2"])])
+                                 [("", "Both teams"), ("1", mu["team1"]), ("2", mu["team2"])],
+                                 [(k, name(k), t) for t in ("1", "2") for k in mu[f"players{t}"]])
         body = (self._bar(request, bettor) + _flash(request)
                 + f'<p class="small"><a href="/book">← all games</a></p><h1>#{mu["id"]} {_e(mu["title"])} '
                   f'<span class="chip">{_STATUS[mu["status"]]}</span></h1>'
@@ -726,12 +731,18 @@ class BookSite:
                            for t, p in (("team1", "players1"), ("team2", "players2")))
 
     @staticmethod
-    def _filter_bar(placeholder: str, kinds: list[tuple[str, str]], teams: list[tuple[str, str]] | None = None) -> str:
-        """Search box and filter buttons over the page's .fr rows (data-q text, data-k kind, data-t team);
-        a .fg card whose rows are all hidden hides too."""
+    def _filter_bar(placeholder: str, kinds: list[tuple[str, str]], teams: list[tuple[str, str]] | None = None,
+                    players: list[tuple[str, str, str]] | None = None) -> str:
+        """Search box and filter buttons over the page's .fr rows (data-q text, data-k kind, data-t team,
+        data-p player); a .fg card whose rows are all hidden hides too. The player dropdown
+        ((key, name, team) each) lists the chosen team's players, or everyone when no team is picked."""
         chips = "".join(f'<a href="#" data-f="{k}"{" class=on" if not k else ""}>{_e(lbl)}</a>' for k, lbl in kinds)
         team = ("" if not teams else '<select class="ft" aria-label="Team">'
                 + "".join(f'<option value="{k}">{_e(lbl)}</option>' for k, lbl in teams) + "</select>")
+        if players:
+            team += ('<select class="fp" aria-label="Player"><option value="">All players</option>'
+                     + "".join(f'<option value="{_e(k)}" data-t="{t}">{_e(lbl)}</option>' for k, lbl, t in players)
+                     + "</select>")
         return (f'<div class="card filters"><input class="fq" type="search" placeholder="{_e(placeholder)}" '
                 f'aria-label="Search"><div class="tabs" style="margin:0">{chips}</div>{team}'
                 f'<span class="small muted fn"></span></div>' + FILTER_JS)

@@ -619,6 +619,7 @@ def test_inside_betting(tmp_path):
                 mate["selections"][0]["id"], rival["selections"][1]["id"], book.markets(other)[0]["selections"][1]["id"]):
         book.place_bet(zork, sel, 10)
     mine = {x["id"] for m in ms if m["player_key"] == "qbone" for x in m["selections"]}
+    mine |= {x["id"] for m in ms if m["kind"] == "leader" for x in m["selections"] if x["side"] == "p:qbone"}
     assert set(book.blocked(zork, mid)) == mine and not book.blocked(fan, mid)
 
     # an account the admin says isn't a player is free; one linked by hand is limited
@@ -706,3 +707,42 @@ def test_injury_boosts_and_promos(tmp_path):
     book.unsettle_market(total["id"])
     assert book.bettor(sam)["balance"] == bal
     assert {b["id"]: b["odds"] for b in book.bets_for(sam)}[bid] == boosted
+
+
+def test_exact_team_margin_and_leader_lines(tmp_path):
+    from nflu.sportsbook import exact_outcomes, margin_side
+    assert [o[0] for o in exact_outcomes(1.0)][:2] == ["n:0", "n:1"] and exact_outcomes(1.0)[-1][0].startswith("ge:")
+    assert abs(sum(p for *_, p in exact_outcomes(3.2)) - 1) < 1e-9
+    assert (margin_side(3), margin_side(-7), margin_side(21), margin_side(0)) == ("t1:1-6", "t2:7-13", "t1:14+", "tie")
+
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    ms = {(m["kind"], m["stat"]): m for m in book.markets(mid)}
+    exact = ms[("exact", "g:tds")]
+    assert exact["title"] == "Exact: Touchdowns (both teams)" and len(exact["selections"]) >= 3
+    t1, both = ms[("total", "t1:tds")], ms[("yesno", "g:both_td")]
+    margin, leader = ms[("margin", None)], ms[("leader", None)]
+    assert len(margin["selections"]) == 7 and {s["side"] for s in leader["selections"]} == {
+        "p:qbone", "p:wrone", "p:qbtwo", "p:wrtwo"}
+    assert book.ladder(t1)  # team TDs get a slider too
+    book.edit_matchup(mid, "", "Bats", "", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    assert book.market(t1["id"])["title"] == "Bats touchdowns"
+    assert book.market(margin["id"])["selections"][0]["label"] == "Bats by 1-6"
+
+    # team 1 (QBOne 4 TD passes) beats team 2 (1 TD) 31-7 as the Bills; QBOne has the most fantasy points
+    g = _game(10, random.Random(1), home="Ravens", away="Bills", score=(7, 31))
+    for p in g.players:
+        for k in ("pass_tds", "rec_tds", "rush_tds", "def_tds"):
+            p.stats.pop(k, None)
+    g.players[0].stats.update(pass_tds=4)
+    g.players[2].stats.update(pass_tds=1)
+    gid, _ = db.save_game(g)
+    book.settle_from_game(mid, gid)
+    out = lambda m: {s["side"]: s["outcome"] for s in book.market(m["id"])["selections"]}
+    assert out(exact)["n:5"] == "win" if "n:5" in out(exact) else out(exact)[next(k for k in out(exact) if k.startswith("ge:"))] == "win"
+    assert out(both) == {"yes": "win", "no": "lose"}
+    assert out(t1)["over" if t1["line"] < 4 else "under"] == "win"
+    assert out(margin)["t1:14+"] == "win" and out(margin)["tie"] == "lose"
+    top = max(db.game_players(gid), key=lambda ln: ln["fantasy_points"])["username_key"]
+    assert out(leader)[f"p:{top}"] == "win"
