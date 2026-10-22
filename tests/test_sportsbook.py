@@ -688,6 +688,7 @@ def test_injury_boosts_and_promos(tmp_path):
     assert book.selection(ml["id"])["odds"] == ml["odds"]
 
     # promos: profit boost on a win, no-sweat refund on a loss, each used once
+    db.x("DELETE FROM book_promos")  # the tier rewards from making the matchups
     book.give_promo(sam, "profit", 50, None)
     book.give_promo(None, "nosweat", 0, 100, "everyone")
     promo_profit, promo_ns = sorted((p["id"] for p in book.promos(sam, unused=True)))
@@ -843,3 +844,90 @@ def test_h2h_milestones_ranges_team_points_and_bettor_page(tmp_path):
             html = await (await c.get(f"/book/feed?who={zork}")).text()
             assert "Zork's bets" in html and "$25.00" in html and "Tail" in html and "Ann" not in html.split("<h1>")[1]
     asyncio.run(run())
+
+
+def test_tiers_rewards_boost_limits_and_insurance(tmp_path):
+    db = _db(tmp_path)
+    book = Book(db)
+    assert Book.tier_for(0)["name"] == "Bronze" and Book.tier_for(2_500)["name"] == "Silver"
+    assert Book.tier_for(80_000)["next"] is None and Book.tier_for(9_999)["next_at"] == 10_000
+    ann, _ = book.create_bettor("Ann")
+    bob, _ = book.create_bettor("Bob")
+    db.x("UPDATE book_bettors SET balance = 100000 WHERE id = ?", (bob,))
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    # a new matchup gives everyone one reward from their tier (Bronze: profit boosts)
+    assert [p["kind"] for p in book.promos(ann)] == ["profit"] and "Bronze reward for #1" in book.promos(ann)[0]["note"]
+    total = next(m for m in book.markets(mid) if m["kind"] == "total" and not m["stat"])
+    over, under = total["selections"]
+
+    # profit boosts only go on stakes up to the tier's limit
+    boost = book.promos(ann, unused=True)[0]["id"]
+    try:
+        book.place_bet(ann, over["id"], 150, promo_id=boost)
+        raise AssertionError("boost over the Bronze limit")
+    except BookError as e:
+        assert "Bronze" in str(e) and "$100" in str(e)
+    book.place_bet(ann, over["id"], 100, promo_id=boost)
+
+    # insurance: 3% on top, the stake back if it loses, the premium kept either way
+    bal = book.bettor(ann)["balance"]
+    bid = book.place_bet(ann, under["id"], 200, insure=True)
+    assert book.bettor(ann)["balance"] == round(bal - 206, 2)
+    profit = book.house()["total"]["profit"]
+    book.settle_market(total["id"], over["id"])
+    assert {b["id"]: b["payout"] for b in book.bets_for(ann)}[bid] == 200
+    won = [b for b in book.bets_for(ann) if b["id"] != bid][0]
+    assert round(book.house()["total"]["profit"] - profit, 2) == round(won["stake"] - won["payout"], 2)  # premium already counted
+    # a parlay can be insured too: the premium is per bet
+    ml, sp = (m for m in book.markets(mid) if m["kind"] in ("moneyline", "spread"))
+    book.slip_add(ann, ml["selections"][0]["id"])
+    book.slip_add(ann, sp["selections"][0]["id"])
+    bal = book.bettor(ann)["balance"]
+    res = book.place_slip(ann, 50, insure=True)
+    assert res["cost"] == 51.5 and book.bettor(ann)["balance"] == round(bal - 51.5, 2)
+    # a refund (voided by the admin, or the game deleted) gives the insurance back too
+    book.void_bet("parlay", res["parlays"][0])
+    assert book.bettor(ann)["balance"] == bal
+
+    # betting more moves Bob up; his rewards come from the higher tier's list
+    other = book.create_matchup("", ["qbone"], ["qbtwo"])
+    book.place_bet(bob, book.markets(other)[0]["selections"][0]["id"], 12_000)
+    assert book.tier(bob)["name"] == "Gold" and book.tier(ann)["name"] == "Bronze"
+    before = book.bettor(bob)["balance"]
+    third = book.create_matchup("", ["qbone"], ["qbtwo"])
+    got = [p for p in book.promos(bob) if f"#{third}" in p["note"]]
+    assert len(got) == 1 and "Gold reward" in got[0]["note"] and got[0]["kind"] in ("profit", "nosweat", "bonus")
+    if got[0]["kind"] == "bonus":
+        assert book.bettor(bob)["balance"] == before + got[0]["pct"] and got[0]["used_at"]
+    book.give_promo(bob, "nosweat", 0, None)
+    ns = next(p["id"] for p in book.promos(bob, unused=True) if p["kind"] == "nosweat")
+    try:
+        book.place_bet(bob, book.markets(third)[0]["selections"][0]["id"], 10, insure=True, promo_id=ns)
+        raise AssertionError("insurance on a no-sweat bet")
+    except BookError as e:
+        assert "no-sweat" in str(e)
+
+
+def test_named_teams_keep_their_names(tmp_path):
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"], team1=" Sharks ", team2="Jets")
+    mu = book.matchup(mid)
+    assert (mu["team1"], mu["team2"], mu["title"], mu["named"]) == ("Sharks", "Jets", "Sharks vs Jets", 1)
+    ml = next(m for m in book.markets(mid) if m["kind"] == "moneyline")
+    assert [s["label"] for s in ml["selections"]] == ["Sharks", "Jets"]
+    one = book.create_matchup("", ["qbone"], ["qbtwo"], team1="Sharks")  # one named, the other the usual way
+    assert (book.matchup(one)["team1"], book.matchup(one)["team2"]) == ("Sharks", "Team qbtwo")
+    try:
+        book.create_matchup("", ["qbone"], ["qbtwo"], team1="Jets", team2="jets")
+        raise AssertionError("same names")
+    except BookError:
+        pass
+    # settling keeps the names (an unnamed matchup takes the game's, as before)
+    plain = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    gid, _ = db.save_game(_game(10, random.Random(1), home="Ravens", away="Bills", score=(7, 31)))
+    for m in (mid, plain):
+        book.settle_from_game(m, gid)
+    assert (book.matchup(mid)["team1"], book.matchup(mid)["team2"]) == ("Sharks", "Jets")
+    assert {book.matchup(plain)["team1"], book.matchup(plain)["team2"]} == {"Ravens", "Bills"}
+    assert book.market(ml["id"])["selections"][0]["label"] == "Sharks"
