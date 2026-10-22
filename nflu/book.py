@@ -253,12 +253,13 @@ CART_HTML = """<button id="cartbtn" type="button" aria-label="Parlay slip">🧾 
 <div class="cl"></div><div class="cf"><div class="co"></div>
 <label class="small">Stake ($) <input class="cs" inputmode="decimal" placeholder="100" autocomplete="off"></label>
 <label class="small cpw" style="display:none">🎁 Promo <select class="cpr"></select></label>
-<label class="small"><input type="checkbox" class="cin"> ☂️ Insure it (+{ins}%, stake back if it loses)</label>
+<label class="small cinw" style="display:none">☂️ Insure a pick (+{ins}%; stake back if it's the only miss)
+<select class="cin"><option value="">No insurance</option></select></label>
 <div class="small">To win <b class="cw">$0.00</b> · paid back <b class="cr">$0.00</b> <span class="cb"></span></div>
 <button type="button" class="cp">Place parlay</button><div class="cm small"></div>
 <div class="small"><a href="/book/parlay">Round robins and more →</a> · <a href="#" class="cx">Clear</a></div></div></div>"""
 
-CART_JS = """<script>(function(){var c=document.getElementById('cart'),btn=document.getElementById('cartbtn'),
+CART_JS = """<script>(function(){var INS=+document.getElementById('betcard').dataset.ins,c=document.getElementById('cart'),btn=document.getElementById('cartbtn'),
 cs=document.getElementById('betcard').dataset.csrf,H={'X-Requested-With':'fetch'},S=null;function $(x){return c.querySelector(x)}
 function f(v){return '$'+v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}function fo(o){return(o>0?'+':'')+o}
 function post(url,data){var fd=new FormData();fd.set('csrf',cs);fd.set('next','/book');for(var k in data)fd.set(k,data[k]);
@@ -266,7 +267,8 @@ return fetch(url,{method:'POST',body:fd,headers:H}).then(function(r){return r.js
 function show(o){c.style.display=o?'flex':'none';try{sessionStorage.setItem('cart-open',o?'1':'')}catch(e){}}
 function upd(){if(!S)return;var s=parseFloat(($('.cs').value||'').replace(/[$,]/g,''))||0,d=S.decimal,
 o=$('.cpr').selectedOptions[0],b=(S.legs.length>1?S.boost:0)+(o?+(o.dataset.pct||0):0),w=s*(d-1)*(1+b/100);
-$('.cw').textContent=f(w);$('.cr').textContent=f(s+w);$('.cb').textContent=S.boost&&S.legs.length>1?'\\ud83d\\ude80 +'+S.boost+'% parlay boost':'';}
+$('.cw').textContent=f(w);$('.cr').textContent=f(s+w);$('.cb').textContent=(S.boost&&S.legs.length>1?'\\ud83d\\ude80 +'+S.boost+'% parlay boost':'')+
+($('.cin').value?' \\u00b7 insurance '+f(Math.round(s*INS)/100):'');}
 function mark(ids){document.querySelectorAll('form.addp').forEach(function(fm){var m=fm.action.match(/\\/parlay\\/(add|remove)\\/(\\d+)/);
 if(!m)return;var inn=ids.indexOf(+m[2])>=0,b=fm.querySelector('button');fm.action='/book/parlay/'+(inn?'remove':'add')+'/'+m[2];
 if(!/tail/.test(fm.action)){b.textContent=inn?'\\u2713':'+';b.className=inn?'in':'sec';}});
@@ -288,14 +290,16 @@ $('.co').innerHTML=n>=2?'<b>'+n+'-pick parlay</b> <span class="odds">'+fo(d.amer
 $('.cf').style.display=n?'grid':'none';var p=$('.cpr'),keep=p.value;p.innerHTML='<option value="">None</option>';
 (d.promos||[]).forEach(function(x){var o=document.createElement('option');o.value=x.id;o.textContent=x.label;
 o.dataset.pct=x.kind==='profit'?x.pct:0;p.appendChild(o);});p.value=keep;$('.cpw').style.display=(d.promos||[]).length?'':'none';
-mark(d.legs.map(function(g){return g.id}));upd();}
+var ci=$('.cin'),kc=ci.value;ci.innerHTML='<option value="">No insurance</option>';d.legs.forEach(function(g){
+var o=document.createElement('option');o.value=g.id;o.textContent=g.title+': '+g.label;ci.appendChild(o);});ci.value=kc;
+$('.cinw').style.display=n>=2?'':'none';mark(d.legs.map(function(g){return g.id}));upd();}
 function refresh(openIt){return fetch('/book/api/slip',{headers:H,cache:'no-store'}).then(function(r){return r.json()})
 .then(function(d){if(d.ok){draw(d);if(openIt===true)show(true);}});}
 window.bookCart={refresh:refresh};
-btn.onclick=function(){show(c.style.display!=='flex')};$('.x').onclick=function(){show(false)};$('.cs').oninput=upd;$('.cpr').onchange=upd;
+btn.onclick=function(){show(c.style.display!=='flex')};$('.x').onclick=function(){show(false)};$('.cs').oninput=upd;$('.cpr').onchange=upd;$('.cin').onchange=upd;
 $('.cx').onclick=function(e){e.preventDefault();post('/book/parlay/clear').then(refresh)};
 $('.cp').onclick=function(){if(!S)return;$('.cp').disabled=true;post('/book/parlay',{stake:$('.cs').value,seen:S.seen,
-size:S.legs.length,promo:$('.cpr').value,insure:$('.cin').checked?'1':''}).then(function(d){var m=$('.cm');m.textContent=d.msg;m.className='cm small '+(d.ok?'won':'lost');
+size:S.legs.length,promo:$('.cpr').value,insure_sel:$('.cin').value}).then(function(d){var m=$('.cm');m.textContent=d.msg;m.className='cm small '+(d.ok?'won':'lost');
 if(d.ok){$('.cs').value='';var e=document.querySelector('.bar .money');if(e)e.textContent=f(d.balance);}refresh();});};
 document.addEventListener('submit',function(e){var fm=e.target;if(!fm.matches('form.addp')||/tail/.test(fm.action))return;
 e.preventDefault();post(fm.action,{}).then(function(d){if(!d.ok){alertMsg(d.msg)}refresh(/\\/add\\//.test(fm.action));});});
@@ -870,6 +874,15 @@ class BookSite:
         return (f'<label class="small"><input type="checkbox" name="insure" value="1"{f" class={cls}" if cls else ""}> '
                 f'☂️ Insure it: +{INSURANCE_PCT:g}% of the stake now, stake back if it loses</label>')
 
+    def _pick_insurance(self, legs: list[dict]) -> str:
+        """Pick insurance for a parlay: choose one pick to insure."""
+        if len(legs) < 2:
+            return ""
+        return (f'<label class="small">☂️ Insure a pick (+{INSURANCE_PCT:g}% of the stake; if it\'s the only pick '
+                f'that misses, you get your stake back)<br><select name="insure_sel"><option value="">No insurance</option>'
+                + "".join(f'<option value="{s["id"]}">{_e(self._title(s))}: {_e(s["label"])}</option>' for s in legs)
+                + "</select></label>")
+
     @staticmethod
     def _perks(b) -> str:
         """Tags for a bet's boosts and promos."""
@@ -877,7 +890,7 @@ class BookSite:
         if b.get("boost"):
             out.append(f"🚀 +{b['boost']:g}% winnings")
         if b.get("premium"):
-            out.append(f"☂️ Insured ({_money(b['premium'])})")
+            out.append(f"☂️ {'Pick insured' if b.get('insured_sel') else 'Insured'} ({_money(b['premium'])})")
         elif b.get("nosweat"):
             out.append("🛡️ No sweat")
         if b.get("admin_void") and b["status"] == "void":
@@ -1038,6 +1051,7 @@ class BookSite:
             legs = "<br>".join(
                 f'{icon.get(leg["outcome"], "")} <a href="/book/matchups/{leg["matchup_id"]}">{_e(self._title(leg, name))}'
                 f'</a>: {_e(leg["label"])} <span class="odds">{fmt_odds(leg["odds"])}</span>'
+                + (' <span title="Insured pick">☂️</span>' if p.get("insured_sel") == leg["selection_id"] else "")
                 + (f' <span class="small muted">({_e(leg["result"])})</span>' if leg["result"] else "")
                 for leg in p["legs"])
             rows.append(f'<tr><td class="small">{len(p["legs"])}-leg parlay '
@@ -1092,7 +1106,7 @@ class BookSite:
                 f'<div class="opts"><b>Bet</b>{"".join(options)}</div>'
                 f'<label>Stake per bet ($)<br><input id="stake" name="stake" inputmode="decimal" required '
                 f'value="{_e(stake)}" placeholder="100"></label>'
-                f'{self._promo_select(bettor)}{self._insure_box()}'
+                f'{self._promo_select(bettor)}{self._pick_insurance(legs)}'
                 f'<label class="small"><input type="checkbox" name="keep" value="1"> Keep these picks in my slip '
                 f'(to bet them again another way)</label>'
                 f'<div><b id="nb">1 bet</b> · total <b id="cost">$0.00</b> · pays back up to <b id="ret">$0.00</b> '
@@ -1104,11 +1118,11 @@ class BookSite:
                 f"function u(){{var s=parseFloat((i.value||'').replace(/[$,]/g,''))||0,nb=0,ret=0;"
                 f"bx.forEach(function(b){{if(b.checked){{nb+=t[b.value][0];ret+=t[b.value][1];}}}});"
                 f"document.getElementById('nb').textContent=nb+' bet'+(nb==1?'':'s');"
-                f"var ins=document.querySelector('input[name=insure]'),k=ins&&ins.checked?1+{INSURANCE_PCT}/100:1;"
+                f"var ins=document.querySelector('select[name=insure_sel]'),k=ins&&ins.value?1+{INSURANCE_PCT}/100:1;"
                 f"document.getElementById('cost').textContent=f(s*nb*k);document.getElementById('ret').textContent=f(s*ret);"
                 f"document.getElementById('go').textContent=nb?'Place '+nb+' bet'+(nb==1?'':'s')+' ('+f(s*nb*k)+')':'Pick what to bet';}}"
                 f"i.addEventListener('input',u);bx.forEach(function(b){{b.addEventListener('change',u)}});"
-                f"var ib=document.querySelector('input[name=insure]');if(ib)ib.addEventListener('change',u);u();}})();</script>")
+                f"var ib=document.querySelector('select[name=insure_sel]');if(ib)ib.addEventListener('change',u);u();}})();</script>")
         body = (self._bar(request, bettor) + err + "<h1>Parlay slip</h1>"
                 f'<div class="card scroll"><table class="legs">{"".join(rows)}</table></div>'
                 f'<div class="card"><div class="score">{n} pick{"s" * (n != 1)}'
@@ -1182,7 +1196,7 @@ class BookSite:
             if not sizes:
                 raise BookError("Pick what to bet: the parlay, a round robin or each pick alone.")
             res = self.book.place_slip(bettor["id"], stake, seen, sizes, keep=bool(form.get("keep")),
-                                       promo_id=_int(form.get("promo")), insure=bool(form.get("insure")))
+                                       promo_id=_int(form.get("promo")), insure_sel=_int(form.get("insure_sel")))
         except BookError as e:
             if _ajax(request):
                 return web.json_response({"ok": False, "msg": str(e)})
@@ -1351,10 +1365,13 @@ class BookSite:
                 f"stakes up to {_money(t['boost_cap'])}.</p>" + yours
                 + "<h2>🔥 Odds boosts</h2><p class='small muted'>Better odds on these picks, single bets only.</p>"
                 + (f'<div class="card">{boosts}</div>' if boosts else "<p class='muted'>None right now.</p>")
-                + f"<h2>☂️ Bet insurance</h2><div class='card'><p>Tick <b>Insure it</b> when you bet and pay "
-                  f"{INSURANCE_PCT:g}% of the stake on top (a $100 bet costs ${100 + INSURANCE_PCT:g}). If the bet "
-                  f"or parlay loses, you get the $100 back. The {INSURANCE_PCT:g}% is kept unless the bet is voided (then it comes back too). It can't "
-                  f"go with a no-sweat promo (that already refunds a loss).</p></div>"
+                + f"<h2>☂️ Insurance</h2><div class='card'><p><b>Single bet:</b> tick <b>Insure it</b> and pay "
+                  f"{INSURANCE_PCT:g}% of the stake on top (a $100 bet costs ${100 + INSURANCE_PCT:g}). If the pick "
+                  f"loses, you get the $100 back.</p><p><b>Parlay:</b> under <b>Insure a pick</b>, choose the one "
+                  f"pick you're least sure of and pay {INSURANCE_PCT:g}% of the stake. If that pick is the only one "
+                  f"that misses, you get your stake back; if any other pick misses, the parlay loses as usual.</p>"
+                  f"<p class='small muted'>The {INSURANCE_PCT:g}% is kept unless the bet is voided (then it comes "
+                  f"back too). Insurance can't go with a no-sweat promo, which already refunds a loss.</p></div>"
                 + (f"<h2>🚀 Parlay boost</h2><div class='card'><p>Every parlay gets more winnings the more picks "
                    f"it has: {ladder}. It's added automatically, and a pick that pushes or is voided drops out of "
                    f"the count.</p></div>" if PARLAY_BOOSTS else ""))

@@ -878,16 +878,33 @@ def test_tiers_rewards_boost_limits_and_insurance(tmp_path):
     assert {b["id"]: b["payout"] for b in book.bets_for(ann)}[bid] == 200
     won = [b for b in book.bets_for(ann) if b["id"] != bid][0]
     assert round(book.house()["total"]["profit"] - profit, 2) == round(won["stake"] - won["payout"], 2)  # premium already counted
-    # a parlay can be insured too: the premium is per bet
+    # pick insurance on a parlay: 3% to insure one pick; if it's the only miss, the stake comes back
     ml, sp = (m for m in book.markets(mid) if m["kind"] in ("moneyline", "spread"))
-    book.slip_add(ann, ml["selections"][0]["id"])
-    book.slip_add(ann, sp["selections"][0]["id"])
+    picks = [ml["selections"][0]["id"], sp["selections"][0]["id"]]
+    for sel in picks:
+        book.slip_add(ann, sel)
     bal = book.bettor(ann)["balance"]
-    res = book.place_slip(ann, 50, insure=True)
+    try:
+        book.place_slip(ann, 50, sizes=[1, 2], insure_sel=picks[0])
+        raise AssertionError("pick insurance on a round robin")
+    except BookError as e:
+        assert "one parlay" in str(e)
+    res = book.place_slip(ann, 50, insure_sel=picks[0], keep=True)
     assert res["cost"] == 51.5 and book.bettor(ann)["balance"] == round(bal - 51.5, 2)
+    insured = res["parlays"][0]
+    plain = book.place_slip(ann, 50, insure_sel=picks[1], keep=True)["parlays"][0]
     # a refund (voided by the admin, or the game deleted) gives the insurance back too
-    book.void_bet("parlay", res["parlays"][0])
-    assert book.bettor(ann)["balance"] == bal
+    book.void_bet("parlay", plain)
+    bal = book.bettor(ann)["balance"]
+    # the insured pick loses first: the parlay waits for the other pick
+    book.settle_market(ml["id"], ml["selections"][1]["id"])
+    par = lambda: next(p for p in book.parlays_for(ann) if p["id"] == insured)  # noqa: E731
+    assert par()["status"] == "pending"
+    book.settle_market(sp["id"], sp["selections"][0]["id"])  # the other pick wins: stake back
+    assert par()["status"] == "lost" and par()["payout"] == 50 and book.bettor(ann)["balance"] == bal + 50
+    book.unsettle_market(sp["id"])
+    book.settle_market(sp["id"], sp["selections"][1]["id"])  # both miss: no refund
+    assert par()["payout"] == 0 and book.bettor(ann)["balance"] == bal
 
     # betting more moves Bob up; his rewards come from the higher tier's list
     other = book.create_matchup("", ["qbone"], ["qbtwo"])
