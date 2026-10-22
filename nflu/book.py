@@ -176,7 +176,7 @@ t=bar.querySelector('.ft'),pl=bar.querySelector('.fp'),n=bar.querySelector('.fn'
 function team(){if(!pl)return;var tm=t.value;pl.querySelectorAll('option[data-t]').forEach(function(o){
 o.hidden=o.disabled=!!tm&&o.dataset.t!==tm;});if(pl.selectedOptions[0]&&pl.selectedOptions[0].hidden)pl.value='';}
 function run(){var s=q.value.trim().toLowerCase(),tm=t?t.value:'',p=pl?pl.value:'',shown=0,all=document.querySelectorAll('.fr');
-all.forEach(function(r){var ok=(!kind||r.dataset.k===kind)&&(!tm||r.dataset.t===tm)&&(!p||r.dataset.p===p)&&
+all.forEach(function(r){var ok=(!kind||r.dataset.k===kind)&&(!tm||r.dataset.t===tm)&&(!p||(' '+r.dataset.p+' ').indexOf(' '+p+' ')>=0)&&
 s.split(/\\s+/).every(function(w){return r.dataset.q.indexOf(w)>=0});r.style.display=ok?'':'none';if(ok)shown++;});
 document.querySelectorAll('.fg').forEach(function(g){g.style.display=g.querySelector('.fr:not([style*="none"])')?'':'none'});
 n.textContent=(s||kind||tm||p)?shown+' of '+all.length:'';}
@@ -442,8 +442,13 @@ class BookSite:
 
     def _title(self, m: dict, name=None) -> str:
         """A market's title; props use the player's current name, so names set later show up."""
-        if m.get("kind") == "prop" and m.get("player_key"):
-            return f"{(name or self._names())(m['player_key'])}: {stat_label(m['stat'])}"
+        if m.get("kind") in ("prop", "milestone") and m.get("player_key"):
+            return (f"{(name or self._names())(m['player_key'])}: {stat_label(m['stat'])}"
+                    + (" milestones" if m["kind"] == "milestone" else ""))
+        if m.get("kind") == "h2h" and "|" in (m.get("player_key") or ""):
+            a, b = m["player_key"].split("|")
+            nm = name or self._names()
+            return f"{stat_label(m['stat'])}: {nm(a)} vs {nm(b)}"
         return m.get("market_title") or m["title"]
 
     def _bar(self, request: web.Request, bettor) -> str:
@@ -682,7 +687,8 @@ class BookSite:
         groups: dict[str, list[dict]] = {}
         for m in markets:
             head = ("Game" if m["kind"] in ("moneyline", "spread") or (m["kind"] == "total" and not m["stat"]) else
-                    "Game props" if m["kind"] in ("total", "yesno", "exact", "margin", "leader") else
+                    "Game props" if m["kind"] in ("total", "yesno", "exact", "margin", "leader", "band") else
+                    "Player head-to-heads" if m["kind"] == "h2h" else
                     "Specials" if m["kind"] == "custom" else name(m["player_key"]))
             groups.setdefault(head, []).append(m)
         ctx = self._parlay_ctx(request, bettor)
@@ -696,10 +702,11 @@ class BookSite:
                 html = self._slider_row(m, name, ctx, self.book.ladder(m, models, alts.get(m["id"], [])))
             else:
                 html = self._market_row(m, mu, name, ctx)
-            kind = "game" if m["kind"] in ("moneyline", "spread", "total", "yesno", "exact", "margin", "leader") else m["kind"]
+            kind = ("game" if m["kind"] in ("moneyline", "spread", "total", "yesno", "exact", "margin", "leader", "band")
+                    else "prop" if m["kind"] in ("milestone", "h2h") else m["kind"])
             text = " ".join([self._title(m, name)] + [x["label"] for x in m["selections"]]).lower()
             return (f'<div class="fr" data-k="{kind}" data-t="{side.get(m["player_key"], "")}" '
-                    f'data-p="{_e(m["player_key"] or "")}" '
+                    f'data-p="{_e((m["player_key"] or "").replace("|", " "))}" '
                     f'data-q="{_e(text)}">{html}</div>')
         cards = "".join(f'<div class="card fg"><h2 style="margin-top:0">{_e(head)}</h2>'
                         + "".join(row(m) for m in ms) + "</div>" for head, ms in groups.items())
@@ -1174,10 +1181,14 @@ class BookSite:
         """Everyone's bets. Live: open bets, newest first, updating on the page as bets come in, each with
         a Tail button that copies it. Bet history: settled bets with their results."""
         bettor = self._require_bettor(request)
+        who = self.book.bettor(_int(request.query.get("who"), 0)) if request.query.get("who") else None
         view = "history" if request.query.get("view") == "history" else "live"
         show = request.query.get("show", "all")
         show = show if show in ("parlays", "singles", "all") else "all"
-        items = [d for d in self.book.feed(200, pending=view == "live")
+        # one bettor's page (from the leaderboard): all their bets, open ones first
+        found = (sorted(self.book.feed(500, bettor_id=who["id"]), key=lambda d: d["status"] != "pending")
+                 if who else self.book.feed(200, pending=view == "live"))
+        items = [d for d in found
                  if show == "all" or d["kind"] == ("parlay" if show == "parlays" else "bet")][:80]
         name, csrf = self._names(), self._hidden(request, BETTOR_COOKIE)
         icon = {"win": "✅", "lose": "❌", "push": "↩", "void": "↩", None: "⏳"}
@@ -1196,7 +1207,7 @@ class BookSite:
                 + f'<a href="/book/matchups/{leg["matchup_id"]}">{_e(self._title(leg, name))}</a>: '
                   f'{_e(leg["label"])} <span class="odds">{fmt_odds(leg["odds"])}</span>' for leg in d["legs"])
             open_legs = [leg for leg in d["legs"] if leg["market_status"] == "open" and leg["matchup_status"] == "open"]
-            if not open_legs or d["bettor_id"] == bettor["id"]:
+            if not open_legs or d["bettor_id"] == bettor["id"] or (who and d["status"] != "pending"):
                 tail = ""
             elif d["kind"] == "bet":
                 tail = f'<a class="sel" href="/book/bet/{open_legs[0]["selection_id"]}">Tail</a>'
@@ -1208,13 +1219,27 @@ class BookSite:
             rows.append(f'<tr data-k="{d["kind"]}{d["id"]}"><td><b>{_e(d["name"])}</b><br>'
                         f'<span class="small muted">{_time(d["placed_at"])}</span></td>'
                         f'<td class="small">{what}{legs}</td><td class="n">{_money(d["stake"])}</td>'
-                        f'<td>{res}</td>{"<td>" + tail + "</td>" if view == "live" else ""}</tr>')
-        empty = "No open bets right now." if view == "live" else "No bets have been settled yet."
+                        f'<td>{res}</td>{"<td>" + tail + "</td>" if view == "live" or who else ""}</tr>')
+        empty = ("No bets yet." if who else "No open bets right now." if view == "live" else
+                 "No bets have been settled yet.")
         table = ('<div class="card scroll"><table><tr><th>Bettor</th><th>Picks</th><th class="n">Stake</th>'
-                 f'<th>Result</th>{"<th></th>" if view == "live" else ""}</tr>{"".join(rows)}</table></div>'
+                 f'<th>Result</th>{"<th></th>" if view == "live" or who else ""}</tr>{"".join(rows)}</table></div>'
                  if rows else f"<p class='muted'>{empty}</p>")
         if _ajax(request):
             return web.Response(text=table, content_type="text/html", headers={"Cache-Control": "no-store"})
+        if who:
+            q = lambda k: f"/book/feed?who={who['id']}" + ("" if k == "all" else f"&show={k}")
+            kinds = "".join(f'<a href="{q(k)}"{" class=on" if k == show else ""}>{lbl}</a>'
+                            for k, lbl in (("all", "All"), ("parlays", "Parlays"), ("singles", "Single bets")))
+            rec = next((r for r in self.book.leaderboard() if r["id"] == who["id"]), None)
+            stats = (f'Total {_money(rec["worth"])} · profit {_money(rec["worth"] - START_BALANCE)} · '
+                     f'{rec["won"]}-{rec["lost"]} · {rec["bets"]} bets' if rec else "")
+            body = (self._bar(request, bettor) + _flash(request)
+                    + f"<p class='small'><a href='/book/leaderboard'>← leaderboard</a></p>"
+                      f"<h1>{_e(who['name'])}'s bets</h1><p class='small muted'>{stats}. Open bets first, "
+                      f"then settled ones, newest first. Tail copies an open one.</p>"
+                      f"<div class='tabs small'>{kinds}</div><div id='feed'>{table}</div>" + FEED_JS)
+            return self._page(f"{who['name']}'s bets", body)
         q = lambda v, k: f"/book/feed?view={v}" + ("" if k == "all" else f"&show={k}")
         tabs = "".join(f'<a href="{q(v, show)}"{" class=on" if v == view else ""}>{lbl}</a>'
                        for v, lbl in (("live", "🔴 Live"), ("history", "Bet history")))
@@ -1248,7 +1273,8 @@ class BookSite:
         if not rows:
             return "<p class='muted'>Nobody has joined yet.</p>"
         body = "".join(
-            f'<tr><td class="n">{i + 1}</td><td>{_e(r["name"])}</td><td class="n"><b>{_money(r["worth"])}</b></td>'
+            f'<tr><td class="n">{i + 1}</td><td><a href="/book/feed?who={r["id"]}" '
+            f'title="See {_e(r["name"])}\'s bets">{_e(r["name"])}</a></td><td class="n"><b>{_money(r["worth"])}</b></td>'
             f'<td class="n {"won" if r["worth"] >= START_BALANCE else "lost"}">{_money(r["worth"] - START_BALANCE)}</td>'
             f'<td class="n">{_money(r["at_risk"])}</td><td class="n">{r["won"]}-{r["lost"]}</td>'
             f'<td class="n">{r["bets"]}</td></tr>' for i, r in enumerate(rows))
@@ -1556,7 +1582,7 @@ class BookSite:
                     if m["kind"] != "custom" else "")
             toggle = ('<button class="sec" name="action" value="lock">Close betting</button>' if m["status"] == "open"
                       else '<button class="sec" name="action" value="open">Reopen betting</button>')
-            by_value = ("" if m["kind"] not in ("prop", "total") else
+            by_value = ("" if m["kind"] not in ("prop", "total", "milestone", "band") else
                         f'<input class="n" name="value" placeholder="Result" title="What the stat came to">'
                         f'<button class="sec" name="action" value="settle_value" title="Settles this line'
                         f'{"" if m["parent_id"] else " and every alt line of it"} from the number">'
