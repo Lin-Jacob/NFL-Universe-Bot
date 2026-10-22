@@ -777,6 +777,20 @@ class BookSite:
                 if mu["auto_settle"] else "Auto-settle is <b>off</b>.")
         lineups = "<br>".join(f'<b>{_e(mu[t])}</b>: ' + ", ".join(_e(name(k)) for k in mu[p])
                               for t, p in (("team1", "players1"), ("team2", "players2")))
+        if live:  # each player with a button to switch teams or take them out
+            cols = []
+            for t, p, other in (("team1", "players1", "team2"), ("team2", "players2", "team1")):
+                rows = "".join(
+                    f'<tr><td style="vertical-align:middle">{_e(name(k))}</td><td><form style="display:flex;gap:6px;margin:0;white-space:nowrap" '
+                    f'method="post" '
+                    f'action="{act}">{csrf}<input type="hidden" name="player" value="{_e(k)}">'
+                    f'<button class="sec" name="action" value="move">Move to {_e(mu[other])} →</button>'
+                    f'<button class="sec" name="action" value="remove" title="Take out of the matchup">✕</button>'
+                    f"</form></td></tr>" for k in mu[p])
+                cols.append(f'<div><h2 style="margin-top:0">{_e(mu[t])}</h2><table>{rows}</table></div>')
+            lineups = (f'<div class="grid">{"".join(cols)}</div><p class="small muted">Moving a player re-prices '
+                       f"the winner odds; their props stay. Taking one out voids their props (stakes returned). "
+                       f"Add players or rename teams under Edit matchup below.</p>")
         edit = ("" if not live else
                 f'<details class="card"><summary><b>Edit matchup</b> (title, team names, players)</summary>'
                 f'<form method="post" action="{act}">{csrf}'
@@ -793,9 +807,9 @@ class BookSite:
                 f'<button name="action" value="edit">Save matchup</button></form></details>')
         body = (self._admin_bar(request) + _flash(request)
                 + f'<h1>#{mu["id"]} {_e(mu["title"])} <span class="chip">{_STATUS[mu["status"]]}</span></h1>'
-                  f'<div class="card small">{lineups}<br>{auto if live else ""}'
+                  f'<div class="card">{lineups}<span class="small">{auto if live else ""}'
                   f'{" Settled from game #" + str(mu["game_id"]) + "." if mu["game_id"] else ""} '
-                  f'<a href="/book/matchups/{mu["id"]}">Bettor view →</a></div>'
+                  f'<a href="/book/matchups/{mu["id"]}">Bettor view →</a></span></div>'
                 + "".join(controls) + edit
                 + '<div class="card"><h2 style="margin-top:0">Markets</h2>'
                   '<p class="small muted">Edit a line and press Auto-price to re-price it from the stats, or type '
@@ -818,6 +832,19 @@ class BookSite:
             if action in ("lock", "open"):
                 self.book.set_matchup_status(mid, "locked" if action == "lock" else "open")
                 msg = "Betting closed." if action == "lock" else "Betting reopened."
+            elif action in ("move", "remove"):
+                key = str(form.get("player", ""))
+                p1, p2 = list(mu["players1"]), list(mu["players2"])
+                if key not in p1 + p2:
+                    raise BookError("That player isn't in this matchup.")
+                src, dst = (p1, p2) if key in p1 else (p2, p1)
+                src.remove(key)
+                if action == "move":
+                    dst.append(key)
+                self.book.edit_matchup(mid, mu["title"], mu["team1"], mu["team2"], p1, p2, self._names())
+                to = mu["team1"] if dst is p1 else mu["team2"]
+                msg = (f"Moved {self._names()(key)} to {to}; winner odds re-priced." if action == "move" else
+                       f"Took {self._names()(key)} out; their props are voided and stakes returned.")
             elif action == "edit":
                 sides = self._sides(form)
                 msg = self.book.edit_matchup(mid, str(form.get("title", "")), str(form.get("team1", "")),

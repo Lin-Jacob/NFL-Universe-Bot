@@ -251,3 +251,24 @@ def test_live_edit(tmp_path):
     assert book.market(prop["id"])["status"] == "void" and book.bettor(bettor)["balance"] == START_BALANCE
     assert any(m["player_key"] == "newguy" for m in book.markets(mid))
     assert book.version() != v0
+
+
+def test_admin_move_player(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADMIN_PASSWORD", PASSWORD)
+
+    async def run():
+        db = _db(tmp_path)
+        Book(db).create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+        async with TestClient(TestServer(WebhookServer(db, SECRET).app)) as c:
+            html = await (await c.post("/admin/login", data={"username": "admin", "password": PASSWORD})).text()
+            csrf = re.search(r'name="csrf" value="(\w+)"', html).group(1)
+            assert "Move to Team qbtwo" in await (await c.get("/admin/matchups/1")).text()
+            r = await c.post("/admin/matchups/1", data={"csrf": csrf, "action": "move", "player": "wrone"})
+            assert "moved wrone to team qbtwo" in (await r.text()).lower()
+            mu = Book(db).matchup(1)
+            assert mu["players1"] == ["qbone"] and mu["players2"] == ["qbtwo", "wrtwo", "wrone"]
+            r = await c.post("/admin/matchups/1", data={"csrf": csrf, "action": "remove", "player": "qbone"})
+            assert "Each team needs at least one player" in await r.text()
+            r = await c.post("/admin/matchups/1", data={"csrf": csrf, "action": "remove", "player": "wrtwo"})
+            assert "took wrtwo out" in (await r.text()).lower() and "wrtwo" not in Book(db).matchup(1)["players2"]
+    asyncio.run(run())
