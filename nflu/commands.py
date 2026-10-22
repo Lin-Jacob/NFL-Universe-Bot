@@ -11,7 +11,7 @@ from discord.ext import commands
 
 import config
 
-from . import analytics
+from . import analytics, players
 from .ask import ask as ask_league
 from .embeds import (GROUP_ICON, Names, career_card, displayed, fmt_num, full_width, game_embed, player_card,
                      score_line, short_line, stats_block, table, when)
@@ -549,6 +549,20 @@ class Stats(commands.Cog):
                    "(no tunnel or `PUBLIC_URL` set).")
         await inter.response.send_message(msg)
 
+    @app_commands.command(name="password", description="Your sportsbook login (only you can see it)")
+    async def password(self, inter: discord.Interaction):
+        p = players.for_discord(self.db, inter.user.id)
+        pw = players.book_password(self.db, p) if p else None
+        url = self.bot.site_url()
+        if not p or not pw:
+            msg = ("You don't have a sportsbook login yet. Ask an admin to link your Discord account to your "
+                   "player with `/admin setname`, or to add your password in `config.py`.")
+        else:
+            msg = (f"🎲 Sportsbook login\nName: **{p.name}**\nPassword: ||`{pw}`||"
+                   + (f"\nLog in at {url}/book" if url else "")
+                   + "\nOnly you can see this message.")
+        await inter.response.send_message(msg, ephemeral=True)
+
     @app_commands.command(name="help", description="What this bot can do")
     async def help(self, inter: discord.Interaction):
         e = discord.Embed(title="NFL Universe stats bot", color=config.EMBED_COLOR,
@@ -570,7 +584,8 @@ class Stats(commands.Cog):
         e.add_field(name="ℹ️ Info", inline=False, value=(
             "`/scoring` fantasy scoring by position (INTs and missed FGs subtract)\n"
             "`/names` real names ↔ Roblox usernames · `/whois query` look someone up\n"
-            "`/website` link to the stats website"))
+            "`/website` link to the stats website\n"
+            "`/password` your sportsbook login (only you see it)"))
         if True:  # /asknfl is open to everyone (ASKNFL_USER_IDS was removed)
             e.add_field(name="🤖 Ask", inline=False, value=(
                 "`/asknfl prompt [public]` ask Claude about the league's stats (read-only, stats questions only)"))

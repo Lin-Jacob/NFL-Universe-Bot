@@ -431,3 +431,36 @@ def test_pick_order_and_new_pages(tmp_path, monkeypatch):
             assert "Single bets" in await (await c.get("/book/feed?show=singles")).text()
             assert "Alt line" in await (await c.get("/admin/matchups/1")).text()
     asyncio.run(run())
+
+
+def test_league_player_logins(tmp_path, monkeypatch):
+    import config
+    from nflu import players
+    monkeypatch.setattr(config, "PLAYER_NAMES", {
+        "Jacob": {"roblox_username": "QBOne", "password": "759822057"},
+        "Nate": {"roblox_username": "WrOne", "password": ""},   # empty: uses the linked Discord ID
+        "Old": "QBTwo"})                                          # older format still works
+    db = _db(tmp_path)
+    db.set_name("WrOne", "Nate", 4242)
+    assert [p.name for p in players.players()] == ["Jacob", "Nate", "Old"]
+    assert players.book_password(db, players.find("jacob")) == "759822057"
+    assert players.book_password(db, players.find("Nate")) == "4242"
+    assert players.book_password(db, players.find("Old")) is None
+    assert players.for_discord(db, 759822057).name == "Jacob" and players.for_discord(db, 4242).name == "Nate"
+    assert players.for_discord(db, 1) is None
+
+    async def run():
+        async with TestClient(TestServer(WebhookServer(db, SECRET).app)) as c:
+            html = await (await c.get("/book")).text()
+            assert '<option value="Jacob">' in html and '<option value="Nate">' in html and "Old" not in html
+            r = await c.post("/book/join", data={"name": "jacob", "password": "mine"})
+            assert "is a league player" in await r.text()
+            r = await c.post("/book/login", data={"name": "nate", "password": "nope"})
+            assert "Wrong name or password" in await r.text()
+            r = await c.post("/book/login", data={"name": "nate", "password": "4242", "next": "/book/me"})
+            html = await r.text()
+            assert "Welcome back, Nate" in html and "$10,000.00" in html  # account made on first login
+            r = await c.post("/book/login", data={"name": "Jacob", "password": "759822057"})
+            assert "Welcome back, Jacob" in await r.text()
+            assert {b["name"] for b in Book(db).leaderboard()} == {"Nate", "Jacob"}
+    asyncio.run(run())

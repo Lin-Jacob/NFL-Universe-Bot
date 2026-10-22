@@ -431,11 +431,23 @@ class Book:
         _check_new_password(password)
         self.db.x("UPDATE book_bettors SET password = ? WHERE id = ?", (hash_password(password), bettor_id))
 
-    def login(self, name: str, password: str) -> tuple[object, bool]:
+    def login(self, name: str, password: str, preset: str | None = None) -> tuple[object, bool]:
         """(bettor, claimed) for this name and password, or (None, False). An account made before
         passwords existed is claimed by the first person to log in to it: their password becomes its
-        password (on purpose: this is a friends' league, not a bank)."""
-        b = self.db.one("SELECT * FROM book_bettors WHERE name_key = ?", (" ".join(name.split()).lower(),))
+        password (on purpose: this is a friends' league, not a bank).
+
+        preset: for a league player (config.PLAYER_NAMES), the password set for them there. Typing it
+        logs in to the account with their name, making it (with the starting money) the first time;
+        the account's own password works too, and it's never claimed by anyone else."""
+        name = " ".join(name.split())
+        b = self.db.one("SELECT * FROM book_bettors WHERE name_key = ?", (name.lower(),))
+        if preset:
+            if secrets.compare_digest(password.encode(), preset.encode()):
+                if not b:
+                    self.create_bettor(name, secrets.token_urlsafe(16))
+                    b = self.db.one("SELECT * FROM book_bettors WHERE name_key = ?", (name.lower(),))
+                return b, False
+            return (b, False) if b and check_password(password, b["password"]) else (None, False)
         if b and b["password"] is None:
             self.set_password(b["id"], password)
             return self.bettor(b["id"]), True

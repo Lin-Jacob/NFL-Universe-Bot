@@ -39,6 +39,7 @@ from aiohttp import web
 
 from .db import Database
 from .embeds import Names
+from . import players
 from .site import _e, _page, _time
 from .sportsbook import (MAX_PARLAY_LEGS, MAX_SLIP_BETS, START_BALANCE, Book, BookError, Models,
                          american_from_decimal, bettable_stats, decimal_odds, fmt_odds, stat_label)
@@ -298,9 +299,12 @@ class BookSite:
         nx = f'<input type="hidden" name="next" value="{_e(nxt)}">'
         return (f"<h1>Sportsbook</h1>{err}<div class='grid'><div class='card'><h2 style='margin-top:0'>Log in</h2>"
                 f'<form class="stack" method="post" action="/book/login">{nx}'
-                f'<input name="name" maxlength="24" required placeholder="Name" autocomplete="username" '
-                f'value="{_e(name)}"><input name="password" type="password" required placeholder="Password" '
-                f'autocomplete="current-password"><button>Log in</button></form></div>'
+                f'<input name="name" maxlength="24" required placeholder="Your name" autocomplete="username" '
+                f'list="league-players" value="{_e(name)}">{self._players_list()}'
+                f'<input name="password" type="password" required placeholder="Password" '
+                f'autocomplete="current-password"><button>Log in</button></form>'
+                f"<p class='small muted'>League players: pick your name and type the password the bot's "
+                f"<b>/password</b> command shows you in Discord (only you can see it).</p></div>"
                 f"<div class='card'><h2 style='margin-top:0'>New here?</h2><p>Bet fake money on league games. "
                 f"Make an account and you start with <b>{_money(START_BALANCE)}</b>.</p>"
                 f'<form class="stack" method="post" action="/book/join">{nx}'
@@ -313,6 +317,12 @@ class BookSite:
                 f'<input type="hidden" name="next" value="{_e(nxt)}">'
                 f'<input name="code" maxlength="12" required placeholder="ABCD-2345" autocomplete="off">'
                 f"<button class='sec'>Use my account</button></form></div>")
+
+    def _players_list(self) -> str:
+        """Autocomplete for the login name: every league player who has a sportsbook password."""
+        names = sorted(p.name for p in players.players() if players.book_password(self.db, p))
+        return ('<datalist id="league-players">' + "".join(f'<option value="{_e(n)}">' for n in names)
+                + "</datalist>")
 
     # -------------------------------------------------------------- bettors
     async def index(self, request: web.Request) -> web.Response:
@@ -353,6 +363,10 @@ class BookSite:
         if self._bettor(request):
             raise web.HTTPSeeOther(nxt)
         name = str(form.get("name", ""))
+        if (p := players.find(name)) and players.book_password(self.db, p):
+            return self._page("Join", self._join_html(
+                nxt, f"{p.name} is a league player. Log in with your name and the password /password shows "
+                     f"you in Discord.", p.name))
         try:
             _, token = self.book.create_bettor(name, str(form.get("password", "")))
         except BookError as e:
@@ -368,8 +382,10 @@ class BookSite:
         ip = "login:" + (request.headers.get("CF-Connecting-IP") or request.remote or "?")
         if self._too_many(ip):
             return self._page("Log in", self._join_html(nxt, "Too many wrong passwords. Wait 10 minutes.", name))
+        player = players.find(name)
+        preset = players.book_password(self.db, player) if player else None
         try:
-            b, claimed = self.book.login(name, str(form.get("password", "")))
+            b, claimed = self.book.login(player.name if player else name, str(form.get("password", "")), preset)
         except BookError as e:  # claiming an old account with too short a password
             return self._page("Log in", self._join_html(nxt, str(e), name))
         if not b:
