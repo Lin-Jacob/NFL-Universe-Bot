@@ -602,24 +602,24 @@ def test_inside_betting(tmp_path):
     mate = next(m for m in ms if m["kind"] == "prop" and m["player_key"] == "wrone")
     rival = next(m for m in ms if m["kind"] == "prop" and m["player_key"] == "qbtwo")
     side = {s["side"]: s["id"] for s in ml["selections"]}
-    for sel, why in ((own["selections"][1]["id"], "own stats"), (side["team2"], "against your own team"),
-                     (spread["selections"][1]["id"], "against your own team"),
-                     (total["selections"][0]["id"], "totals")):
+    for sel in (own["selections"][1]["id"], own["selections"][0]["id"]):
         try:
             book.place_bet(zork, sel, 10)
             raise AssertionError("insider bet went through")
         except BookError as e:
-            assert why in str(e)
+            assert "own stats" in str(e)
         try:
             book.slip_add(zork, sel)
             raise AssertionError("insider pick went into the slip")
         except BookError:
             pass
         book.place_bet(fan, sel, 10)  # everyone else can
-    for sel in (side["team1"], mate["selections"][0]["id"], rival["selections"][1]["id"],
-                book.markets(other)[0]["selections"][1]["id"]):
+    # against their own team, the game's totals, teammates, rivals and other games are all fine
+    for sel in (side["team1"], side["team2"], spread["selections"][1]["id"], total["selections"][0]["id"],
+                mate["selections"][0]["id"], rival["selections"][1]["id"], book.markets(other)[0]["selections"][1]["id"]):
         book.place_bet(zork, sel, 10)
-    assert set(book.blocked(zork, mid)) >= {own["selections"][0]["id"], side["team2"]} and not book.blocked(fan, mid)
+    mine = {x["id"] for m in ms if m["player_key"] == "qbone" for x in m["selections"]}
+    assert set(book.blocked(zork, mid)) == mine and not book.blocked(fan, mid)
 
     # an account the admin says isn't a player is free; one linked by hand is limited
     book.set_player_key(zork, "")

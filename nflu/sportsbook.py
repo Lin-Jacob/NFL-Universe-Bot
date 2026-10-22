@@ -70,8 +70,8 @@ ALL_PROPS = ("receptions", "rec_yards", "any_td", "tackles", "sacks", "def_ints"
 # Inside betting: a league player's sportsbook account can't bet on what they control. Each rule can
 # be turned off in config.py. Other bettors are never affected.
 BLOCK_OWN_PROPS: bool = getattr(config, "BOOK_BLOCK_OWN_PROPS", True)            # their own stats, over or under
-BLOCK_BET_AGAINST_SELF: bool = getattr(config, "BOOK_BLOCK_BET_AGAINST_SELF", True)  # the other team's winner/spread
-BLOCK_OWN_GAME_PROPS: bool = getattr(config, "BOOK_BLOCK_OWN_GAME_PROPS", True)  # totals and game props of their game
+BLOCK_BET_AGAINST_SELF: bool = getattr(config, "BOOK_BLOCK_BET_AGAINST_SELF", False)  # the other team's winner/spread
+BLOCK_OWN_GAME_PROPS: bool = getattr(config, "BOOK_BLOCK_OWN_GAME_PROPS", False) # totals and game props of their game
 BLOCK_TEAMMATE_PROPS: bool = getattr(config, "BOOK_BLOCK_TEAMMATE_PROPS", False)  # a teammate's stats
 
 # Game bets on what both teams do together, over/unders settled from the whole game's stat sheet.

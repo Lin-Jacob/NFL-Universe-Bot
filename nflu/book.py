@@ -675,8 +675,7 @@ class BookSite:
         lineups = self._lineups(mu, name)
         if ctx["blocked"].keys() & {x["id"] for m in markets for x in m["selections"]}:
             lineups += ('<div class="msg">🔒 You\'re playing in this game, so the picks you could sway are '
-                        'locked: your own stats, the other team winning or covering, and the game\'s totals. '
-                        'Everything else is open.</div>')
+                        'locked. Everything else is open.</div>')
         tools = self._filter_bar("Search players or stats, e.g. passing yards",
                                  [("", "All"), ("game", "Game"), ("prop", "Player props"), ("custom", "Specials")],
                                  [("", "Both teams"), ("1", mu["team1"]), ("2", mu["team2"])])
@@ -1643,7 +1642,7 @@ class BookSite:
                 "Set password resets a bettor's password if they forgot it. "
                 "Deleting a bettor removes their bets too.</p>"
                 "<p class='muted small'><b>Plays as</b> is the league player an account belongs to. That player "
-                "can't bet on their own stats, against their own team, or on the totals of a game they play in. "
+                "can't bet on their own stats in a game they play in. "
                 "Auto matches the account's name to a league player (PLAYER_NAMES or /admin setname).</p>"
                 + (f'<div class="card scroll"><table><tr><th>Name</th><th>Plays as</th><th class="n">Balance</th>'
                    f'<th class="n">In open bets</th><th class="n">Bets</th><th></th></tr>{rows}</table></div>'
