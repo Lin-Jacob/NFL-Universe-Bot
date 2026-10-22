@@ -69,7 +69,7 @@ def test_models_and_settlement(tmp_path):
     mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
     assert book.matchup(mid)["title"] == "Team qbone vs Team qbtwo"
     kinds = [m["kind"] for m in book.markets(mid)]
-    assert kinds[:2] == ["moneyline", "total"] and kinds.count("prop") >= 8
+    assert kinds[:3] == ["moneyline", "spread", "total"] and kinds.count("prop") >= 8
     bettor, _ = book.create_bettor("Sam")
     ml = book.markets(mid)[0]
     prop = next(m for m in book.markets(mid) if m["stat"] == "pass_yards" and m["player_key"] == "qbone")
@@ -548,3 +548,161 @@ def test_parlay_cart(tmp_path):
             assert r["ok"] and r["balance"] == START_BALANCE - 25
             assert (await (await c.get("/book/api/slip")).json())["legs"] == []
     asyncio.run(run())
+
+
+def test_spread_and_game_props(tmp_path):
+    from nflu.sportsbook import game_stat_value
+    line = lambda **st: {"stats": st}
+    # 3 TDs + a field goal = 21; 25 points means 4 after touchdowns, more than one a TD: a 2-pt try made
+    sheet = [line(pass_tds=2, fg_made=1), line(rec_tds=2), line(rush_tds=1)]
+    assert game_stat_value(sheet, "g:tds") == 3 and game_stat_value(sheet, "g:pat", 25) == 4
+    assert game_stat_value(sheet, "g:two_pt", 25) == 1 and game_stat_value(sheet, "g:two_pt", 21) == 0
+    assert game_stat_value(sheet, "g:two_pt", 23) is None and game_stat_value(sheet, "g:pat", 40) is None
+
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    ms = book.markets(mid)
+    spread = next(m for m in ms if m["kind"] == "spread")
+    assert spread["line"] % 1 == 0.5 and spread["selections"][0]["label"].startswith("Team qbone ")
+    tds = next(m for m in ms if m["stat"] == "g:tds")
+    two = next(m for m in ms if m["kind"] == "yesno")
+    assert tds["kind"] == "total" and book.ladder(tds)
+    book.update_market(spread["id"], -6.5, {}, reprice=True)
+    assert book.market(spread["id"])["selections"][1]["label"] == "Team qbtwo +6.5"
+
+    g = _game(10, random.Random(1), home="Ravens", away="Bills", score=(7, 32))
+    for p in g.players:
+        for k in ("pass_tds", "rec_tds", "rush_tds", "def_tds"):
+            p.stats.pop(k, None)
+    g.players[0].stats.update(pass_tds=4)  # team 1: 24 + 8 after TDs = 32, so a 2-pt try was made
+    g.players[2].stats.update(pass_tds=1)
+    gid, _ = db.save_game(g)
+    book.settle_from_game(mid, gid)
+    sp = book.market(spread["id"])
+    assert [s["outcome"] for s in sp["selections"]] == ["win", "lose"]  # won by 25, more than 6.5
+    assert book.market(tds["id"])["result"].startswith("5 touchdowns")
+    assert [s["outcome"] for s in book.market(two["id"])["selections"]] == ["win", "lose"]
+
+
+def test_inside_betting(tmp_path):
+    db = _db(tmp_path)
+    db.set_name("QBOne", "Zork")
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    other = book.create_matchup("", ["qbtwo"], ["wrtwo"])
+    zork, _ = book.create_bettor("Zork")  # QBOne's account, matched by name
+    fan, _ = book.create_bettor("Fan")
+    assert book.player_key(zork) == "qbone" and book.player_key(fan) is None
+    ms = book.markets(mid)
+    ml = ms[0]
+    spread = next(m for m in ms if m["kind"] == "spread")
+    total = next(m for m in ms if m["kind"] == "total" and not m["stat"])
+    own = next(m for m in ms if m["kind"] == "prop" and m["player_key"] == "qbone")
+    mate = next(m for m in ms if m["kind"] == "prop" and m["player_key"] == "wrone")
+    rival = next(m for m in ms if m["kind"] == "prop" and m["player_key"] == "qbtwo")
+    side = {s["side"]: s["id"] for s in ml["selections"]}
+    for sel in (own["selections"][1]["id"], own["selections"][0]["id"]):
+        try:
+            book.place_bet(zork, sel, 10)
+            raise AssertionError("insider bet went through")
+        except BookError as e:
+            assert "own stats" in str(e)
+        try:
+            book.slip_add(zork, sel)
+            raise AssertionError("insider pick went into the slip")
+        except BookError:
+            pass
+        book.place_bet(fan, sel, 10)  # everyone else can
+    # against their own team, the game's totals, teammates, rivals and other games are all fine
+    for sel in (side["team1"], side["team2"], spread["selections"][1]["id"], total["selections"][0]["id"],
+                mate["selections"][0]["id"], rival["selections"][1]["id"], book.markets(other)[0]["selections"][1]["id"]):
+        book.place_bet(zork, sel, 10)
+    mine = {x["id"] for m in ms if m["player_key"] == "qbone" for x in m["selections"]}
+    assert set(book.blocked(zork, mid)) == mine and not book.blocked(fan, mid)
+
+    # an account the admin says isn't a player is free; one linked by hand is limited
+    book.set_player_key(zork, "")
+    bid = book.place_bet(zork, own["selections"][1]["id"], 25)
+    book.set_player_key(zork, None)
+    flagged = book.insider_bets(mid)
+    assert [(b["kind"], b["id"]) for b in flagged] == [("bet", bid)] and "own stats" in flagged[0]["why"]
+    before = book.bettor(zork)["balance"]
+    book.void_bet("bet", bid)
+    assert book.bettor(zork)["balance"] == before + 25 and not book.insider_bets(mid)
+    book.settle_market(own["id"], own["selections"][1]["id"])  # settling leaves the voided bet alone
+    book.unsettle_market(own["id"])
+    assert book.bettor(zork)["balance"] == before + 25
+
+
+def test_injury_boosts_and_promos(tmp_path):
+    from nflu.sportsbook import parlay_boost
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    other = book.create_matchup("", ["qbtwo"], ["wrtwo"])
+    sam, _ = book.create_bettor("Sam")
+    ms = book.markets(mid)
+    hurt = next(m for m in ms if m["kind"] == "prop" and m["player_key"] == "wrone")
+    fine = next(m for m in ms if m["kind"] == "prop" and m["player_key"] == "qbone")
+    rival = book.markets(other)[0]
+    h_over, f_over, r_pick = hurt["selections"][0], fine["selections"][0], rival["selections"][0]
+
+    # injury insurance: the single is voided, the parlay carries on without that pick
+    single = book.place_bet(sam, h_over["id"], 100)
+    for sel in (h_over, f_over, r_pick):
+        book.slip_add(sam, sel["id"])
+    assert parlay_boost(3) == 10
+    pid = book.place_parlay(sam, 50)
+    res = book.injury(mid, "wrone")
+    assert res == {"bets": 1, "parlays": 1}
+    assert next(b for b in book.bets_for(sam) if b["id"] == single)["status"] == "void"
+    assert book.bettor(sam)["balance"] == START_BALANCE - 50
+    assert book.parlays_for(sam)[0]["status"] == "pending"
+    book.settle_market(fine["id"], f_over["id"])
+    book.settle_market(rival["id"], r_pick["id"])
+    p = book.parlays_for(sam)[0]
+    two = book.parlay_decimal([f_over["odds"], r_pick["odds"]])
+    assert p["id"] == pid and p["status"] == "won" and p["payout"] == round(50 + 50 * (two - 1), 2)  # 2 picks: no boost
+    assert "wrone" in book.matchup(mid)["injured"]
+
+    # odds boost: single bets only, capped stake
+    mid2 = book.create_matchup("", ["qbone"], ["qbtwo"])
+    ml = book.markets(mid2)[0]["selections"][0]
+    book.boost_odds(ml["id"], ml["odds"] + 300 if ml["odds"] > 0 else 200, 50)
+    try:
+        book.slip_add(sam, ml["id"])
+        raise AssertionError("boost went in a parlay")
+    except BookError as e:
+        assert "single bets only" in str(e)
+    try:
+        book.place_bet(sam, ml["id"], 60)
+        raise AssertionError("over the boost limit")
+    except BookError:
+        pass
+    boosted = book.selection(ml["id"])["odds"]
+    bid = book.place_bet(sam, ml["id"], 50)
+    book.unboost_odds(ml["id"])
+    assert book.selection(ml["id"])["odds"] == ml["odds"]
+
+    # promos: profit boost on a win, no-sweat refund on a loss, each used once
+    book.give_promo(sam, "profit", 50, None)
+    book.give_promo(None, "nosweat", 0, 100, "everyone")
+    promo_profit, promo_ns = sorted((p["id"] for p in book.promos(sam, unused=True)))
+    total = next(m for m in book.markets(mid2) if m["kind"] == "total" and not m["stat"])
+    over, under = total["selections"]
+    b1 = book.place_bet(sam, over["id"], 100, promo_id=promo_profit)
+    b2 = book.place_bet(sam, under["id"], 100, promo_id=promo_ns)
+    try:
+        book.place_bet(sam, over["id"], 10, promo_id=promo_profit)
+        raise AssertionError("promo used twice")
+    except BookError:
+        pass
+    bal = book.bettor(sam)["balance"]
+    book.settle_market(total["id"], over["id"])
+    won = round(100 + 100 * (decimal_odds(over["odds"]) - 1) * 1.5, 2)
+    assert book.bettor(sam)["balance"] == round(bal + won + 100, 2)  # boosted win + no-sweat refund
+    assert {b["id"]: b["payout"] for b in book.bets_for(sam)}[b2] == 100
+    book.unsettle_market(total["id"])
+    assert book.bettor(sam)["balance"] == bal
+    assert {b["id"]: b["odds"] for b in book.bets_for(sam)}[bid] == boosted
