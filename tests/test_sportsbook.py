@@ -429,6 +429,13 @@ def test_pick_order_and_new_pages(tmp_path, monkeypatch):
             html = await (await c.get("/book/feed")).text()
             assert "Cy" in html and "2-leg parlay" in html
             assert "Single bets" in await (await c.get("/book/feed?show=singles")).text()
+            v = (await (await c.get("/book/version")).json())["f"]
+            bk = Book(db)
+            bk.place_bet(bk.create_bettor("Dee")[0], bk.markets(1)[0]["selections"][0]["id"], 5)
+            assert (await (await c.get("/book/version")).json())["f"] != v
+            part = await (await c.get("/book/feed", headers={"X-Requested-With": "fetch"})).text()
+            assert part.startswith('<div class="card scroll">') and "Dee" in part and "<h1>" not in part
+            assert "Dee" not in await (await c.get("/book/feed?view=history")).text()
             assert "Alt line" in await (await c.get("/admin/matchups/1")).text()
     asyncio.run(run())
 

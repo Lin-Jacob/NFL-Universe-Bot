@@ -130,7 +130,7 @@ An empty `password` means the player's Discord ID, once an admin has linked thei
 
 **Several bets from one slip:** the slip can place the full parlay, round robins (every smaller parlay, e.g. all 2-pick parlays from 4 picks) and each pick as a straight bet, all at once, with the stake on each bet. Up to `BOOK_MAX_SLIP_BETS` (100) bets at once. Tick **Keep these picks** to bet the same picks again another way.
 
-**Everyone's bets:** `/book/feed` lists everyone's parlays (tabs for single bets and all). **Tail** copies a bet's still-open picks at today's odds: a parlay goes into your slip, and a single bet opens its bet slip.
+**Everyone's bets:** `/book/feed` is a live feed of everyone's open bets. New bets appear on their own (highlighted for a moment) without reloading. Filter it by parlays or single bets. **Tail** copies a bet's still-open picks at today's odds: a parlay goes into your slip, and a single bet opens its bet slip. The **Bet history** tab lists settled bets with how they did.
 
 **House profit/loss:** the top of `/admin` shows what the book has won or lost on settled bets (singles and parlays), the money in open bets, and what it would owe if every open bet won. Each matchup row shows the profit/loss on its single bets. Money handed out on the Bettors page isn't counted.
 
