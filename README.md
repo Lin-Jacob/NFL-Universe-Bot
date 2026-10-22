@@ -136,7 +136,7 @@ An empty `password` means the player's Discord ID, once an admin has linked thei
 
 **Deleting a matchup:** **Delete matchup** on its admin page refunds open bets on it, removes it and its bets, and renumbers the matchups after it so there's no gap.
 
-**Alt lines (the slider):** every over/under on a matchup page has a big slider through other lines, priced from the same model (a higher line pays more on the over). Picking a line bets it alone or adds it to the slip like any pick. Betting a new line creates a hidden "alt" market under the main one that settles with the game. On the admin page, alt lines show under their bet once someone has picked one. **Settle at number** settles a bet and all its alt lines from what the stat came to.
+**Alt lines (the slider):** every over/under and the spread on a matchup page has a big slider through other lines, priced from the same model (a higher line pays more on the over; a bigger handicap pays more on the team giving it, e.g. Team Jacob −10.5). Picking a line bets it alone or adds it to the slip like any pick. Betting a new line creates a hidden "alt" market under the main one that settles with the game. On the admin page, alt lines show under their bet once someone has picked one. **Settle at number** settles a bet and all its alt lines from what the stat came to.
 
 **Several bets from one slip:** the slip can place the full parlay, round robins (every smaller parlay, e.g. all 2-pick parlays from 4 picks) and each pick as a straight bet, all at once, with the stake on each bet. Up to `BOOK_MAX_SLIP_BETS` (100) bets at once. Tick **Keep these picks** to bet the same picks again another way.
 
@@ -151,6 +151,7 @@ An empty `password` means the player's Discord ID, once an admin has linked thei
 1. **Create a matchup:** mark each player Team 1 / Team 2 (or type names of players with no games yet). Teams are called "Team <first player>" until the game comes in. Odds are generated from the stored stats right away:
    - **Winner**, from the same model as `/odds`.
    - **Spread**, e.g. Team Jacob −3.5 / Team Chris +3.5. The margin is spread out like past games' final-score margins and centred where the winner odds put it. Settles from the final score once the bot knows which side each team played.
+   - **Add newer bet types** (admin matchup page): a game made before an update gets any kinds of bets it's missing. Bets already on it don't change.
    - **Total points**, over/under from past games' combined scores.
    - **Game props**, over/unders on the whole game from past games' stat sheets: touchdowns, field goals made, longest field goal, points after touchdowns (extra points + 2-pt conversions), sacks, turnovers, punts, defensive and return TDs, and safeties. Only stats some past game has recorded are offered, and each has a slider. Also **A 2-point conversion is made** (yes/no). The stat sheet has no extra points or 2-pt conversions, so those two are worked out from the final score minus 6 a TD, 3 a field goal and 2 a safety; when that can't tell (the sheet is missing someone's scoring, or one 2-pt try looks the same as two kicks) the bet is voided and stakes are returned.
    - **Exact numbers** for low counts (touchdowns, field goals, turnovers, sacks): 0, 1, 2 … or "N or more", priced from past games.

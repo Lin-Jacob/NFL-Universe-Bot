@@ -158,12 +158,14 @@ t.classList.add('new')});});}).catch(function(){});}
 tick();setInterval(tick,4000);document.addEventListener('visibilitychange',tick);})();</script>"""
 
 
-# Over/under sliders: moving one shows that line's odds and points the buttons at it
+# Over/under and spread sliders: moving one shows that line's odds and points the buttons at it
+# (a spread's form has data-n, the two team names; its line is team 1's handicap)
 SLIDER_JS = """<script>(function(){function fo(o){return(o>0?'+':'')+o}
-document.querySelectorAll('form.alt').forEach(function(f){
-var r=f.querySelector('input[type=range]');function u(){var L=JSON.parse(f.dataset.l),slip=JSON.parse(f.dataset.slip),x=L[+r.value];f.querySelector('.ln').textContent=x[0];
+document.querySelectorAll('form.alt').forEach(function(f){var N=f.dataset.n?JSON.parse(f.dataset.n):null;
+var r=f.querySelector('input[type=range]');function u(){var L=JSON.parse(f.dataset.l),slip=JSON.parse(f.dataset.slip),x=L[+r.value];
+f.querySelector('.ln').textContent=N?fo(x[0]):x[0];
 f.elements.line.value=x[0];var lb=f.querySelectorAll('.lb'),b=f.querySelectorAll('button.pk b'),ad=f.querySelectorAll('button.ad');
-['Over','Under'].forEach(function(w,j){lb[j].textContent=w+' '+x[0];b[j].textContent=fo(x[1+j]);
+['Over','Under'].forEach(function(w,j){lb[j].textContent=N?N[j]+' '+fo(j?-x[0]:x[0]):w+' '+x[0];b[j].textContent=fo(x[1+j]);
 var inn=x[3+j]!==null&&slip.indexOf(x[3+j])>=0;ad[j].textContent=inn?'\u2713':'+';ad[j].className=(inn?'in':'sec')+' ad';});}
 r.addEventListener('input',u);u();});})();</script>"""
 
@@ -689,7 +691,7 @@ class BookSite:
         side = {k: "1" for k in mu["players1"]} | {k: "2" for k in mu["players2"]}
 
         def row(m: dict) -> str:
-            if (m["kind"] in ("prop", "total") and m["status"] == "open" and mu["status"] == "open"
+            if (m["kind"] in ("prop", "total", "spread") and not m["parent_id"] and m["status"] == "open" and mu["status"] == "open"
                     and not any(x["id"] in ctx["blocked"] or x["boost_from"] is not None for x in m["selections"])):
                 html = self._slider_row(m, name, ctx, self.book.ladder(m, models, alts.get(m["id"], [])))
             else:
@@ -720,7 +722,7 @@ class BookSite:
                   f'<p class="small muted">Lines and odds come from each player\'s past games. Props settle on the '
                   f'stat in the game; a player who doesn\'t play has their props voided (stakes returned). '
                   f'Tap a pick to bet it alone, or <b>+</b> to add it to a <a href="/book/parlay">parlay</a>. '
-                  f'Drag a slider for other lines: a higher line pays more on the over, less on the under.</p>'
+                  f'Drag a slider for other lines: a higher line pays more on the over, less on the under, and a bigger handicap pays more on a spread.</p>'
                 + tools + cards + (SLIDER_JS if "data-l=" in cards else ""))
         return self._page(mu["title"], body, live=True)
 
@@ -748,30 +750,38 @@ class BookSite:
                 f'<span class="small muted fn"></span></div>' + FILTER_JS)
 
     def _slider_row(self, m: dict, name, ctx: dict, ladder: list[dict]) -> str:
-        """An over/under with a big slider through its lines; the pick buttons follow the slider."""
+        """An over/under or spread with a big slider through its lines; the pick buttons follow the slider."""
         if len(ladder) < 2:
             return self._market_row(m, {"status": "open"}, name, ctx)
         i = next(n for n, r in enumerate(ladder) if r["line"] == m["line"])
         data = json.dumps([[r["line"], r["over"], r["under"], r["over_id"], r["under_id"]] for r in ladder])
         cur = ladder[i]
+        teams = None
+        if m["kind"] == "spread":  # labels like the spread's own: "Bats -3.5" / "Cats +3.5"
+            teams = [x["label"].rsplit(" ", 1)[0] for s in ("team1", "team2")
+                     for x in m["selections"] if x["side"] == s]
+        fmt = (lambda v: f"{v:+g}") if teams else (lambda v: f"{v:g}")
 
         def pick(side: str) -> str:
             sid = cur[side + "_id"]
             inside = sid in ctx["slip"]
+            label = (f"{teams[0]} {cur['line']:+g}" if side == "over" else f"{teams[1]} {-cur['line']:+g}") \
+                if teams else f"{side.title()} {cur['line']:g}"
             return (f'<span class="pick-wrap"><button class="pk" name="pick" value="{side}:bet" '
-                    f'title="Bet on this alone"><span class="lb">{side.title()} {cur["line"]:g}</span>'
+                    f'title="Bet on this alone"><span class="lb">{_e(label)}</span>'
                     f'<b>{fmt_odds(cur[side])}</b></button>'
                     f'<button class="{"in" if inside else "sec"} ad" name="pick" value="{side}:parlay" '
                     f'title="Add to parlay" style="padding:7px 11px">{"✓" if inside else "+"}</button></span>')
         return (f'<form class="mk alt" method="post" action="/book/alt/{m["id"]}" data-l="{_e(data)}" '
-                f'data-slip="{_e(json.dumps(sorted(ctx["slip"])))}">{ctx["csrf"]}'
+                f'data-slip="{_e(json.dumps(sorted(ctx["slip"])))}"'
+                + (f' data-n="{_e(json.dumps(teams))}"' if teams else "") + f'>{ctx["csrf"]}'
                 f'<input type="hidden" name="next" value="{_e(ctx["next"])}">'
                 f'<input type="hidden" name="line" value="{cur["line"]:g}">'
                 f'<div class="row"><div class="t">{_e(self._title(m, name))}</div>'
-                f'<span class="ln">{cur["line"]:g}</span></div>'
+                f'<span class="ln">{fmt(cur["line"])}</span></div>'
                 f'<input type="range" class="big" min="0" max="{len(ladder) - 1}" value="{i}" step="1" '
                 f'aria-label="Line for {_e(self._title(m, name))}">'
-                f'<div class="ends"><span>{ladder[0]["line"]:g}</span><span>{ladder[-1]["line"]:g}</span></div>'
+                f'<div class="ends"><span>{fmt(ladder[0]["line"])}</span><span>{fmt(ladder[-1]["line"])}</span></div>'
                 f'<div class="row">{pick("over")} {pick("under")}</div></form>')
 
     async def alt_pick(self, request: web.Request) -> web.Response:
@@ -786,6 +796,8 @@ class BookSite:
             if side not in ("over", "under") or what not in ("bet", "parlay") or line is None:
                 raise BookError("Pick over or under.")
             m = self.book.market(self.book.alt_market(_int(request.match_info["id"], 0), line))
+            if m["kind"] == "spread":  # the slider's buttons are team 1 / team 2 on a spread
+                side = {"over": "team1", "under": "team2"}[side]
             sel = next(x for x in m["selections"] if x["side"] == side)
             if what == "bet":
                 if _ajax(request):
@@ -1617,7 +1629,10 @@ class BookSite:
                    else f'<button name="action" value="open">Reopen betting</button>')
                 + f'<button class="sec" name="action" value="auto">'
                   f'{"Turn off" if mu["auto_settle"] else "Turn on"} auto-settle</button>'
-                  f'<button class="sec" name="action" value="void">Void everything (refund)</button></form>')
+                  f'<button class="sec" name="action" value="void">Void everything (refund)</button>'
+                  f'<button class="sec" name="action" value="refresh" title="For games made before an update: adds '
+                  f'any newer kinds of bets this game is missing. Nothing already here changes.">'
+                  f'Add newer bet types</button></form>')
             games = "".join(f'<option value="{g["id"]}">#{g["id"]} {_e(g["home_team"])} {g["home_score"]} – '
                             f'{g["away_score"]} {_e(g["away_team"])}</option>' for g in self.db.recent_games(25))
             controls.append(
@@ -1753,6 +1768,9 @@ class BookSite:
             elif action == "auto":
                 self.book.set_auto_settle(mid, not mu["auto_settle"])
                 msg = "Auto-settle turned " + ("off." if mu["auto_settle"] else "on.")
+            elif action == "refresh":
+                n = self.book.add_missing_markets(mid, self._names())
+                msg = f"Added {n} new bet{'s' * (n != 1)}." if n else "This game already has every kind of bet."
             elif action == "void":
                 self.book.void_matchup(mid)
                 msg = "Matchup voided; every stake was returned."

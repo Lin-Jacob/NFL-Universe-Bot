@@ -338,18 +338,23 @@ def default_line(model: dict) -> float:
     return math.floor(model["mean"]) + 0.5
 
 
+def line_chance(model: dict, line: float) -> float:
+    """The first side's chance at a line: the over, or for a spread (model["spread"]) team 1 covering."""
+    return p_cover(model, line) if model.get("spread") else p_over(model, line)
+
+
 def alt_lines(model: dict, main: float) -> list[float]:
-    """The slider's lines for an over/under: the main line plus up to ALT_LINES each side, a whole
-    number of steps apart (1 for counts, a round number near a third of the spread for yards), so they
-    all end in .5 like the main one. Lines where one side is nearly certain are left off."""
-    if model["dist"] == "poisson":
+    """The slider's lines for an over/under or spread: the main line plus up to ALT_LINES each side, a
+    whole number of steps apart (1 for counts and spreads, a round number near a third of the spread for
+    yards), so they all end in .5 like the main one. Lines where one side is nearly certain are left off."""
+    if model["dist"] == "poisson" or model.get("spread"):
         step = 1.0
     else:
         step = next((x for x in (1, 2, 5, 10, 15, 20, 25, 50, 100) if x >= model["sd"] / 3), 100.0)
     out = []
     for k in range(-ALT_LINES, ALT_LINES + 1):
         line = main + k * step
-        if line < 0 or (k and not ALT_MIN_CHANCE <= p_over(model, line) <= 1 - ALT_MIN_CHANCE):
+        if (line < 0 and not model.get("spread")) or (k and not ALT_MIN_CHANCE <= line_chance(model, line) <= 1 - ALT_MIN_CHANCE):
             continue
         out.append(line)
     return out
@@ -783,12 +788,35 @@ class Book:
         self._team_props(matchup_id, names)
         self._player_props(matchup_id, mu["players1"] + mu["players2"], names)
 
-    def _add_spread(self, matchup_id: int, mu: dict, model: dict, line: float) -> int:
+    def add_missing_markets(self, matchup_id: int, names=lambda k: k) -> int:
+        """Add the bets a newer version of the book offers that this matchup doesn't have yet (one made
+        before an update). Bets already there, and anything voided or settled, are left alone. Returns
+        how many were added."""
+        def key(m: dict) -> tuple:
+            return (m["kind"], m["stat"], m["player_key"])
+        with self.db.lock:
+            before = self.db.q("SELECT id, kind, stat, player_key FROM book_markets WHERE matchup_id = ? "
+                               "AND parent_id IS NULL", (matchup_id,))
+            have = {key(m) for m in before}
+            last = self.db.one("SELECT COALESCE(MAX(id), 0) n FROM book_markets")["n"]
+            self.generate_markets(matchup_id, names)
+            dupes = [m["id"] for m in self.db.q("SELECT id, kind, stat, player_key FROM book_markets "
+                                                 "WHERE matchup_id = ? AND id > ?", (matchup_id, last))
+                     if key(m) in have]
+            c = self.db.conn
+            for mid in dupes:  # just made, so nothing is bet on them
+                c.execute("DELETE FROM book_selections WHERE market_id = ?", (mid,))
+                c.execute("DELETE FROM book_markets WHERE id = ?", (mid,))
+            c.commit()
+            return self.db.one("SELECT COUNT(*) n FROM book_markets WHERE matchup_id = ? AND parent_id IS NULL",
+                               (matchup_id,))["n"] - len(before)
+
+    def _add_spread(self, matchup_id: int, mu: dict, model: dict, line: float, sort: int = 1) -> int:
         pc = p_cover(model, line)
         o1, o2 = price([pc, 1 - pc])
         return self._add_market(matchup_id, "spread", "Spread",
                                 [("team1", f"{mu['team1']} {line:+g}", o1, pc),
-                                 ("team2", f"{mu['team2']} {-line:+g}", o2, 1 - pc)], line=line, sort=1)
+                                 ("team2", f"{mu['team2']} {-line:+g}", o2, 1 - pc)], line=line, sort=sort)
 
     def _game_props(self, matchup_id: int) -> None:
         """Over/unders on the whole game (stats some past game has recorded), and a 2-pt yes/no."""
@@ -1005,8 +1033,8 @@ class Book:
 
     # ----------------------------------------------------------- alt lines
     def ladder(self, market: dict, models: Models | None = None, alts: list[dict] | None = None) -> list[dict]:
-        """The slider for an over/under: [{"line", "over", "under", "over_id", "under_id"}] lowest line
-        first. The main line has the market's own odds; an alt line someone already bet has its stored
+        """The slider for an over/under or spread: [{"line", "over", "under", "over_id", "under_id"}] lowest
+        line first ("over"/"under" are team 1/team 2 on a spread). The main line has the market's own odds; an alt line someone already bet has its stored
         odds; the rest are priced from the model now. *_id is the selection when the line exists."""
         model = self.model_for(market, models)
         if model is None:
@@ -1019,9 +1047,10 @@ class Book:
             row = {"line": line, "over_id": None, "under_id": None}
             if line in have:
                 for sel in have[line]["selections"]:
-                    row[sel["side"]], row[sel["side"] + "_id"] = sel["odds"], sel["id"]
+                    side = {"team1": "over", "team2": "under"}.get(sel["side"], sel["side"])
+                    row[side], row[side + "_id"] = sel["odds"], sel["id"]
             else:
-                po = p_over(model, line)
+                po = line_chance(model, line)
                 row["over"], row["under"] = price([po, 1 - po])
             out.append(row)
         return out
@@ -1032,9 +1061,9 @@ class Book:
 
     def alt_market(self, market_id: int, line: float) -> int:
         """The market for one of an over/under's alternate lines, made (priced from the model) the first
-        time someone picks that line. The main line is the market itself."""
+        time someone picks that line (spreads too). The main line is the market itself."""
         m = self.market(market_id)
-        if not m or m["kind"] not in ("prop", "total") or m["parent_id"]:
+        if not m or m["kind"] not in ("prop", "total", "spread") or m["parent_id"]:
             raise BookError("That bet doesn't have other lines.")
         mu = self.matchup(m["matchup_id"])
         if m["status"] != "open" or mu["status"] != "open":
@@ -1048,15 +1077,22 @@ class Book:
             row = self.db.one("SELECT id FROM book_markets WHERE parent_id = ? AND line = ?", (m["id"], line))
             if row:
                 return row["id"]
-            po = p_over(model, line)
-            oo, ou = price([po, 1 - po])
-            aid = self._add_market(m["matchup_id"], m["kind"], m["title"],
-                                   [("over", f"Over {line:g}", oo, po), ("under", f"Under {line:g}", ou, 1 - po)],
-                                   player_key=m["player_key"], stat=m["stat"], line=line, sort=m["sort"])
+            if m["kind"] == "spread":
+                aid = self._add_spread(m["matchup_id"], mu, model, line, sort=m["sort"])
+            else:
+                po = p_over(model, line)
+                oo, ou = price([po, 1 - po])
+                aid = self._add_market(m["matchup_id"], m["kind"], m["title"],
+                                       [("over", f"Over {line:g}", oo, po), ("under", f"Under {line:g}", ou, 1 - po)],
+                                       player_key=m["player_key"], stat=m["stat"], line=line, sort=m["sort"])
             self.db.x("UPDATE book_markets SET parent_id = ? WHERE id = ?", (m["id"], aid))
             return aid
 
     def model_for(self, market: dict, models: Models | None = None) -> dict | None:
+        if market["kind"] == "spread":
+            mu = self.matchup(market["matchup_id"])
+            p1, _, _ = moneyline_chances(self.db, mu["players1"], mu["players2"])
+            return spread_model(self.db, p1) | {"spread": True}
         if market["kind"] == "total" and market["stat"] and market["stat"][:3] in ("t1:", "t2:"):
             means = self.team_td_means(self.matchup(market["matchup_id"]))
             mean = means[int(market["stat"][1]) - 1] if means else 0.5
@@ -1090,22 +1126,13 @@ class Book:
                     word = "Over" if s["side"] == "over" else "Under"
                     c.execute("UPDATE book_selections SET label = ? WHERE id = ?", (f"{word} {line:g}", s["id"]))
                 m["line"] = line
-            if reprice and (model := self.model_for(m)):
-                po = p_over(model, m["line"])
+            if reprice and (model := self.model_for(m)):  # over/under, or team 1/team 2 on a spread
+                po = line_chance(model, m["line"])
                 oo, ou = price([po, 1 - po])
                 for s in m["selections"]:
-                    over = s["side"] == "over"
+                    over = s["side"] in ("over", "team1")
                     c.execute("UPDATE book_selections SET odds = ?, fair_p = ? WHERE id = ?",
                               (oo if over else ou, po if over else 1 - po, s["id"]))
-            elif reprice and m["kind"] == "spread":
-                mu = self.matchup(m["matchup_id"])
-                p1, _, _ = moneyline_chances(self.db, mu["players1"], mu["players2"])
-                pc = p_cover(spread_model(self.db, p1), m["line"])
-                o1, o2 = price([pc, 1 - pc])
-                for s in m["selections"]:
-                    first = s["side"] == "team1"
-                    c.execute("UPDATE book_selections SET odds = ?, fair_p = ? WHERE id = ?",
-                              (o1 if first else o2, pc if first else 1 - pc, s["id"]))
             elif reprice and m["kind"] in ("margin", "leader", "exact") or (reprice and m["stat"] == "g:both_td"):
                 if m["kind"] == "exact":
                     fair = {side: p for side, _, p in exact_outcomes(game_stat_model(self.db, m["stat"])["mean"])}

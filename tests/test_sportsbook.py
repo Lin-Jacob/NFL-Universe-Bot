@@ -746,3 +746,36 @@ def test_exact_team_margin_and_leader_lines(tmp_path):
     assert out(margin)["t1:14+"] == "win" and out(margin)["tie"] == "lose"
     top = max(db.game_players(gid), key=lambda ln: ln["fantasy_points"])["username_key"]
     assert out(leader)[f"p:{top}"] == "win"
+
+
+def test_alt_spreads_and_newer_bet_types(tmp_path):
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    spread = next(m for m in book.markets(mid) if m["kind"] == "spread")
+    ladder = book.ladder(spread)
+    lines = [r["line"] for r in ladder]
+    assert len(lines) > 2 and spread["line"] in lines and all(ln % 1 == 0.5 for ln in lines)
+    # a bigger handicap for team 1 pays more on team 1, less on team 2
+    assert ladder[0]["over"] > ladder[-1]["over"] and ladder[0]["under"] < ladder[-1]["under"]
+    alt = book.market(book.alt_market(spread["id"], lines[0]))
+    assert alt["parent_id"] == spread["id"] and alt["kind"] == "spread" and alt["line"] == lines[0]
+    assert [s["side"] for s in alt["selections"]] == ["team1", "team2"]
+    assert alt["selections"][0]["label"] == f"Team qbone {lines[0]:+g}"
+    assert book.alt_market(spread["id"], lines[0]) == alt["id"]  # made once
+
+    # a matchup made before an update gets the bet types it's missing, and nothing twice
+    margin = next(m for m in book.markets(mid) if m["kind"] == "margin")
+    db.x("DELETE FROM book_selections WHERE market_id = ?", (margin["id"],))
+    db.x("DELETE FROM book_markets WHERE id = ?", (margin["id"],))
+    n = len(book.markets(mid))
+    assert book.add_missing_markets(mid) == 1 and len(book.markets(mid)) == n + 1
+    assert book.add_missing_markets(mid) == 0
+
+    # team 1 wins by 24: covers the main spread and the alt
+    g = _game(10, random.Random(1), home="Ravens", away="Bills", score=(7, 31))
+    gid, _ = db.save_game(g)
+    book.settle_from_game(mid, gid)
+    a = book.market(alt["id"])
+    won = 24 + a["line"] > 0
+    assert a["selections"][0]["outcome"] == ("win" if won else "lose")
