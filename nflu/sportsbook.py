@@ -779,8 +779,20 @@ class Book:
         self.db.x("UPDATE book_matchups SET status = 'void' WHERE id = ?", (matchup_id,))
 
     def delete_matchup(self, matchup_id: int) -> None:
+        """Delete a matchup (open bets on it are refunded first, then its markets and bets go with it)
+        and renumber the matchups after it so the numbers stay 1, 2, 3... with no gap."""
         self.void_matchup(matchup_id)
-        self.db.x("DELETE FROM book_matchups WHERE id = ?", (matchup_id,))
+        with self.db.lock:
+            c = self.db.conn
+            c.execute("DELETE FROM book_matchups WHERE id = ?", (matchup_id,))
+            c.execute("PRAGMA defer_foreign_keys = ON")  # markets point at the old numbers mid-way
+            ids = [r["id"] for r in c.execute("SELECT id FROM book_matchups ORDER BY id")]
+            for new, old in enumerate(ids, start=1):
+                if new != old:
+                    c.execute("UPDATE book_markets SET matchup_id = ? WHERE matchup_id = ?", (new, old))
+                    c.execute("UPDATE book_matchups SET id = ? WHERE id = ?", (new, old))
+            c.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'book_matchups'", (len(ids),))
+            c.commit()
 
     # --------------------------------------------------------------------- bets
     def place_bet(self, bettor_id: int, sel_id: int, stake: float, seen_odds: int | None = None) -> int:

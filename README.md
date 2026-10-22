@@ -118,6 +118,12 @@ An empty `password` means the player's Discord ID, once an admin has linked thei
 
 **Parlays:** the **+** next to any pick adds it to the bettor's parlay slip (`/book/parlay`, saved with their account). Two to ten picks, one per bet; the odds multiply and it pays only if every pick wins. A pick that pushes or is voided drops out and the rest still count. Parlays settle by themselves as their picks settle, and undoing a pick's settlement re-grades them.
 
+**Bet card:** tapping any odds opens a small bet card on the same page instead of a new one. Drag it anywhere by its top bar (it remembers where). It has quick stake buttons (+$10 … Max), shows what the bet pays as you type, places the bet or adds the pick to your parlay slip, and updates your balance on the spot. Esc or ✕ closes it.
+
+**Search and filters:** the sportsbook home page can search games by title, team or player and filter Open / Betting closed. Each matchup page has a search box (e.g. "passing yards" or a player's name) and filters for Game, Player props and Specials, plus a team filter. Both teams are always listed with their players, under their in-game names once a game has named them.
+
+**Deleting a matchup:** **Delete matchup** on its admin page refunds open bets on it, removes it and its bets, and renumbers the matchups after it so there's no gap.
+
 **Alt lines (the slider):** every over/under on a matchup page has a big slider through other lines, priced from the same model (a higher line pays more on the over). Picking a line bets it alone or adds it to the slip like any pick. Betting a new line creates a hidden "alt" market under the main one that settles with the game. On the admin page, alt lines show under their bet once someone has picked one. **Settle at number** settles a bet and all its alt lines from what the stat came to.
 
 **Several bets from one slip:** the slip can place the full parlay, round robins (every smaller parlay, e.g. all 2-pick parlays from 4 picks) and each pick as a straight bet, all at once, with the stake on each bet. Up to `BOOK_MAX_SLIP_BETS` (100) bets at once. Tick **Keep these picks** to bet the same picks again another way.
