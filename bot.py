@@ -27,6 +27,7 @@ from nflu.embeds import game_embed
 from nflu.feed import PAIR_WINDOW, nearest_csv, nflu_embed, nflu_server_id, server_allowed
 from nflu.parser import ParsedGame
 from nflu.tunnel import Tunnel
+from nflu.players import players
 from nflu.webhook import WebhookServer, ingest
 
 load_dotenv()
@@ -54,8 +55,8 @@ class NFLUBot(commands.Bot):
 
     def apply_config(self) -> int:
         """Load PLAYER_NAMES into the name map and rescore every game with FANTASY_SCORING."""
-        for name, ign in config.PLAYER_NAMES.items():
-            self.db.set_name(ign, name)
+        for p in players():
+            self.db.set_name(p.roblox_username, p.name)
         return self.db.recompute_fantasy()
 
     async def setup_hook(self) -> None:

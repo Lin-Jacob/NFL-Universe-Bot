@@ -111,11 +111,12 @@ def test_web_flow(tmp_path, monkeypatch):
         async with TestClient(TestServer(srv.app)) as c:
             # new visitor is asked for a name
             html = await (await c.get("/book")).text()
-            assert "Pick a name" in html and "$10,000.00" in html
+            assert "Pick a password" in html and "$10,000.00" in html
             assert "Sportsbook" in await (await c.get("/")).text()
-            r = await c.post("/book/join", data={"name": "<i>Ann</i>", "next": "/book"})
+            assert "at least 4" in await (await c.post("/book/join", data={"name": "Ann", "password": "x"})).text()
+            r = await c.post("/book/join", data={"name": "<i>Ann</i>", "password": "pass1", "next": "/book"})
             html = await r.text()
-            assert r.status == 200 and "&lt;i&gt;Ann&lt;/i&gt;" in html and "account code is" in html
+            assert r.status == 200 and "&lt;i&gt;Ann&lt;/i&gt;" in html and "Welcome!" in html
             assert (await c.post("/book/join", data={"name": "Ann2"})).status == 200  # already joined: no-op
             assert len(Book(db).leaderboard()) == 1
 
@@ -166,6 +167,26 @@ def test_web_flow(tmp_path, monkeypatch):
                 assert "No account has that code" in await (await c2.post("/book/code", data={"code": "zzzz"})).text()
                 r = await c2.post("/book/code", data={"code": code.lower().replace("-", " "), "next": "/book/me"})
                 assert "Welcome back" in (html := await r.text()) and "$9,750.00" in html
+            # name + password works on another device; log out works
+            async with TestClient(TestServer(srv.app)) as c3:
+                r = await c3.post("/book/login", data={"name": "<i>ann</i>", "password": "nope"})
+                assert "Wrong name or password" in await r.text()
+                r = await c3.post("/book/login", data={"name": "<i>ann</i>", "password": "pass1", "next": "/book/me"})
+                html = await r.text()
+                assert "Welcome back" in html and "$9,750.00" in html and "Change password" in html
+                lcsrf = re.search(r'name="csrf" value="(\w+)"', html).group(1)
+                r = await c3.post("/book/password", data={"csrf": lcsrf, "password": "pass2"})
+                assert "Password saved" in await r.text()
+                r = await c3.post("/book/logout", data={"csrf": lcsrf})
+                assert "Logged out" in (html := await r.text()) and "Log in" in html
+                assert Book(db).login("<i>Ann</i>", "pass2")[0] and not Book(db).login("<i>Ann</i>", "pass1")[0]
+                # an old account with no password is claimed by logging in, keeping its money and bets
+                old_id, _ = Book(db).create_bettor("Old Timer")
+                Book(db).adjust_balance(old_id, 123)
+                r = await c3.post("/book/login", data={"name": "old timer", "password": "mine", "next": "/book/me"})
+                assert "its password now" in (html := await r.text()) and "$10,123.00" in html
+                assert Book(db).login("Old Timer", "mine") == (Book(db).bettor(old_id), False)
+                assert Book(db).login("Old Timer", "other")[0] is None
 
             # the game arrives by webhook and settles the matchup
             p = json.loads(SAMPLE.read_text())
@@ -251,3 +272,195 @@ def test_live_edit(tmp_path):
     assert book.market(prop["id"])["status"] == "void" and book.bettor(bettor)["balance"] == START_BALANCE
     assert any(m["player_key"] == "newguy" for m in book.markets(mid))
     assert book.version() != v0
+
+
+def test_admin_move_player(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADMIN_PASSWORD", PASSWORD)
+
+    async def run():
+        db = _db(tmp_path)
+        Book(db).create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+        async with TestClient(TestServer(WebhookServer(db, SECRET).app)) as c:
+            html = await (await c.post("/admin/login", data={"username": "admin", "password": PASSWORD})).text()
+            csrf = re.search(r'name="csrf" value="(\w+)"', html).group(1)
+            assert "Move to Team qbtwo" in await (await c.get("/admin/matchups/1")).text()
+            r = await c.post("/admin/matchups/1", data={"csrf": csrf, "action": "move", "player": "wrone"})
+            assert "moved wrone to team qbtwo" in (await r.text()).lower()
+            mu = Book(db).matchup(1)
+            assert mu["players1"] == ["qbone"] and mu["players2"] == ["qbtwo", "wrtwo", "wrone"]
+            r = await c.post("/admin/matchups/1", data={"csrf": csrf, "action": "remove", "player": "qbone"})
+            assert "Each team needs at least one player" in await r.text()
+            r = await c.post("/admin/matchups/1", data={"csrf": csrf, "action": "remove", "player": "wrtwo"})
+            assert "took wrtwo out" in (await r.text()).lower() and "wrtwo" not in Book(db).matchup(1)["players2"]
+    asyncio.run(run())
+
+
+def test_settles_when_stats_arrive_later(tmp_path):
+    """A game first saved without its stats (score only) settles its matchup when it's saved again with them."""
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbking_123", "speedywr"], ["billsqb", "truckstick"])
+    sam, _ = book.create_bettor("Sam")
+    ml = book.markets(mid)[0]
+    book.place_bet(sam, ml["selections"][0]["id"], 1000)
+    full = json.loads(SAMPLE.read_text())
+    score_only = {**full, "players": []}
+    assert ingest(db, json.dumps(score_only), "test")["status"] == "parsed"
+    assert book.matchup(mid)["status"] == "open"  # no players yet: nothing to settle on
+    assert ingest(db, json.dumps(full), "test")["status"] == "replaced"
+    assert book.matchup(mid)["status"] == "settled"
+    assert book.bettor(sam)["balance"] == round(START_BALANCE - 1000 + 1000 * decimal_odds(ml["selections"][0]["odds"]), 2)
+
+
+def test_tie_and_leftovers(tmp_path):
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    sam, _ = book.create_bettor("Sam")
+    ml = book.markets(mid)[0]
+    book.place_bet(sam, ml["selections"][0]["id"], 1000)
+    custom = book.add_custom(mid, "Pick-six?", [("Yes", 400), ("No", -600)])
+    prop = next(m for m in book.markets(mid) if m["kind"] == "prop")
+    db.x("UPDATE book_selections SET side = 'broken' WHERE market_id = ? AND side = 'over'", (prop["id"],))
+    gid, _ = db.save_game(_game(20, random.Random(2), score=(14, 14)))
+    res = book.settle_from_game(mid, gid)
+    # a tie pushes the winner bet even though the sides can't be told apart; a broken market doesn't stop the rest
+    assert book.market(ml["id"])["status"] == "settled"
+    assert book.bettor(sam)["balance"] == START_BALANCE
+    assert sorted(res["left"]) == sorted([book.market(custom)["title"], prop["title"]])
+    assert res["settled"] == len(book.markets(mid)) - 2
+    assert book.matchup(mid)["status"] == "locked"
+
+
+def test_alt_lines_round_robin_tail_and_house(tmp_path):
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    ann, _ = book.create_bettor("Ann")
+    bob, _ = book.create_bettor("Bob")
+    mk = {(m["player_key"], m["stat"]): m for m in book.markets(mid)}
+    py = mk[("qbone", "pass_yards")]
+
+    # the slider: lines both sides of the main one, overs pay more as the line goes up
+    lad = book.ladder(py)
+    assert len(lad) >= 5 and any(r["line"] == py["line"] and r["over_id"] for r in lad)
+    assert all(a["line"] < b["line"] and a["over"] <= b["over"] for a, b in zip(lad, lad[1:]))
+    high = lad[-1]["line"]
+    alt = book.alt_market(py["id"], high)
+    assert book.alt_market(py["id"], high) == alt and book.alt_market(py["id"], py["line"]) == py["id"]
+    assert book.market(alt)["parent_id"] == py["id"] and next(r for r in book.ladder(py) if r["line"] == high)["over_id"]
+    try:
+        book.alt_market(py["id"], py["line"] + 0.25)
+        raise AssertionError("a line that isn't offered")
+    except BookError:
+        pass
+    alt_over = next(s for s in book.market(alt)["selections"] if s["side"] == "over")
+    book.place_bet(ann, alt_over["id"], 100)
+    # another line of the same bet swaps out of the slip like any pick from that market
+    book.slip_add(ann, alt_over["id"])
+    book.slip_add(ann, py["selections"][1]["id"])
+    assert [s["id"] for s in book.slip(ann)] == [py["selections"][1]["id"]]
+
+    # round robin: 3 picks -> the 3-pick parlay, three 2-pick parlays and three singles, $10 each
+    for key in (("wrone", "receptions"), ("wrtwo", "tackles")):
+        book.slip_add(ann, mk[key]["selections"][0]["id"])
+    seen = [(s["id"], s["odds"]) for s in book.slip(ann)]
+    try:
+        book.place_slip(ann, 10_000, seen, [1, 2, 3])
+        raise AssertionError("more than the balance")
+    except BookError as e:
+        assert "7 bets" in str(e)
+    res = book.place_slip(ann, 10, seen, [3, 2, 1], keep=True)
+    assert len(res["parlays"]) == 4 and len(res["singles"]) == 3 and res["cost"] == 70
+    assert len(book.slip(ann)) == 3  # kept
+    assert book.bettor(ann)["balance"] == START_BALANCE - 100 - 70
+
+    # everyone's bets, and tailing a parlay into another bettor's slip
+    feed = book.feed()
+    assert {d["kind"] for d in feed} == {"bet", "parlay"} and all(d["name"] == "Ann" for d in feed)
+    three = next(d for d in feed if d["kind"] == "parlay" and len(d["legs"]) == 3)
+    assert [s["id"] for s in book.tail(bob, "parlay", three["id"])] == [leg["selection_id"] for leg in three["legs"]]
+    assert len(book.slip(bob)) == 3
+
+    # the house: nothing settled yet, then the alt-line over loses when settled at a number
+    h = book.house()
+    assert h["total"]["profit"] == 0 and h["total"]["open"] == 170 and h["total"]["exposure"] > 170
+    assert book.settle_value(py["id"], high - 1) == 2  # the main line and its alt line
+    assert book.market(alt)["status"] == "settled" and book.house()["singles"]["profit"] >= 100
+    assert book.matchup_house()[mid] == book.house()["singles"]["profit"]
+
+
+def test_pick_order_and_new_pages(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADMIN_PASSWORD", PASSWORD)
+
+    async def run():
+        db = _db(tmp_path)
+        async with TestClient(TestServer(WebhookServer(db, SECRET).app)) as c:
+            html = await (await c.post("/admin/login", data={"username": "admin", "password": PASSWORD})).text()
+            assert "house profit/loss" in html and 'class="seg"' in html
+            csrf = re.search(r'name="csrf" value="(\w+)"', html).group(1)
+            # team lists keep the order players were picked in, not the table's
+            await c.post("/admin/matchups", data={"csrf": csrf, "p:qbone": "1", "p:wrone": "1", "p:qbtwo": "2",
+                                                  "p:wrtwo": "2", "order": "wrtwo,wrone,qbtwo,qbone"})
+            mu = Book(db).matchup(1)
+            assert mu["players1"] == ["wrone", "qbone"] and mu["players2"] == ["wrtwo", "qbtwo"]
+            assert mu["team1"] == "Team WrOne"
+
+            await c.post("/book/join", data={"name": "Cy", "password": "pass1"})
+            html = await (await c.get("/book/matchups/1")).text()
+            assert 'type="range"' in html and "data-l=" in html
+            bcsrf = re.search(r'name="csrf" value="(\w+)"', html).group(1)
+            py = next(m for m in Book(db).markets(1) if m["stat"] == "pass_yards" and m["player_key"] == "qbone")
+            high = Book(db).ladder(py)[-1]["line"]
+            r = await c.post(f"/book/alt/{py['id']}", data={"csrf": bcsrf, "line": f"{high:g}", "pick": "over:parlay",
+                                                            "next": "/book/matchups/1"})
+            assert f"Added Over {high:g}" in await r.text()
+            r = await c.post(f"/book/alt/{py['id']}", data={"csrf": bcsrf, "line": f"{high:g}", "pick": "under:bet",
+                                                            "next": "/book/matchups/1"})
+            assert r.url.path.startswith("/book/bet/") and f"Under {high:g}" in await r.text()
+            tk = next(m for m in Book(db).markets(1) if m["stat"] == "tackles")
+            await c.post(f"/book/parlay/add/{tk['selections'][0]['id']}", data={"csrf": bcsrf, "next": "/book"})
+            html = await (await c.get("/book/parlay")).text()
+            assert "Each pick on its own" in html
+            seen = re.search(r'name="seen" value="([^"]+)"', html).group(1)
+            r = await c.post("/book/parlay", data=[("csrf", bcsrf), ("seen", seen), ("stake", "50"),
+                                                   ("size", "2"), ("size", "1")])
+            assert "Placed 1 parlay and 2 straight bets" in await r.text()
+            html = await (await c.get("/book/feed")).text()
+            assert "Cy" in html and "2-leg parlay" in html
+            assert "Single bets" in await (await c.get("/book/feed?show=singles")).text()
+            assert "Alt line" in await (await c.get("/admin/matchups/1")).text()
+    asyncio.run(run())
+
+
+def test_league_player_logins(tmp_path, monkeypatch):
+    import config
+    from nflu import players
+    monkeypatch.setattr(config, "PLAYER_NAMES", {
+        "Jacob": {"roblox_username": "QBOne", "password": "759822057"},
+        "Nate": {"roblox_username": "WrOne", "password": ""},   # empty: uses the linked Discord ID
+        "Old": "QBTwo"})                                          # older format still works
+    db = _db(tmp_path)
+    db.set_name("WrOne", "Nate", 4242)
+    assert [p.name for p in players.players()] == ["Jacob", "Nate", "Old"]
+    assert players.book_password(db, players.find("jacob")) == "759822057"
+    assert players.book_password(db, players.find("Nate")) == "4242"
+    assert players.book_password(db, players.find("Old")) is None
+    assert players.for_discord(db, 759822057).name == "Jacob" and players.for_discord(db, 4242).name == "Nate"
+    assert players.for_discord(db, 1) is None
+
+    async def run():
+        async with TestClient(TestServer(WebhookServer(db, SECRET).app)) as c:
+            html = await (await c.get("/book")).text()
+            assert '<option value="Jacob">' in html and '<option value="Nate">' in html and "Old" not in html
+            r = await c.post("/book/join", data={"name": "jacob", "password": "mine"})
+            assert "is a league player" in await r.text()
+            r = await c.post("/book/login", data={"name": "nate", "password": "nope"})
+            assert "Wrong name or password" in await r.text()
+            r = await c.post("/book/login", data={"name": "nate", "password": "4242", "next": "/book/me"})
+            html = await r.text()
+            assert "Welcome back, Nate" in html and "$10,000.00" in html  # account made on first login
+            r = await c.post("/book/login", data={"name": "Jacob", "password": "759822057"})
+            assert "Welcome back, Jacob" in await r.text()
+            assert {b["name"] for b in Book(db).leaderboard()} == {"Nate", "Jacob"}
+    asyncio.run(run())

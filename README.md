@@ -104,9 +104,29 @@ The site can only show data, never change it, and never shows the webhook secret
 
 ### Sportsbook (fake money)
 
-`/book` on the same address is a mock sportsbook. A new visitor picks a name and starts with $10,000 of fake money; their browser cookie remembers them. Everything (accounts, balances, bets, matchups) is saved in the bot's database (`data/nfl_universe.db`), so stopping and starting the bot loses nothing. A browser only remembers its account for one address, so when the link changes (a `cloudflared` restart) or someone switches devices, they type the **account code** shown on their My bets page into the join page to get their account back. They bet on open matchups, see their bets at `/book/me`, and everyone's money at `/book/leaderboard`.
+`/book` on the same address is a mock sportsbook. A new visitor makes an account with a name and password and starts with $10,000 of fake money. They log in with the same name and password on any device (and again after a `cloudflared` restart changes the link); the browser also remembers them until they log out. Everything (accounts, balances, bets, matchups) is saved in the bot's database (`data/nfl_universe.db`), so stopping and starting the bot loses nothing. Accounts made before passwords existed keep their money and bets: the first login with that name sets its password (claims it). Passwords are stored hashed, but this is a friends' league, not a bank. An admin can reset a forgotten password on the Bettors page.
+
+**League player logins:** league players log in with their real name (the login box suggests names as you type) and a preset password. Set it per player in `PLAYER_NAMES` in `config.py`:
+
+```python
+PLAYER_NAMES = {
+    "Jacob": {"roblox_username": "roblox_user_759822057", "password": ""},
+}
+```
+
+An empty `password` means the player's Discord ID, once an admin has linked their account with `/admin setname`. The first login creates their account with the starting money. In Discord, `/password` shows a player their own name and password, and only they can see the reply. Nobody else can sign up with a league player's name. The older `"Jacob": "roblox_user_759822057"` format still works; those players just have no preset password.
 
 **Parlays:** the **+** next to any pick adds it to the bettor's parlay slip (`/book/parlay`, saved with their account). Two to ten picks, one per bet; the odds multiply and it pays only if every pick wins. A pick that pushes or is voided drops out and the rest still count. Parlays settle by themselves as their picks settle, and undoing a pick's settlement re-grades them.
+
+**Alt lines (the slider):** every over/under on a matchup page has a big slider through other lines, priced from the same model (a higher line pays more on the over). Picking a line bets it alone or adds it to the slip like any pick. Betting a new line creates a hidden "alt" market under the main one that settles with the game. On the admin page, alt lines show under their bet once someone has picked one. **Settle at number** settles a bet and all its alt lines from what the stat came to.
+
+**Several bets from one slip:** the slip can place the full parlay, round robins (every smaller parlay, e.g. all 2-pick parlays from 4 picks) and each pick as a straight bet, all at once, with the stake on each bet. Up to `BOOK_MAX_SLIP_BETS` (100) bets at once. Tick **Keep these picks** to bet the same picks again another way.
+
+**Everyone's bets:** `/book/feed` lists everyone's parlays (tabs for single bets and all). **Tail** copies a bet's still-open picks at today's odds: a parlay goes into your slip, and a single bet opens its bet slip.
+
+**House profit/loss:** the top of `/admin` shows what the book has won or lost on settled bets (singles and parlays), the money in open bets, and what it would owe if every open bet won. Each matchup row shows the profit/loss on its single bets. Money handed out on the Bettors page isn't counted.
+
+**Picking teams:** the admin's player chart has a big Out / Team 1 / Team 2 switch per player. Above it, each team is listed in the order you picked the players, and that order is saved; the first pick names the team.
 
 **Admin page:** `/admin`, username `admin`, password `ADMIN_PASSWORD` from `.env` (add the line `ADMIN_PASSWORD=...` and restart; without it the admin page stays off). There you:
 
@@ -173,6 +193,7 @@ Notes:
 | `/inspect_game [game] [view] [player]` | One game (latest if empty). **Simple** (default): the box score, with ◀ ▶ flipping to older / newer games. **Complex**: a stat card per player showing the matchup, fantasy points, rank in the game, snaps and every stat they recorded grouped by position (QB/RB/WR/DB/DL/ST) with points per group, with ◀ ▶ flipping between players (best first). `player` starts the cards on that player |
 | `/player [name] [view]` | **Simple** (default): career stats, fantasy totals, best game. **Complex**: a career card with every stat combined over all games, grouped by position (QB/RB/WR/DB/DL/ST), each shown as total · per-game average (longest plays show best · average), plus points per group, snaps, points per 100 snaps and best game. ◀ ▶ flips between players in `/fantasy` order, starting on `name` (or #1 if empty) |
 | `/me` | Your own stats (once an admin links your Discord account) |
+| `/password` | Your sportsbook login name and password. Only you can see the reply |
 | `/gamelog name [count]` | A player's recent games |
 | `/compare player1 player2` | Side-by-side stats |
 | `/leaders stat [per_game]` | Top 10 in any stat, or fantasy points |
