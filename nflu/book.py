@@ -1525,7 +1525,8 @@ class BookSite:
                   f'<div class="inline" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">'
                   f'<input name="title" placeholder="Title (optional)"></div>'
                   f'<p class="small muted">Put each player on Team 1 or Team 2. The lists show each team in the '
-                  f"order you picked, and that's the order it keeps (the first pick names the team). When the game "
+                  f"order you picked, and that's the order it keeps. Name a team, or leave it blank and the first pick "
+                  f"names it (then the game's team names once it's played). When the game "
                   f"comes in, the bot works out which side each team played from its players and settles the "
                   f"winner.</p>"
                   f'{pick}'
@@ -1556,8 +1557,12 @@ class BookSite:
         order = (mu["players1"] + mu["players2"]) if mu else []
         everyone = sorted(people.items(), key=lambda kv: name(kv[0]).lower())
         options = "".join(f'<option value="{_e(k)}">{_e(label)}</option>' for k, label in everyone)
-        lists = "".join(f'<div class="card t{i}" style="margin:0"><b>{_e(t)}</b>'
-                        f'<select class="add" data-t="{i}" aria-label="Add a player to {_e(t)}">'
+        # A new matchup's teams can be named here (empty = "Team <first player>", then the game's names)
+        lists = "".join(f'<div class="card t{i}" style="margin:0"><b class="tn" data-d="{_e(t)}">{_e(t)}</b>'
+                        + ("" if mu else f' <input class="tname" name="team{i}" data-t="{i}" maxlength="40" '
+                                         f'placeholder="Team name (optional)" aria-label="Team {i} name" '
+                                         f'style="width:auto;flex:1 1 140px">')
+                        + f'<select class="add" data-t="{i}" aria-label="Add a player to {_e(t)}">'
                         f'<option value="">＋ Add a player…</option>{options}</select><ol id="pk{i}">'
                         + "".join(f"<li>{_e(name(k))}</li>" for k in (mu[f"players{i}"] if mu else []))
                         + "</ol></div>" for i, t in ((1, t1), (2, t2)))
@@ -1581,6 +1586,9 @@ class BookSite:
                 "if(sl.value)set(sl.value,sl.dataset.t);sl.value='';});});"
                 "box.querySelectorAll('.seg input').forEach(function(i){i.addEventListener('change',function(){"
                 "var k=i.closest('tr').dataset.k;o=o.filter(function(x){return x!==k});if(i.value)o.push(k);draw();});});"
+                "box.querySelectorAll('input.tname').forEach(function(n){n.addEventListener('input',function(){"
+                "var t=n.dataset.t,h=n.parentNode.querySelector('.tn'),v=n.value.trim()||h.dataset.d;h.textContent=v;"
+                "box.querySelectorAll('.seg input[value=\"'+t+'\"]+span').forEach(function(sp){sp.textContent=v});});});"
                 "box.querySelector('.find').addEventListener('input',function(e){var q=e.target.value.toLowerCase();"
                 "box.querySelectorAll('tr[data-k]').forEach(function(tr){tr.style.display="
                 "tr.textContent.toLowerCase().indexOf(q)>=0?'':'none';});});draw();})();</script>")
@@ -1609,7 +1617,8 @@ class BookSite:
         self._check_csrf(request, form, ADMIN_COOKIE)
         sides = self._sides(form)
         try:
-            mid = self.book.create_matchup(str(form.get("title", "")), sides["1"], sides["2"], self._names())
+            mid = self.book.create_matchup(str(form.get("title", "")), sides["1"], sides["2"], self._names(),
+                                           str(form.get("team1", "")), str(form.get("team2", "")))
         except BookError as e:
             raise _redirect("/admin", str(e), err=True)
         raise _redirect(f"/admin/matchups/{mid}", "Matchup created and open for betting"

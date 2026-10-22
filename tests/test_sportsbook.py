@@ -906,3 +906,28 @@ def test_tiers_rewards_boost_limits_and_insurance(tmp_path):
         raise AssertionError("insurance on a no-sweat bet")
     except BookError as e:
         assert "no-sweat" in str(e)
+
+
+def test_named_teams_keep_their_names(tmp_path):
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"], team1=" Sharks ", team2="Jets")
+    mu = book.matchup(mid)
+    assert (mu["team1"], mu["team2"], mu["title"], mu["named"]) == ("Sharks", "Jets", "Sharks vs Jets", 1)
+    ml = next(m for m in book.markets(mid) if m["kind"] == "moneyline")
+    assert [s["label"] for s in ml["selections"]] == ["Sharks", "Jets"]
+    one = book.create_matchup("", ["qbone"], ["qbtwo"], team1="Sharks")  # one named, the other the usual way
+    assert (book.matchup(one)["team1"], book.matchup(one)["team2"]) == ("Sharks", "Team qbtwo")
+    try:
+        book.create_matchup("", ["qbone"], ["qbtwo"], team1="Jets", team2="jets")
+        raise AssertionError("same names")
+    except BookError:
+        pass
+    # settling keeps the names (an unnamed matchup takes the game's, as before)
+    plain = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    gid, _ = db.save_game(_game(10, random.Random(1), home="Ravens", away="Bills", score=(7, 31)))
+    for m in (mid, plain):
+        book.settle_from_game(m, gid)
+    assert (book.matchup(mid)["team1"], book.matchup(mid)["team2"]) == ("Sharks", "Jets")
+    assert {book.matchup(plain)["team1"], book.matchup(plain)["team2"]} == {"Ravens", "Bills"}
+    assert book.market(ml["id"])["selections"][0]["label"] == "Sharks"

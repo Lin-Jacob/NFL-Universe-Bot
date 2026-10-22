@@ -274,6 +274,9 @@ def ensure_schema(db: Database) -> None:
             c.execute("ALTER TABLE book_selections ADD COLUMN boost_max REAL")
         if "injured" not in {r["name"] for r in c.execute("PRAGMA table_info(book_matchups)")}:
             c.execute("ALTER TABLE book_matchups ADD COLUMN injured TEXT NOT NULL DEFAULT '[]'")
+        if "named" not in {r["name"] for r in c.execute("PRAGMA table_info(book_matchups)")}:
+            # 1 = the admin named the teams, so they keep those names (not the game's) when it settles
+            c.execute("ALTER TABLE book_matchups ADD COLUMN named INTEGER NOT NULL DEFAULT 0")
         if "parent_id" not in {r["name"] for r in c.execute("PRAGMA table_info(book_markets)")}:
             c.execute("ALTER TABLE book_markets ADD COLUMN parent_id INTEGER")
         for r in c.execute("SELECT id FROM book_bettors WHERE code IS NULL").fetchall():
@@ -819,18 +822,24 @@ class Book:
                         "JOIN book_matchups mu ON mu.id = m.matchup_id WHERE s.id = ?", (sel_id,))
         return dict(s) if s else None
 
-    def create_matchup(self, title: str, keys1: list[str], keys2: list[str], names=lambda k: k) -> int:
-        """Two lineups. Teams are called "Team <first player>" until the game that settles it names them."""
+    def create_matchup(self, title: str, keys1: list[str], keys2: list[str], names=lambda k: k,
+                       team1: str = "", team2: str = "") -> int:
+        """Two lineups. Teams the admin names keep those names; the rest are called "Team <first player>"
+        until the game that settles it names them."""
         if not keys1 or not keys2:
             raise BookError("Each team needs at least one player.")
         if set(keys1) & set(keys2):
             raise BookError("A player can't be on both teams.")
-        team1, team2 = f"Team {names(keys1[0])}", f"Team {names(keys2[0])}"
+        named = bool(" ".join(team1.split()) or " ".join(team2.split()))
+        team1 = " ".join(team1.split())[:40] or f"Team {names(keys1[0])}"
+        team2 = " ".join(team2.split())[:40] or f"Team {names(keys2[0])}"
+        if team1.lower() == team2.lower():
+            raise BookError("Give the two teams different names.")
         title = title.strip() or f"{team1} vs {team2}"
         base = self.db.one("SELECT COALESCE(MAX(id), 0) n FROM games")["n"]
         cur = self.db.x("INSERT INTO book_matchups(title, team1, team2, players1, players2, base_game_id, "
-                        "created_at) VALUES(?,?,?,?,?,?,?)",
-                        (title, team1, team2, json.dumps(keys1), json.dumps(keys2), base, _now()))
+                        "created_at, named) VALUES(?,?,?,?,?,?,?,?)",
+                        (title, team1, team2, json.dumps(keys1), json.dumps(keys2), base, _now(), int(named)))
         mid = cur.lastrowid
         self.generate_markets(mid, names)
         if GIVE_TIER_REWARDS:
@@ -1090,14 +1099,15 @@ class Book:
         if set(keys1) & set(keys2):
             raise BookError("A player can't be on both teams.")
         team1, team2 = " ".join(team1.split()) or mu["team1"], " ".join(team2.split()) or mu["team2"]
+        named = mu["named"] or (team1, team2) != (mu["team1"], mu["team2"])  # renamed by the admin: keep it
         title = " ".join(title.split()) or mu["title"]
         old, new = set(mu["players1"]) | set(mu["players2"]), set(keys1) | set(keys2)
         removed, added = old - new, [k for k in keys1 + keys2 if k not in old]
         moved = (set(mu["players1"]) & set(keys2)) | (set(mu["players2"]) & set(keys1))
         with self.db.lock:
             c = self.db.conn
-            c.execute("UPDATE book_matchups SET title = ?, team1 = ?, team2 = ?, players1 = ?, players2 = ? "
-                      "WHERE id = ?", (title, team1, team2, json.dumps(keys1), json.dumps(keys2), matchup_id))
+            c.execute("UPDATE book_matchups SET title = ?, team1 = ?, team2 = ?, players1 = ?, players2 = ?, named = ? "
+                      "WHERE id = ?", (title, team1, team2, json.dumps(keys1), json.dumps(keys2), int(named), matchup_id))
             for side, name in (("team1", team1), ("team2", team2)):
                 c.execute("UPDATE book_selections SET label = ? WHERE side = ? AND market_id IN "
                           "(SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'moneyline')",
@@ -2120,9 +2130,10 @@ class Book:
         scores = None
         first_home = self.assign_sides(mu, game, lines)
         if first_home is not None:
-            # The lineups take the game's team names from here on
-            t1, t2 = (game["home_team"], game["away_team"]) if first_home else (game["away_team"], game["home_team"])
             scores = (game["home_score"], game["away_score"]) if first_home else (game["away_score"], game["home_score"])
+        if first_home is not None and not mu.get("named"):
+            # The lineups take the game's team names from here on (unless the admin named them)
+            t1, t2 = (game["home_team"], game["away_team"]) if first_home else (game["away_team"], game["home_team"])
             with self.db.lock:
                 c = self.db.conn
                 c.execute("UPDATE book_matchups SET team1 = ?, team2 = ? WHERE id = ?", (t1, t2, matchup_id))
