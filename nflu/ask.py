@@ -28,6 +28,7 @@ from pathlib import Path
 import config
 
 from .fantasy import fantasy_points
+from .players import players
 
 
 OFF_TOPIC = "OFF_TOPIC"
@@ -79,7 +80,7 @@ def build_snapshot(db_path: str) -> str:
         conn.execute("PRAGMA query_only = ON")  # belt and braces on top of mode=ro
         names = {r["username_key"]: r["display_name"] for r in conn.execute(
             "SELECT username_key, display_name FROM names")}
-        names.update({ign.lower(): name for name, ign in config.PLAYER_NAMES.items()})
+        names.update({p.roblox_username.lower(): p.name for p in players()})
         games = conn.execute("SELECT id, home_team, home_score, away_team, away_score, played_at "
                              "FROM games ORDER BY played_at DESC, id DESC").fetchall()
         lines_by_game: dict[int, list] = {}
