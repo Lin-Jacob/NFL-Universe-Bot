@@ -93,7 +93,7 @@ def _page(title: str, body: str) -> web.Response:
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "no-referrer",
         "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-                                   "img-src 'self' data:; frame-ancestors 'none'",
+                                   "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
     })
 
 

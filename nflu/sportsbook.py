@@ -14,11 +14,16 @@ is locked and every market the game can answer is settled. Which side of the gam
 played on is worked out from the players (see Book.assign_sides), so the winner settles too.
 Anything left (custom bets, a side it can't tell) is settled by hand on the admin page.
 
+Parlays: a bettor collects picks (one per market) in a slip that's saved with their account, then
+bets them together. The odds multiply; it pays only if every leg wins. A leg that pushes or is
+voided drops out (the rest still count); if every leg drops out, the stake is returned.
+
 Tunable values below can be overridden by adding the same name to config.py.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import secrets
@@ -35,6 +40,7 @@ START_BALANCE: float = getattr(config, "BOOK_START_BALANCE", 10_000)
 # Bookmaker's margin on a two-way market: 0.045 makes an even line about -110 / -110.
 VIG: float = getattr(config, "BOOK_VIG", 0.045)
 MIN_STAKE: float = getattr(config, "BOOK_MIN_STAKE", 1)
+MAX_PARLAY_LEGS: int = getattr(config, "BOOK_MAX_PARLAY_LEGS", 10)
 # Past score totals assumed when fewer than 2 games are stored
 DEFAULT_TOTAL = (28.0, 12.0)
 
@@ -106,6 +112,28 @@ CREATE TABLE IF NOT EXISTS book_bets (
 );
 CREATE INDEX IF NOT EXISTS idx_book_bets_bettor ON book_bets(bettor_id);
 CREATE INDEX IF NOT EXISTS idx_book_bets_sel ON book_bets(selection_id);
+CREATE TABLE IF NOT EXISTS book_parlays (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    bettor_id   INTEGER NOT NULL REFERENCES book_bettors(id) ON DELETE CASCADE,
+    stake       REAL NOT NULL,
+    placed_at   TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',       -- pending | won | lost | void
+    payout      REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS book_parlay_legs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    parlay_id     INTEGER NOT NULL REFERENCES book_parlays(id) ON DELETE CASCADE,
+    selection_id  INTEGER NOT NULL REFERENCES book_selections(id) ON DELETE CASCADE,
+    odds          INTEGER NOT NULL                     -- odds when the parlay was placed
+);
+CREATE INDEX IF NOT EXISTS idx_book_legs_sel ON book_parlay_legs(selection_id);
+-- Picks a bettor is collecting for their next parlay
+CREATE TABLE IF NOT EXISTS book_slip (
+    bettor_id     INTEGER NOT NULL REFERENCES book_bettors(id) ON DELETE CASCADE,
+    selection_id  INTEGER NOT NULL REFERENCES book_selections(id) ON DELETE CASCADE,
+    added_at      TEXT NOT NULL,
+    PRIMARY KEY (bettor_id, selection_id)
+);
 """
 
 
@@ -168,6 +196,10 @@ def to_american(q: float) -> int:
 def price(fair: list[float]) -> list[int]:
     """Odds for each outcome's model chance, with the book's margin spread over them."""
     return [to_american(p * (1 + VIG)) for p in fair]
+
+
+def american_from_decimal(dec: float) -> int:
+    return round((dec - 1) * 100) if dec >= 2 else -round(100 / (dec - 1))
 
 
 def fmt_odds(american: int) -> str:
@@ -346,12 +378,15 @@ class Book:
         self.db.x("DELETE FROM book_bettors WHERE id = ?", (bettor_id,))
 
     def leaderboard(self) -> list[dict]:
+        """Every bettor with money in open bets and their record, singles and parlays together."""
         rows = self.db.q(
+            "WITH x AS (SELECT bettor_id, stake, status FROM book_bets "
+            "           UNION ALL SELECT bettor_id, stake, status FROM book_parlays) "
             "SELECT b.*, "
             "COALESCE(SUM(CASE WHEN x.status = 'pending' THEN x.stake END), 0) AS at_risk, "
-            "COUNT(x.id) AS bets, "
+            "COUNT(x.bettor_id) AS bets, "
             "COALESCE(SUM(x.status = 'won'), 0) AS won, COALESCE(SUM(x.status = 'lost'), 0) AS lost "
-            "FROM book_bettors b LEFT JOIN book_bets x ON x.bettor_id = b.id GROUP BY b.id")
+            "FROM book_bettors b LEFT JOIN x ON x.bettor_id = b.id GROUP BY b.id")
         out = [dict(r, worth=round(r["balance"] + r["at_risk"], 2)) for r in rows]
         out.sort(key=lambda r: (r["worth"], r["balance"]), reverse=True)
         return out
@@ -441,13 +476,74 @@ class Book:
         tm = total_model(self.db)
         line = default_line(tm)
         self._add_total(matchup_id, tm, line)
+        self._player_props(matchup_id, mu["players1"] + mu["players2"], names)
+
+    def _player_props(self, matchup_id: int, keys: list[str], names=lambda k: k, first_sort: int = 10) -> None:
+        """The usual props for these players: fantasy points plus the stats each has recorded."""
         models = Models(self.db)
         rr, _ = analytics.role_ratings(self.db)
-        for i, key in enumerate(mu["players1"] + mu["players2"]):
+        for i, key in enumerate(keys):
             stats = ["fantasy"] + [s for s in (QB_PROPS if models.is_qb(key, rr) else ()) + ALL_PROPS
                                    if models.has_recorded(key, s)]
             for stat in stats:
-                self.add_prop(matchup_id, key, stat, names=names, models=models, sort=10 + i)
+                self.add_prop(matchup_id, key, stat, names=names, models=models, sort=first_sort + i)
+
+    def edit_matchup(self, matchup_id: int, title: str, team1: str, team2: str, keys1: list[str],
+                     keys2: list[str], names=lambda k: k) -> str:
+        """Change a matchup while it's live. Players taken out have their props voided (stakes back),
+        players added get the usual props, and the winner odds are re-priced for the new lineups
+        (bets already placed keep their odds). Returns a summary of what changed."""
+        mu = self.matchup(matchup_id)
+        if not mu:
+            raise BookError("No such matchup.")
+        if mu["status"] in ("settled", "void"):
+            raise BookError("This matchup is already settled.")
+        if not keys1 or not keys2:
+            raise BookError("Each team needs at least one player.")
+        if set(keys1) & set(keys2):
+            raise BookError("A player can't be on both teams.")
+        team1, team2 = " ".join(team1.split()) or mu["team1"], " ".join(team2.split()) or mu["team2"]
+        title = " ".join(title.split()) or mu["title"]
+        old, new = set(mu["players1"]) | set(mu["players2"]), set(keys1) | set(keys2)
+        removed, added = old - new, [k for k in keys1 + keys2 if k not in old]
+        moved = (set(mu["players1"]) & set(keys2)) | (set(mu["players2"]) & set(keys1))
+        with self.db.lock:
+            c = self.db.conn
+            c.execute("UPDATE book_matchups SET title = ?, team1 = ?, team2 = ?, players1 = ?, players2 = ? "
+                      "WHERE id = ?", (title, team1, team2, json.dumps(keys1), json.dumps(keys2), matchup_id))
+            for side, name in (("team1", team1), ("team2", team2)):
+                c.execute("UPDATE book_selections SET label = ? WHERE side = ? AND market_id IN "
+                          "(SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'moneyline')",
+                          (name, side, matchup_id))
+            c.commit()
+        for m in self.db.q("SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'prop' AND player_key IN "
+                           f"({','.join('?' * len(removed))}) AND status IN ('open', 'locked')",
+                           (matchup_id, *removed)) if removed else []:
+            self.void_market(m["id"], "player taken out of the matchup")
+        if added:
+            first = self.db.one("SELECT COALESCE(MAX(sort), 9) + 1 n FROM book_markets WHERE matchup_id = ? "
+                                "AND sort < 90", (matchup_id,))["n"]
+            self._player_props(matchup_id, added, names, first_sort=first)
+        if removed or added or moved:
+            for m in self.db.q("SELECT id FROM book_markets WHERE matchup_id = ? AND kind = 'moneyline' "
+                               "AND status IN ('open', 'locked')", (matchup_id,)):
+                self.update_market(m["id"], None, {}, reprice=True)
+        parts = [f"{len(added)} player{'s' * (len(added) != 1)} added"] if added else []
+        parts += [f"{len(removed)} taken out (their props voided)"] if removed else []
+        parts += [f"{len(moved)} switched teams"] if moved else []
+        return "Matchup saved" + (": " + ", ".join(parts) + ", winner odds re-priced." if parts else ".")
+
+    def version(self) -> str:
+        """Changes whenever anything a bettor sees on the sportsbook changes (odds, lines, status...),
+        so open pages know to refresh."""
+        row = self.db.one(
+            "SELECT (SELECT group_concat(id || ':' || odds || ':' || label || ':' || COALESCE(outcome, ''), ',') "
+            "        FROM book_selections) a, "
+            "       (SELECT group_concat(id || ':' || status || ':' || COALESCE(line, '') || ':' || title, ',') "
+            "        FROM book_markets) b, "
+            "       (SELECT group_concat(id || ':' || status || ':' || title || ':' || team1 || ':' || team2 || ':' "
+            "        || players1 || players2, ',') FROM book_matchups) c")
+        return hashlib.sha256("|".join(str(v) for v in tuple(row)).encode()).hexdigest()[:16]
 
     def _add_total(self, matchup_id: int, model: dict, line: float) -> int:
         po = p_over(model, line)
@@ -580,6 +676,116 @@ class Book:
             "JOIN book_markets m ON m.id = s.market_id JOIN book_matchups mu ON mu.id = m.matchup_id "
             "WHERE b.bettor_id = ? ORDER BY b.id DESC", (bettor_id,))]
 
+    # ------------------------------------------------------------------ parlays
+    def slip(self, bettor_id: int) -> list[dict]:
+        """The picks in a bettor's parlay slip, oldest first, with their current odds and status."""
+        ids = [r["selection_id"] for r in self.db.q("SELECT selection_id FROM book_slip WHERE bettor_id = ? "
+                                                    "ORDER BY added_at, rowid", (bettor_id,))]
+        return [s for sid in ids if (s := self.selection(sid))]
+
+    def slip_add(self, bettor_id: int, sel_id: int) -> None:
+        """Add a pick to the slip. Another pick from the same market is swapped out for it."""
+        s = self.selection(sel_id)
+        if not s:
+            raise BookError("That bet doesn't exist anymore.")
+        if s["matchup_status"] != "open" or s["market_status"] != "open":
+            raise BookError("Betting on this is closed.")
+        with self.db.lock:
+            c = self.db.conn
+            c.execute("DELETE FROM book_slip WHERE bettor_id = ? AND selection_id IN "
+                      "(SELECT id FROM book_selections WHERE market_id = ? AND id != ?)",
+                      (bettor_id, s["market_id"], sel_id))
+            n = c.execute("SELECT COUNT(*) FROM book_slip WHERE bettor_id = ? AND selection_id != ?",
+                          (bettor_id, sel_id)).fetchone()[0]
+            if n >= MAX_PARLAY_LEGS:
+                c.rollback()
+                raise BookError(f"A parlay can have at most {MAX_PARLAY_LEGS} picks.")
+            c.execute("INSERT OR IGNORE INTO book_slip(bettor_id, selection_id, added_at) VALUES(?,?,?)",
+                      (bettor_id, sel_id, _now()))
+            c.commit()
+
+    def slip_remove(self, bettor_id: int, sel_id: int | None = None) -> None:
+        """Take one pick out of the slip, or empty it (sel_id None)."""
+        if sel_id is None:
+            self.db.x("DELETE FROM book_slip WHERE bettor_id = ?", (bettor_id,))
+        else:
+            self.db.x("DELETE FROM book_slip WHERE bettor_id = ? AND selection_id = ?", (bettor_id, sel_id))
+
+    @staticmethod
+    def parlay_decimal(odds: list[int]) -> float:
+        return math.prod(decimal_odds(o) for o in odds)
+
+    def place_parlay(self, bettor_id: int, stake: float, seen: list[tuple[int, int]] | None = None) -> int:
+        """Bet the slip as one parlay. seen = [(selection id, odds)] the bettor was shown; if any pick's
+        odds have changed since, nothing is placed so they can look again."""
+        stake = round(stake, 2)
+        if not stake >= MIN_STAKE:
+            raise BookError(f"The smallest bet is ${MIN_STAKE:,.0f}.")
+        with self.db.lock:
+            c = self.db.conn
+            legs = self.slip(bettor_id)
+            if len(legs) < 2:
+                raise BookError("A parlay needs at least 2 picks. Add more from the games.")
+            closed = [s["label"] for s in legs if s["matchup_status"] != "open" or s["market_status"] != "open"]
+            if closed:
+                raise BookError("Betting closed on " + ", ".join(closed) + ". Remove it to place the parlay.")
+            if seen is not None and sorted(seen) != sorted((s["id"], s["odds"]) for s in legs):
+                raise BookError("Your picks or their odds changed. Check the slip and bet again.")
+            b = c.execute("SELECT balance FROM book_bettors WHERE id = ?", (bettor_id,)).fetchone()
+            if not b or b["balance"] + 1e-9 < stake:
+                raise BookError(f"You only have ${b['balance'] if b else 0:,.2f}.")
+            c.execute("UPDATE book_bettors SET balance = round(balance - ?, 2) WHERE id = ?", (stake, bettor_id))
+            pid = c.execute("INSERT INTO book_parlays(bettor_id, stake, placed_at) VALUES(?,?,?)",
+                            (bettor_id, stake, _now())).lastrowid
+            for s in legs:
+                c.execute("INSERT INTO book_parlay_legs(parlay_id, selection_id, odds) VALUES(?,?,?)",
+                          (pid, s["id"], s["odds"]))
+            c.execute("DELETE FROM book_slip WHERE bettor_id = ?", (bettor_id,))
+            c.commit()
+            return pid
+
+    def parlays_for(self, bettor_id: int) -> list[dict]:
+        out = []
+        for p in self.db.q("SELECT * FROM book_parlays WHERE bettor_id = ? ORDER BY id DESC", (bettor_id,)):
+            d = dict(p)
+            d["legs"] = [dict(r) for r in self.db.q(
+                "SELECT l.odds, s.label, s.outcome, m.title AS market_title, m.result, m.kind, m.player_key, "
+                "m.stat, mu.title AS matchup_title, mu.id AS matchup_id FROM book_parlay_legs l "
+                "JOIN book_selections s ON s.id = l.selection_id JOIN book_markets m ON m.id = s.market_id "
+                "JOIN book_matchups mu ON mu.id = m.matchup_id WHERE l.parlay_id = ? ORDER BY l.id", (p["id"],))]
+            d["decimal"] = self.parlay_decimal([leg["odds"] for leg in d["legs"]]) if d["legs"] else 1.0
+            out.append(d)
+        return out
+
+    def _regrade_parlays(self, c, sel_ids: list[int]) -> None:
+        """Re-work out every parlay with a leg on these selections from its legs' outcomes, and move the
+        difference between the old and new payout to or from the bettor (caller holds the lock).
+
+        Lost as soon as one leg loses; won once every leg is decided, paying the stake times the odds of
+        the winning legs (pushed/voided legs drop out); void (stake back) if no leg won or lost."""
+        if not sel_ids:
+            return
+        marks = ",".join("?" * len(sel_ids))
+        for p in c.execute(f"SELECT DISTINCT p.* FROM book_parlays p JOIN book_parlay_legs l ON l.parlay_id = p.id "
+                           f"WHERE l.selection_id IN ({marks})", sel_ids).fetchall():
+            legs = c.execute("SELECT l.odds, s.outcome FROM book_parlay_legs l JOIN book_selections s "
+                             "ON s.id = l.selection_id WHERE l.parlay_id = ?", (p["id"],)).fetchall()
+            outcomes = [leg["outcome"] for leg in legs]
+            if "lose" in outcomes:
+                status, payout = "lost", 0.0
+            elif None in outcomes:
+                status, payout = "pending", 0.0
+            elif "win" in outcomes:
+                status = "won"
+                payout = round(p["stake"] * self.parlay_decimal([leg["odds"] for leg in legs
+                                                                 if leg["outcome"] == "win"]), 2)
+            else:
+                status, payout = "void", p["stake"]
+            if (status, payout) != (p["status"], p["payout"]):
+                c.execute("UPDATE book_parlays SET status = ?, payout = ? WHERE id = ?", (status, payout, p["id"]))
+                c.execute("UPDATE book_bettors SET balance = round(balance + ?, 2) WHERE id = ?",
+                          (round(payout - p["payout"], 2), p["bettor_id"]))
+
     # --------------------------------------------------------------- settlement
     def _grade(self, market_id: int, outcomes: dict[int, str], result: str | None, status: str = "settled") -> None:
         """Set each selection's outcome and pay its bets (caller checked the market isn't settled)."""
@@ -598,6 +804,7 @@ class Book:
                     if payout:
                         c.execute("UPDATE book_bettors SET balance = round(balance + ?, 2) WHERE id = ?",
                                   (payout, bet["bettor_id"]))
+            self._regrade_parlays(c, list(outcomes))
             c.execute("UPDATE book_markets SET status = ?, result = ? WHERE id = ?", (status, result, market_id))
             c.commit()
         self._maybe_finish(market_id)
@@ -650,6 +857,8 @@ class Book:
                               (bet["payout"], bet["bettor_id"]))
                 c.execute("UPDATE book_bets SET status = 'pending', payout = 0 WHERE id = ?", (bet["id"],))
             c.execute("UPDATE book_selections SET outcome = NULL WHERE market_id = ?", (market_id,))
+            self._regrade_parlays(c, [r["id"] for r in c.execute("SELECT id FROM book_selections WHERE market_id = ?",
+                                                                 (market_id,)).fetchall()])
             c.execute("UPDATE book_markets SET status = 'locked', result = NULL WHERE id = ?", (market_id,))
             c.execute("UPDATE book_matchups SET status = 'locked' WHERE id = (SELECT matchup_id FROM book_markets "
                       "WHERE id = ?) AND status = 'settled'", (market_id,))
