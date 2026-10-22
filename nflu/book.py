@@ -6,8 +6,11 @@ sportsbook.START_BALANCE in fake money):
     GET  /book                     open matchups
     GET  /book/matchups/<id>       every bet on one matchup
     GET  /book/bet/<selection>     bet slip;  POST places the bet
-    GET  /book/parlay              parlay slip (picks collected with the + buttons);  POST places it
+    GET  /book/parlay              parlay slip (picks collected with the + buttons);  POST places the parlay,
+                                   round robins and/or each pick alone
     POST /book/parlay/add/<sel>, /book/parlay/remove/<sel>, /book/parlay/clear
+    POST /book/alt/<market>        bet or slip a line picked on an over/under's slider
+    GET  /book/feed                everyone's parlays and bets;  POST /book/tail/<kind>/<id> copies one
     GET  /book/me                  my balance and bets
     GET  /book/leaderboard         everyone's money
     GET  /book/join;  POST /book/join
@@ -16,7 +19,7 @@ sportsbook.START_BALANCE in fake money):
     POST /book/code                get an account back with its code (older accounts with no password)
 
 Admin (user "admin", password ADMIN_PASSWORD in .env; off when it isn't set):
-    GET  /admin                    login, matchups, create a matchup
+    GET  /admin                    login, house profit/loss, matchups, create a matchup
     GET  /admin/matchups/<id>      edit lines and odds, lock, add props/custom bets, settle
     GET  /admin/bettors            adjust balances
 """
@@ -26,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
+import math
 import os
 import time
 from urllib.parse import urlencode
@@ -35,8 +40,8 @@ from aiohttp import web
 from .db import Database
 from .embeds import Names
 from .site import _e, _page, _time
-from .sportsbook import (MAX_PARLAY_LEGS, START_BALANCE, Book, BookError, american_from_decimal,
-                         bettable_stats, decimal_odds, fmt_odds, stat_label)
+from .sportsbook import (MAX_PARLAY_LEGS, MAX_SLIP_BETS, START_BALANCE, Book, BookError, Models,
+                         american_from_decimal, bettable_stats, decimal_odds, fmt_odds, stat_label)
 
 BETTOR_COOKIE = "nflu_bettor"
 ADMIN_COOKIE = "nflu_admin"
@@ -67,6 +72,32 @@ button.bad{background:#c0392b}
 form.addp{display:inline;margin:0}form.addp button{padding:5px 9px;line-height:1.2}
 form.addp button.in{background:var(--win)}
 .legs td{vertical-align:middle}
+button.pk{display:inline-flex;gap:8px;align-items:baseline;border:1px solid var(--line);border-radius:8px;
+padding:7px 12px;background:var(--chip);color:var(--text);font-weight:400}button.pk:hover{border-color:var(--accent)}
+button.pk b{color:var(--accent);font-variant-numeric:tabular-nums}
+.alt{flex-direction:column;align-items:stretch}.alt .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.alt .ln{font-size:22px;font-weight:700;min-width:70px;font-variant-numeric:tabular-nums}
+.ends{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:-6px}
+input.big{-webkit-appearance:none;appearance:none;width:100%;height:14px;border-radius:7px;background:var(--line);
+margin:16px 0;padding:0;border:none;cursor:pointer}
+input.big::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:36px;height:36px;border-radius:50%;
+background:var(--accent);border:4px solid var(--card);box-shadow:0 1px 6px rgba(0,0,0,.45)}
+input.big::-moz-range-thumb{width:30px;height:30px;border-radius:50%;background:var(--accent);
+border:4px solid var(--card);box-shadow:0 1px 6px rgba(0,0,0,.45)}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.seg label{margin:0!important;position:relative}.seg input{position:absolute;opacity:0;width:1px;height:1px}
+.seg span{display:block;padding:10px 18px;min-width:64px;text-align:center;cursor:pointer;user-select:none}
+.seg label+label span{border-left:1px solid var(--line)}
+.seg input:checked+span{background:var(--muted);color:var(--card);font-weight:700}
+.seg input[value="1"]:checked+span{background:var(--accent);color:#fff}
+.seg input[value="2"]:checked+span{background:#c0392b;color:#fff}
+.seg input:focus-visible+span{outline:2px solid var(--accent)}
+.teams{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0}
+.teams ol{margin:6px 0 0;padding-left:22px;min-height:1.4em}.teams .t1 b{color:var(--accent)}.teams .t2 b{color:#c0392b}
+.tabs{display:flex;gap:6px;margin:0 0 12px}.tabs a{padding:6px 14px;border:1px solid var(--line);border-radius:999px}
+.tabs a.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+button.ad.in{background:var(--win)}
+.opts label{display:flex;gap:8px;align-items:center;margin:4px 0}
 </style>"""
 
 _STATUS = {"open": "Open", "locked": "Betting closed", "settled": "Settled", "void": "Void"}
@@ -81,6 +112,16 @@ function tick(){if(document.hidden)return;fetch('/book/version',{cache:'no-store
 .then(function(d){if(v===null){v=d.v;return;}if(d.v!==v){if(busy()){document.getElementById('live').style.display='block';}
 else{location.reload();}}}).catch(function(){});}
 tick();setInterval(tick,5000);document.addEventListener('visibilitychange',tick);})();</script>"""
+
+
+# Over/under sliders: moving one shows that line's odds and points the buttons at it
+SLIDER_JS = """<script>(function(){function fo(o){return(o>0?'+':'')+o}
+document.querySelectorAll('form.alt').forEach(function(f){var L=JSON.parse(f.dataset.l),slip=JSON.parse(f.dataset.slip),
+r=f.querySelector('input[type=range]');function u(){var x=L[+r.value];f.querySelector('.ln').textContent=x[0];
+f.elements.line.value=x[0];var lb=f.querySelectorAll('.lb'),b=f.querySelectorAll('button.pk b'),ad=f.querySelectorAll('button.ad');
+['Over','Under'].forEach(function(w,j){lb[j].textContent=w+' '+x[0];b[j].textContent=fo(x[1+j]);
+var inn=x[3+j]!==null&&slip.indexOf(x[3+j])>=0;ad[j].textContent=inn?'\u2713':'+';ad[j].className=(inn?'in':'sec')+' ad';});}
+r.addEventListener('input',u);u();});})();</script>"""
 
 
 def _money(v: float) -> str:
@@ -146,6 +187,9 @@ class BookSite:
             web.post("/book/parlay/add/{id}", self.parlay_add),
             web.post("/book/parlay/remove/{id}", self.parlay_remove),
             web.post("/book/parlay/clear", self.parlay_clear),
+            web.post("/book/alt/{id}", self.alt_pick),
+            web.get("/book/feed", self.feed),
+            web.post("/book/tail/{kind}/{id}", self.tail),
             web.get("/book/me", self.me),
             web.get("/book/leaderboard", self.leaderboard),
             web.get("/book/version", self.version),
@@ -207,7 +251,8 @@ class BookSite:
         return (f'<div class="card bar"><span>👋 {_e(bettor["name"])}</span>'
                 f'<span class="money">{_money(bettor["balance"])}</span>'
                 f'<a href="/book">Bets</a><a href="/book/parlay">Parlay slip ({len(self._slip_ids(bettor))})</a>'
-                f'<a href="/book/me">My bets</a><a href="/book/leaderboard">Leaderboard</a>'
+                f'<a href="/book/me">My bets</a><a href="/book/feed">Everyone\'s bets</a>'
+                f'<a href="/book/leaderboard">Leaderboard</a>'
                 f'<form method="post" action="/book/logout" style="margin:0 0 0 auto">'
                 f'{self._hidden(request, BETTOR_COOKIE)}<button class="sec">Log out</button></form></div>')
 
@@ -277,6 +322,7 @@ class BookSite:
         cards, name, ctx = [], self._names(), self._parlay_ctx(request, bettor)
         for mu in self.book.matchups(("open", "locked")):
             markets = self.book.markets(mu["id"])
+            markets = [m for m in markets if not m["parent_id"]]
             main = [m for m in markets if m["kind"] in ("moneyline", "total")]
             n_props = len(markets) - len(main)
             cards.append(
@@ -391,15 +437,26 @@ class BookSite:
         if not mu:
             raise web.HTTPNotFound(text="No such matchup")
         name = self._names()
-        markets = self.book.markets(mu["id"])
+        everything = self.book.markets(mu["id"])
+        alts: dict[int, list[dict]] = {}
+        for m in everything:
+            if m["parent_id"]:
+                alts.setdefault(m["parent_id"], []).append(m)
+        markets = [m for m in everything if not m["parent_id"]]
         groups: dict[str, list[dict]] = {}
         for m in markets:
             head = ("Game" if m["kind"] in ("moneyline", "total") else
                     "Specials" if m["kind"] == "custom" else name(m["player_key"]))
             groups.setdefault(head, []).append(m)
         ctx = self._parlay_ctx(request, bettor)
+        models = Models(self.db)
+
+        def row(m: dict) -> str:
+            if m["kind"] in ("prop", "total") and m["status"] == "open" and mu["status"] == "open":
+                return self._slider_row(m, name, ctx, self.book.ladder(m, models, alts.get(m["id"], [])))
+            return self._market_row(m, mu, name, ctx)
         cards = "".join(f'<div class="card"><h2 style="margin-top:0">{_e(head)}</h2>'
-                        + "".join(self._market_row(m, mu, name, ctx) for m in ms) + "</div>" for head, ms in groups.items())
+                        + "".join(row(m) for m in ms) + "</div>" for head, ms in groups.items())
         lineups = " · ".join(f'<b>{_e(mu[t])}</b>: ' + ", ".join(_e(name(k)) for k in mu[p])
                              for t, p in (("team1", "players1"), ("team2", "players2")))
         body = (self._bar(request, bettor) + _flash(request)
@@ -408,9 +465,63 @@ class BookSite:
                   f'<p class="muted small">{lineups}</p>'
                   f'<p class="small muted">Lines and odds come from each player\'s past games. Props settle on the '
                   f'stat in the game; a player who doesn\'t play has their props voided (stakes returned). '
-                  f'Tap a pick to bet it alone, or <b>+</b> to add it to a <a href="/book/parlay">parlay</a>.</p>'
-                + cards)
+                  f'Tap a pick to bet it alone, or <b>+</b> to add it to a <a href="/book/parlay">parlay</a>. '
+                  f'Drag a slider for other lines: a higher line pays more on the over, less on the under.</p>'
+                + cards + (SLIDER_JS if "data-l=" in cards else ""))
         return self._page(mu["title"], body, live=True)
+
+    def _slider_row(self, m: dict, name, ctx: dict, ladder: list[dict]) -> str:
+        """An over/under with a big slider through its lines; the pick buttons follow the slider."""
+        if len(ladder) < 2:
+            return self._market_row(m, {"status": "open"}, name, ctx)
+        i = next(n for n, r in enumerate(ladder) if r["line"] == m["line"])
+        data = json.dumps([[r["line"], r["over"], r["under"], r["over_id"], r["under_id"]] for r in ladder])
+        cur = ladder[i]
+
+        def pick(side: str) -> str:
+            sid = cur[side + "_id"]
+            inside = sid in ctx["slip"]
+            return (f'<span class="pick-wrap"><button class="pk" name="pick" value="{side}:bet" '
+                    f'title="Bet on this alone"><span class="lb">{side.title()} {cur["line"]:g}</span>'
+                    f'<b>{fmt_odds(cur[side])}</b></button>'
+                    f'<button class="{"in" if inside else "sec"} ad" name="pick" value="{side}:parlay" '
+                    f'title="Add to parlay" style="padding:7px 11px">{"✓" if inside else "+"}</button></span>')
+        return (f'<form class="mk alt" method="post" action="/book/alt/{m["id"]}" data-l="{_e(data)}" '
+                f'data-slip="{_e(json.dumps(sorted(ctx["slip"])))}">{ctx["csrf"]}'
+                f'<input type="hidden" name="next" value="{_e(ctx["next"])}">'
+                f'<input type="hidden" name="line" value="{cur["line"]:g}">'
+                f'<div class="row"><div class="t">{_e(self._title(m, name))}</div>'
+                f'<span class="ln">{cur["line"]:g}</span></div>'
+                f'<input type="range" class="big" min="0" max="{len(ladder) - 1}" value="{i}" step="1" '
+                f'aria-label="Line for {_e(self._title(m, name))}">'
+                f'<div class="ends"><span>{ladder[0]["line"]:g}</span><span>{ladder[-1]["line"]:g}</span></div>'
+                f'<div class="row">{pick("over")} {pick("under")}</div></form>')
+
+    async def alt_pick(self, request: web.Request) -> web.Response:
+        """A pick from an over/under's slider: bet it alone, or add it to (or take it out of) the slip."""
+        bettor = self._require_bettor(request)
+        form = await request.post()
+        self._check_csrf(request, form, BETTOR_COOKIE)
+        nxt = self._safe_next(form.get("next"))
+        side, _, what = str(form.get("pick", "")).partition(":")
+        line = _float(form.get("line"))
+        try:
+            if side not in ("over", "under") or what not in ("bet", "parlay") or line is None:
+                raise BookError("Pick over or under.")
+            m = self.book.market(self.book.alt_market(_int(request.match_info["id"], 0), line))
+            sel = next(x for x in m["selections"] if x["side"] == side)
+            if what == "bet":
+                raise web.HTTPSeeOther(f"/book/bet/{sel['id']}")
+            if sel["id"] in self._slip_ids(bettor):
+                self.book.slip_remove(bettor["id"], sel["id"])
+                msg = f"Took {sel['label']} out of your parlay slip."
+            else:
+                self.book.slip_add(bettor["id"], sel["id"])
+                n = len(self._slip_ids(bettor))
+                msg = f"Added {sel['label']} to your parlay slip ({n} pick{'s' * (n != 1)})."
+        except BookError as e:
+            raise _redirect(nxt, str(e), err=True)
+        raise _redirect(nxt, msg)
 
     async def slip(self, request: web.Request, error: str = "", stake: str = "") -> web.Response:
         bettor = self._require_bettor(request)
@@ -536,7 +647,8 @@ class BookSite:
                 f'<th>Placed</th></tr>{"".join(rows)}</table></div>')
 
     # -------------------------------------------------------------- parlays
-    async def parlay_page(self, request: web.Request, error: str = "", stake: str = "") -> web.Response:
+    async def parlay_page(self, request: web.Request, error: str = "", stake: str = "",
+                          chosen: set[int] | None = None) -> web.Response:
         bettor = self._require_bettor(request)
         legs = self.book.slip(bettor["id"])
         name = self._names()
@@ -559,30 +671,61 @@ class BookSite:
                         f'<button class="sec" title="Remove">✕</button></form></td></tr>')
         dec = self.book.parlay_decimal([s["odds"] for s in legs])
         seen = ",".join(f'{s["id"]}:{s["odds"]}' for s in legs)
-        if len(legs) < 2:
-            form = "<p class='muted'>Add at least one more pick to make a parlay.</p>"
-        else:
-            form = (f'<form class="stack" method="post" action="/book/parlay">{csrf}'
-                    f'<input type="hidden" name="seen" value="{seen}">'
-                    f'<label>Stake ($)<br><input id="stake" name="stake" inputmode="decimal" required '
-                    f'value="{_e(stake)}" placeholder="100"></label>'
-                    f'<div>To win <b id="win">$0.00</b>, paid back <b id="ret">$0.00</b></div>'
-                    f"<button>Place {len(legs)}-leg parlay</button></form>"
-                    f"<script>(function(){{var i=document.getElementById('stake'),d={dec};"
-                    f"function f(v){{return '$'+v.toLocaleString(undefined,{{minimumFractionDigits:2,maximumFractionDigits:2}})}}"
-                    f"function u(){{var s=parseFloat((i.value||'').replace(/[$,]/g,''))||0;"
-                    f"document.getElementById('win').textContent=f(s*(d-1));document.getElementById('ret').textContent=f(s*d);}}"
-                    f"i.addEventListener('input',u);u();}})();</script>")
+        n = len(legs)
+        # For each bet size k: how many bets, and what they pay back per $1 if every pick wins
+        # (the sum over every k-pick combination of its multiplied odds)
+        decs = [decimal_odds(s["odds"]) for s in legs]
+        sizes = {k: (math.comb(n, k), self._sym(decs, k)) for k in range(1, n + 1)}
+        chosen = set(chosen or ()) or {n if n >= 2 else 1}
+
+        def opt(k: int, text: str) -> str:
+            count, _ = sizes[k]
+            return (f'<label><input type="checkbox" name="size" value="{k}"{" checked" if k in chosen else ""}> '
+                    f'{text} <span class="muted small">({count} bet{"s" * (count != 1)})</span></label>')
+        options = ([opt(n, f"<b>{n}-pick parlay</b> {fmt_odds(american_from_decimal(dec))}")] if n >= 2 else [])
+        options += [opt(k, f"Round robin: every {k}-pick parlay") for k in range(n - 1, 1, -1)]
+        options.append(opt(1, "Each pick on its own (straight bets)"))
+        table = json.dumps({k: list(v) for k, v in sizes.items()})
+        form = (f'<form class="stack" method="post" action="/book/parlay">{csrf}'
+                f'<input type="hidden" name="seen" value="{seen}">'
+                f'<div class="opts"><b>Bet</b>{"".join(options)}</div>'
+                f'<label>Stake per bet ($)<br><input id="stake" name="stake" inputmode="decimal" required '
+                f'value="{_e(stake)}" placeholder="100"></label>'
+                f'<label class="small"><input type="checkbox" name="keep" value="1"> Keep these picks in my slip '
+                f'(to bet them again another way)</label>'
+                f'<div><b id="nb">1 bet</b> · total <b id="cost">$0.00</b> · pays back up to <b id="ret">$0.00</b> '
+                f'if every pick wins</div>'
+                f'<button id="go">Place bets</button></form>'
+                f"<script>(function(){{var t={table},i=document.getElementById('stake'),"
+                f"bx=document.querySelectorAll('input[name=size]');"
+                f"function f(v){{return '$'+v.toLocaleString(undefined,{{minimumFractionDigits:2,maximumFractionDigits:2}})}}"
+                f"function u(){{var s=parseFloat((i.value||'').replace(/[$,]/g,''))||0,nb=0,ret=0;"
+                f"bx.forEach(function(b){{if(b.checked){{nb+=t[b.value][0];ret+=t[b.value][1];}}}});"
+                f"document.getElementById('nb').textContent=nb+' bet'+(nb==1?'':'s');"
+                f"document.getElementById('cost').textContent=f(s*nb);document.getElementById('ret').textContent=f(s*ret);"
+                f"document.getElementById('go').textContent=nb?'Place '+nb+' bet'+(nb==1?'':'s')+' ('+f(s*nb)+')':'Pick what to bet';}}"
+                f"i.addEventListener('input',u);bx.forEach(function(b){{b.addEventListener('change',u)}});u();}})();</script>")
         body = (self._bar(request, bettor) + err + "<h1>Parlay slip</h1>"
                 f'<div class="card scroll"><table class="legs">{"".join(rows)}</table></div>'
-                f'<div class="card"><div class="score">{len(legs)} picks · '
-                f'<span class="odds">{fmt_odds(american_from_decimal(dec))}</span></div>'
-                f'<p class="small muted">Decimal {dec:.2f}: a $100 parlay pays back {_money(100 * dec)}. Every pick '
-                f"has to win. A pick that pushes or is voided drops out and the rest still count. Up to "
-                f"{MAX_PARLAY_LEGS} picks, one per bet. You have {_money(bettor['balance'])}.</p>{form}"
-                f'<form method="post" action="/book/parlay/clear" style="margin-top:12px">{csrf}'
-                f'<button class="sec">Clear slip</button></form></div>')
+                f'<div class="card"><div class="score">{n} pick{"s" * (n != 1)}'
+                + (f' · <span class="odds">{fmt_odds(american_from_decimal(dec))}</span>' if n >= 2 else "")
+                + f'</div><p class="small muted">A parlay multiplies the odds of every pick and pays only if they all '
+                  f"win; a pick that pushes or is voided drops out and the rest still count. A round robin bets "
+                  f"every smaller parlay from your picks, so one miss doesn't sink everything. Tick as many as you "
+                  f"like: each is a separate bet of your stake. Up to {MAX_PARLAY_LEGS} picks, one per bet. "
+                  f"You have {_money(bettor['balance'])}.</p>{form}"
+                  f'<form method="post" action="/book/parlay/clear" style="margin-top:12px">{csrf}'
+                  f'<button class="sec">Clear slip</button></form></div>')
         return self._page("Parlay slip", body, live=True)
+
+    @staticmethod
+    def _sym(values: list[float], k: int) -> float:
+        """Sum over every k-item combination of the product of its values."""
+        e = [1.0] + [0.0] * k
+        for v in values:
+            for j in range(k, 0, -1):
+                e[j] += e[j - 1] * v
+        return e[k]
 
     async def _slip_change(self, request: web.Request, fn) -> web.Response:
         bettor = self._require_bettor(request)
@@ -621,13 +764,84 @@ class BookSite:
             sid, _, odds = part.partition(":")
             if _int(sid) is not None and _int(odds) is not None:
                 seen.append((_int(sid), _int(odds)))
+        sizes = [k for x in form.getall("size", []) if (k := _int(x)) is not None]
         try:
             if stake is None:
                 raise BookError("Enter how much to bet.")
-            self.book.place_parlay(bettor["id"], stake, seen)
+            if not sizes and "size" not in form and len(seen) >= 2:
+                sizes = [len(seen)]  # an older page without the options: the whole slip as one parlay
+            if not sizes:
+                raise BookError("Pick what to bet: the parlay, a round robin or each pick alone.")
+            res = self.book.place_slip(bettor["id"], stake, seen, sizes, keep=bool(form.get("keep")))
         except BookError as e:
-            return await self.parlay_page(request, str(e), str(form.get("stake", "")))
-        raise _redirect("/book/me", f"Parlay placed: {_money(stake)}. Good luck!")
+            return await self.parlay_page(request, str(e), str(form.get("stake", "")), set(sizes))
+        parts = ([f"{len(res['parlays'])} parlay{'s' * (len(res['parlays']) != 1)}"] if res["parlays"] else []) + (
+            [f"{len(res['singles'])} straight bet{'s' * (len(res['singles']) != 1)}"] if res["singles"] else [])
+        raise _redirect("/book/parlay" if form.get("keep") else "/book/me",
+                        f"Placed {' and '.join(parts)} of {_money(stake)} ({_money(res['cost'])} in all). Good luck!")
+
+    # ------------------------------------------------------- everyone's bets
+    async def feed(self, request: web.Request) -> web.Response:
+        """Everyone's parlays (or single bets), newest first, each with a Tail button that copies it."""
+        bettor = self._require_bettor(request)
+        show = request.query.get("show", "parlays")
+        show = show if show in ("parlays", "singles", "all") else "parlays"
+        items = [d for d in self.book.feed(150) if show == "all" or d["kind"] == ("parlay" if show == "parlays"
+                                                                                  else "bet")][:60]
+        name, csrf = self._names(), self._hidden(request, BETTOR_COOKIE)
+        icon = {"win": "✅", "lose": "❌", "push": "↩", "void": "↩", None: "⏳"}
+        rows = []
+        for d in items:
+            if d["status"] == "pending":
+                res = f'<span class="muted">Pending · to win {_money(d["stake"] * (d["decimal"] - 1))}</span>'
+            elif d["status"] == "won":
+                res = f'<span class="won">Won {_money(d["payout"] - d["stake"])}</span>'
+            elif d["status"] == "lost":
+                res = f'<span class="lost">Lost {_money(d["stake"])}</span>'
+            else:
+                res = f'<span class="muted">{"Push" if d["status"] == "push" else "Void"}, stake returned</span>'
+            legs = "<br>".join(
+                (f'{icon.get(leg["outcome"], "")} ' if d["kind"] == "parlay" else "")
+                + f'<a href="/book/matchups/{leg["matchup_id"]}">{_e(self._title(leg, name))}</a>: '
+                  f'{_e(leg["label"])} <span class="odds">{fmt_odds(leg["odds"])}</span>' for leg in d["legs"])
+            open_legs = [leg for leg in d["legs"] if leg["market_status"] == "open" and leg["matchup_status"] == "open"]
+            if not open_legs or d["bettor_id"] == bettor["id"]:
+                tail = ""
+            elif d["kind"] == "bet":
+                tail = f'<a class="sel" href="/book/bet/{open_legs[0]["selection_id"]}">Tail</a>'
+            else:
+                tail = (f'<form class="addp" method="post" action="/book/tail/parlay/{d["id"]}">{csrf}'
+                        f'<button title="Copy these picks into your parlay slip">Tail</button></form>')
+            what = (f'{len(d["legs"])}-leg parlay <span class="odds">{fmt_odds(american_from_decimal(d["decimal"]))}'
+                    f'</span><br>' if d["kind"] == "parlay" else "")
+            rows.append(f'<tr><td><b>{_e(d["name"])}</b><br><span class="small muted">{_time(d["placed_at"])}</span></td>'
+                        f'<td class="small">{what}{legs}</td><td class="n">{_money(d["stake"])}</td>'
+                        f'<td>{res}</td><td>{tail}</td></tr>')
+        tabs = "".join(f'<a href="/book/feed?show={k}"{" class=on" if k == show else ""}>{lbl}</a>'
+                       for k, lbl in (("parlays", "Parlays"), ("singles", "Single bets"), ("all", "All")))
+        table = ('<div class="card scroll"><table><tr><th>Bettor</th><th>Picks</th><th class="n">Stake</th>'
+                 f'<th>Result</th><th></th></tr>{"".join(rows)}</table></div>' if rows
+                 else "<p class='muted'>Nobody has placed one yet.</p>")
+        body = (self._bar(request, bettor) + _flash(request) + "<h1>Everyone's bets</h1><div class='tabs'>"
+                + tabs + "</div><p class='small muted'>Like someone's bet? <b>Tail</b> copies its picks (the ones "
+                  "still open) at today's odds: a parlay goes into your parlay slip, a single bet opens its bet "
+                  "slip. You pick your own stake.</p>" + table)
+        return self._page("Everyone's bets", body, live=True)
+
+    async def tail(self, request: web.Request) -> web.Response:
+        bettor = self._require_bettor(request)
+        form = await request.post()
+        self._check_csrf(request, form, BETTOR_COOKIE)
+        kind = request.match_info["kind"]
+        try:
+            legs = self.book.tail(bettor["id"], "parlay" if kind == "parlay" else "bet",
+                                  _int(request.match_info["id"], 0))
+        except BookError as e:
+            raise _redirect("/book/feed", str(e), err=True)
+        if len(legs) == 1 and kind != "parlay":
+            raise web.HTTPSeeOther(f"/book/bet/{legs[0]['id']}")
+        raise _redirect("/book/parlay", f"Tailed: your slip now has those {len(legs)} picks at today's odds. "
+                                        f"Pick your stake.")
 
     def _leader_table(self, rows: list[dict]) -> str:
         if not rows:
@@ -698,51 +912,96 @@ class BookSite:
             return self._page("Admin", self._login_html())
         name = self._names()
         hand = ' <b class="lost">· some bets need settling by hand</b>'
+        per = self.book.matchup_house()
+
+        def pl(v: float) -> str:
+            return f'<span class="{"won" if v >= 0 else "lost"}">{"+" if v > 0 else ""}{_money(v)}</span>'
         rows = "".join(
             f'<tr><td><a href="/admin/matchups/{mu["id"]}">#{mu["id"]} {_e(mu["title"])}</a><br>'
             f'<span class="small muted">{_e(mu["team1"])}: {_e(", ".join(name(k) for k in mu["players1"]))}<br>'
             f'{_e(mu["team2"])}: {_e(", ".join(name(k) for k in mu["players2"]))}</span></td>'
             f'<td>{_STATUS[mu["status"]]}{" · game #" + str(mu["game_id"]) if mu["game_id"] else ""}'
             f'{hand if mu["game_id"] and mu["status"] in ("open", "locked") else ""}</td>'
+            f'<td class="n">{pl(per.get(mu["id"], 0))}</td>'
             f'<td class="small muted">{_time(mu["created_at"])}</td></tr>'
             for mu in self.book.matchups())
-        table = (f'<div class="card scroll"><table><tr><th>Matchup</th><th>Status</th><th>Created</th></tr>'
+        h = self.book.house()
+        house = (f'<div class="card"><h2 style="margin-top:0">House</h2>'
+                 f'<span class="stat"><b>{pl(h["total"]["profit"])}</b><span class="muted">house profit/loss</span></span>'
+                 f'<span class="stat"><b>{pl(h["singles"]["profit"])}</b><span class="muted">on single bets</span></span>'
+                 f'<span class="stat"><b>{pl(h["parlays"]["profit"])}</b><span class="muted">on parlays</span></span>'
+                 f'<span class="stat"><b>{_money(h["total"]["open"])}</b><span class="muted">in open bets</span></span>'
+                 f'<span class="stat"><b>{_money(h["total"]["exposure"])}</b><span class="muted">owed if every open '
+                 f'bet wins</span></span>'
+                 f'<p class="small muted">Profit/loss is the stakes the book kept minus the winnings it paid, on '
+                 f'settled bets ({h["total"]["n"]} bets, {_money(h["total"]["handle"])} wagered in all). Money '
+                 f'given out on the Bettors page isn\'t counted.</p></div>')
+        table = (f'<div class="card scroll"><table><tr><th>Matchup</th><th>Status</th>'
+                 f'<th class="n" title="On single bets; parlays are only in the total">House P/L</th><th>Created</th></tr>'
                  f"{rows}</table></div>" if rows else "<p class='muted'>No matchups yet.</p>")
         pick = self._pick_table()
         create = (f'<div class="card"><h2 style="margin-top:0">New matchup</h2>'
                   f'<form method="post" action="/admin/matchups">{self._hidden(request, ADMIN_COOKIE)}'
                   f'<div class="inline" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">'
                   f'<input name="title" placeholder="Title (optional)"></div>'
-                  f'<p class="small muted">Put each player on Team 1 or Team 2. When the game comes in, the bot '
-                  f"works out which side each team played from its players and settles the winner.</p>"
+                  f'<p class="small muted">Put each player on Team 1 or Team 2. The lists show each team in the '
+                  f"order you picked, and that's the order it keeps (the first pick names the team). When the game "
+                  f"comes in, the bot works out which side each team played from its players and settles the "
+                  f"winner.</p>"
                   f'{pick}'
                   f'<p class="small muted">Players with no games yet (comma-separated names):</p>'
                   f'<div style="display:flex;gap:8px;flex-wrap:wrap"><input name="extra1" placeholder="Team 1 extras">'
                   f'<input name="extra2" placeholder="Team 2 extras"></div>'
                   f'<p><button>Create with auto-generated odds</button></p></form></div>')
-        body = self._admin_bar(request) + _flash(request) + "<h1>Matchups</h1>" + table + create
+        body = self._admin_bar(request) + _flash(request) + house + "<h1>Matchups</h1>" + table + create
         return self._page("Admin", body)
 
     def _pick_table(self, mu: dict | None = None) -> str:
-        """Out / Team 1 / Team 2 radio buttons for every player (and anyone already in the matchup)."""
+        """Every player (and anyone already in the matchup) with a big Out / Team 1 / Team 2 switch, and
+        each team's list in the order players were put on it. That order is kept: the first player
+        picked names the team ("Team <name>") and the lineups are listed that way."""
         name, names = self._names(), Names(self.db)
         on = {k: "1" for k in mu["players1"]} | {k: "2" for k in mu["players2"]} if mu else {}
         people = {u.lower(): names.dashed(u) for u in self.db.known_usernames()}
         people.update({k: name(k) for k in on if k not in people})
+        t1, t2 = (mu["team1"], mu["team2"]) if mu else ("Team 1", "Team 2")
         rows = "".join(
-            f'<tr><td>{_e(label)}</td><td>'
+            f'<tr data-k="{_e(k)}" data-n="{_e(name(k))}"><td style="vertical-align:middle">{_e(label)}</td>'
+            f'<td><div class="seg">'
             + "".join(f'<label><input type="radio" name="p:{_e(k)}" value="{v}"'
-                      f'{" checked" if on.get(k, "") == v else ""}> {lbl}</label>'
-                      for v, lbl in (("", "Out"), ("1", mu["team1"] if mu else "Team 1"),
-                                     ("2", mu["team2"] if mu else "Team 2")))
-            + "</td></tr>" for k, label in sorted(people.items(), key=lambda kv: name(kv[0]).lower()))
-        return f'<div class="scroll"><table class="pick">{rows}</table></div>'
+                      f'{" checked" if on.get(k, "") == v else ""}><span>{_e(lbl)}</span></label>'
+                      for v, lbl in (("", "Out"), ("1", t1), ("2", t2)))
+            + "</div></td></tr>" for k, label in sorted(people.items(), key=lambda kv: name(kv[0]).lower()))
+        order = (mu["players1"] + mu["players2"]) if mu else []
+        lists = "".join(f'<div class="card t{i}" style="margin:0"><b>{_e(t)}</b><ol id="pk{i}">'
+                        + "".join(f"<li>{_e(name(k))}</li>" for k in (mu[f"players{i}"] if mu else []))
+                        + "</ol></div>" for i, t in ((1, t1), (2, t2)))
+        return (f'<div class="pickbox"><input type="hidden" name="order" value="{_e(",".join(order))}">'
+                f'<div class="teams">{lists}</div>'
+                f'<input class="find" type="search" placeholder="Find a player" style="margin:4px 0 8px">'
+                f'<div class="scroll" style="max-height:60vh;overflow:auto"><table class="pick">{rows}</table></div>'
+                "</div><script>(function(){var box=document.currentScript.previousElementSibling,"
+                "ord=box.querySelector('input[name=order]'),o=ord.value?ord.value.split(','):[];"
+                "function draw(){[1,2].forEach(function(t){var ol=box.querySelector('#pk'+t);ol.innerHTML='';"
+                "o.forEach(function(k){var tr=box.querySelector('tr[data-k=\"'+CSS.escape(k)+'\"]'),"
+                "c=tr&&tr.querySelector('input:checked');if(c&&c.value==t){var li=document.createElement('li');"
+                "li.textContent=tr.dataset.n;ol.appendChild(li);}});});ord.value=o.join(',');}"
+                "box.querySelectorAll('.seg input').forEach(function(i){i.addEventListener('change',function(){"
+                "var k=i.closest('tr').dataset.k;o=o.filter(function(x){return x!==k});if(i.value)o.push(k);draw();});});"
+                "box.querySelector('.find').addEventListener('input',function(e){var q=e.target.value.toLowerCase();"
+                "box.querySelectorAll('tr[data-k]').forEach(function(tr){tr.style.display="
+                "tr.textContent.toLowerCase().indexOf(q)>=0?'':'none';});});draw();})();</script>")
 
     def _sides(self, form) -> dict[str, list[str]]:
+        """Team 1 and Team 2 keys from a pick chart, in the order they were picked (the hidden "order"
+        field the page keeps), then any extras typed in."""
         sides: dict[str, list[str]] = {"1": [], "2": []}
         for k, v in form.items():
             if k.startswith("p:") and v in sides:
                 sides[v].append(k[2:])
+        order = {k: i for i, k in enumerate(str(form.get("order", "")).split(",")) if k}
+        for team in sides:
+            sides[team].sort(key=lambda k: order.get(k, len(order)))  # stable: unlisted keep table order
         for team in ("1", "2"):
             for raw in str(form.get(f"extra{team}", "")).split(","):
                 if raw.strip():
@@ -781,14 +1040,20 @@ class BookSite:
                     if m["kind"] != "custom" else "")
             toggle = ('<button class="sec" name="action" value="lock">Close betting</button>' if m["status"] == "open"
                       else '<button class="sec" name="action" value="open">Reopen betting</button>')
+            by_value = ("" if m["kind"] not in ("prop", "total") else
+                        f'<input class="n" name="value" placeholder="Result" title="What the stat came to">'
+                        f'<button class="sec" name="action" value="settle_value" title="Settles this line'
+                        f'{"" if m["parent_id"] else " and every alt line of it"} from the number">'
+                        f'Settle at number</button>')
             buttons = (f'<button name="action" value="save">Save</button>{auto}{toggle}'
                        f'<select name="winner">{winner}<option value="push">Push (refund all)</option></select>'
-                       f'<button class="sec" name="action" value="settle">Settle</button>'
+                       f'<button class="sec" name="action" value="settle">Settle</button>{by_value}'
                        f'<button class="sec" name="action" value="void">Void</button>'
                        f'<button class="bad" name="action" value="delete">Delete</button>')
         result = f'<div class="small muted">{_e(m["result"])}</div>' if m["result"] else ""
         return (f'<form class="mk" method="post" action="/admin/markets/{m["id"]}">{self._hidden(request, ADMIN_COOKIE)}'
-                f'<div class="t"><b>{_e(self._title(m, name))}</b> <span class="chip">{_STATUS[m["status"]]}</span>{result}</div>'
+                f'<div class="t">{"↳ <span class=small>Alt line</span> " if m["parent_id"] else ""}'
+                f'<b>{_e(self._title(m, name))}</b> <span class="chip">{_STATUS[m["status"]]}</span>{result}</div>'
                 f'<div style="display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center">{line}{odds}</div>'
                 f'<div style="display:flex;flex-wrap:wrap;gap:6px">{buttons}</div></form>')
 
@@ -800,7 +1065,10 @@ class BookSite:
         name = self._names()
         csrf = self._hidden(request, ADMIN_COOKIE)
         act = f'/admin/matchups/{mu["id"]}'
-        markets = self.book.markets(mu["id"])
+        everything = self.book.markets(mu["id"])
+        markets = []
+        for m in (m for m in everything if not m["parent_id"]):  # each main market, then its alt lines
+            markets += [m] + sorted((a for a in everything if a["parent_id"] == m["id"]), key=lambda a: a["line"])
         live = mu["status"] in ("open", "locked")
         controls = []
         if live:
@@ -870,7 +1138,8 @@ class BookSite:
                 + self._leftover(mu, markets, name) + "".join(controls) + edit
                 + '<div class="card"><h2 style="margin-top:0">Markets</h2>'
                   '<p class="small muted">Edit a line and press Auto-price to re-price it from the stats, or type '
-                  'your own odds and Save. Changes go live right away: bettors\' open pages update within a few '
+                  'your own odds and Save. Alt lines show up under their bet once someone picks one on a slider; '
+                  'closing, voiding or settling a bet at a number does its alt lines too. Changes go live right away: bettors\' open pages update within a few '
                   'seconds. They apply to new bets only; bets already placed keep their odds.</p>'
                 + "".join(self._admin_market(request, m, name) for m in markets) + "</div>")
         return self._page(f'Admin: {mu["title"]}', body)
@@ -978,6 +1247,12 @@ class BookSite:
                 w = form.get("winner")
                 self.book.settle_market(m["id"], None if w == "push" else _int(w, -1))
                 msg = f"{m['title']}: settled and paid out."
+            elif action == "settle_value":
+                value = _float(form.get("value"))
+                if value is None:
+                    raise BookError("Type the number the stat came to, then press Settle at number.")
+                n = self.book.settle_value(m["id"], value)
+                msg = f"{m['title']}: settled at {value:g} ({n} line{'s' * (n != 1)}) and paid out."
             elif action == "void":
                 self.book.void_market(m["id"])
                 msg = f"{m['title']}: voided, stakes returned."

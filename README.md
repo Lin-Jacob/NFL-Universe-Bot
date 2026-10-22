@@ -108,6 +108,16 @@ The site can only show data, never change it, and never shows the webhook secret
 
 **Parlays:** the **+** next to any pick adds it to the bettor's parlay slip (`/book/parlay`, saved with their account). Two to ten picks, one per bet; the odds multiply and it pays only if every pick wins. A pick that pushes or is voided drops out and the rest still count. Parlays settle by themselves as their picks settle, and undoing a pick's settlement re-grades them.
 
+**Alt lines (the slider):** every over/under on a matchup page has a big slider through other lines, priced from the same model (a higher line pays more on the over). Picking a line bets it alone or adds it to the slip like any pick. Betting a new line creates a hidden "alt" market under the main one that settles with the game. On the admin page, alt lines show under their bet once someone has picked one. **Settle at number** settles a bet and all its alt lines from what the stat came to.
+
+**Several bets from one slip:** the slip can place the full parlay, round robins (every smaller parlay, e.g. all 2-pick parlays from 4 picks) and each pick as a straight bet, all at once, with the stake on each bet. Up to `BOOK_MAX_SLIP_BETS` (100) bets at once. Tick **Keep these picks** to bet the same picks again another way.
+
+**Everyone's bets:** `/book/feed` lists everyone's parlays (tabs for single bets and all). **Tail** copies a bet's still-open picks at today's odds: a parlay goes into your slip, and a single bet opens its bet slip.
+
+**House profit/loss:** the top of `/admin` shows what the book has won or lost on settled bets (singles and parlays), the money in open bets, and what it would owe if every open bet won. Each matchup row shows the profit/loss on its single bets. Money handed out on the Bettors page isn't counted.
+
+**Picking teams:** the admin's player chart has a big Out / Team 1 / Team 2 switch per player. Above it, each team is listed in the order you picked the players, and that order is saved; the first pick names the team.
+
 **Admin page:** `/admin`, username `admin`, password `ADMIN_PASSWORD` from `.env` (add the line `ADMIN_PASSWORD=...` and restart; without it the admin page stays off). There you:
 
 1. **Create a matchup:** mark each player Team 1 / Team 2 (or type names of players with no games yet). Teams are called "Team <first player>" until the game comes in. Odds are generated from the stored stats right away:
