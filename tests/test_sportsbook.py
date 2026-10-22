@@ -583,3 +583,53 @@ def test_spread_and_game_props(tmp_path):
     assert [s["outcome"] for s in sp["selections"]] == ["win", "lose"]  # won by 25, more than 6.5
     assert book.market(tds["id"])["result"].startswith("5 touchdowns")
     assert [s["outcome"] for s in book.market(two["id"])["selections"]] == ["win", "lose"]
+
+
+def test_inside_betting(tmp_path):
+    db = _db(tmp_path)
+    db.set_name("QBOne", "Zork")
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    other = book.create_matchup("", ["qbtwo"], ["wrtwo"])
+    zork, _ = book.create_bettor("Zork")  # QBOne's account, matched by name
+    fan, _ = book.create_bettor("Fan")
+    assert book.player_key(zork) == "qbone" and book.player_key(fan) is None
+    ms = book.markets(mid)
+    ml = ms[0]
+    spread = next(m for m in ms if m["kind"] == "spread")
+    total = next(m for m in ms if m["kind"] == "total" and not m["stat"])
+    own = next(m for m in ms if m["kind"] == "prop" and m["player_key"] == "qbone")
+    mate = next(m for m in ms if m["kind"] == "prop" and m["player_key"] == "wrone")
+    rival = next(m for m in ms if m["kind"] == "prop" and m["player_key"] == "qbtwo")
+    side = {s["side"]: s["id"] for s in ml["selections"]}
+    for sel, why in ((own["selections"][1]["id"], "own stats"), (side["team2"], "against your own team"),
+                     (spread["selections"][1]["id"], "against your own team"),
+                     (total["selections"][0]["id"], "totals")):
+        try:
+            book.place_bet(zork, sel, 10)
+            raise AssertionError("insider bet went through")
+        except BookError as e:
+            assert why in str(e)
+        try:
+            book.slip_add(zork, sel)
+            raise AssertionError("insider pick went into the slip")
+        except BookError:
+            pass
+        book.place_bet(fan, sel, 10)  # everyone else can
+    for sel in (side["team1"], mate["selections"][0]["id"], rival["selections"][1]["id"],
+                book.markets(other)[0]["selections"][1]["id"]):
+        book.place_bet(zork, sel, 10)
+    assert set(book.blocked(zork, mid)) >= {own["selections"][0]["id"], side["team2"]} and not book.blocked(fan, mid)
+
+    # an account the admin says isn't a player is free; one linked by hand is limited
+    book.set_player_key(zork, "")
+    bid = book.place_bet(zork, own["selections"][1]["id"], 25)
+    book.set_player_key(zork, None)
+    flagged = book.insider_bets(mid)
+    assert [(b["kind"], b["id"]) for b in flagged] == [("bet", bid)] and "own stats" in flagged[0]["why"]
+    before = book.bettor(zork)["balance"]
+    book.void_bet("bet", bid)
+    assert book.bettor(zork)["balance"] == before + 25 and not book.insider_bets(mid)
+    book.settle_market(own["id"], own["selections"][1]["id"])  # settling leaves the voided bet alone
+    book.unsettle_market(own["id"])
+    assert book.bettor(zork)["balance"] == before + 25

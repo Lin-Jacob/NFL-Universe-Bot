@@ -111,6 +111,7 @@ touch-action:none;user-select:none;font-weight:700}#betcard .bh span{flex:1}
 #betcard .bb{padding:12px;display:grid;gap:10px}#betcard .pick{font-size:18px;font-weight:700}
 #betcard .q{display:flex;gap:6px;flex-wrap:wrap}#betcard .q button{padding:4px 10px}
 #betcard .bm{min-height:1.2em}
+.sel.locked{opacity:.55;cursor:not-allowed}
 #cartbtn{position:fixed;right:16px;bottom:16px;z-index:40;border-radius:999px;padding:12px 18px;
 box-shadow:0 6px 20px rgba(0,0,0,.3);background:var(--chip);color:var(--text);border:1px solid var(--line)}
 #cartbtn.has{background:var(--accent);color:#fff;border-color:var(--accent)}
@@ -195,7 +196,8 @@ if(!d.ok){location.href='/book/bet/'+id;return;}sel=d;$('.mt').textContent=d.mat
 $('.pick').innerHTML='';$('.pick').append(d.label+' ');var o=document.createElement('span');o.className='odds';
 o.textContent=fo(d.odds);$('.pick').append(o);$('.bal').textContent=f(d.balance);$('.ad').textContent=d.in_slip?
 '\\u2713 In your parlay slip':'+ Add to parlay';$('.ad').disabled=d.in_slip;msg('');
-$('.go').disabled=!d.open;if(!d.open)msg('Betting on this is closed.',true);c.style.display='block';place();upd();$('.st').focus();});}
+$('.go').disabled=!d.open||!!d.why;if(d.why){$('.ad').disabled=true;msg(d.why,true);}
+else if(!d.open)msg('Betting on this is closed.',true);c.style.display='block';place();upd();$('.st').focus();});}
 document.addEventListener('click',function(e){var a=e.target.closest('a.sel[href^="/book/bet/"]');
 if(a&&!e.ctrlKey&&!e.metaKey){e.preventDefault();open(a.getAttribute('href').split('/').pop());return;}
 var b=e.target.closest('form.alt button[value$=":bet"]');if(b){e.preventDefault();var fm=new FormData(b.form);
@@ -439,12 +441,17 @@ class BookSite:
 
     def _parlay_ctx(self, request: web.Request, bettor) -> dict:
         """What the + (add to parlay) buttons on a page need."""
+        blocked: dict[int, str] = {}
+        for mu in self.book.matchups(("open", "locked")):
+            blocked.update(self.book.blocked(bettor["id"], mu["id"]))
         return {"csrf": self._hidden(request, BETTOR_COOKIE), "next": request.path,
-                "slip": self._slip_ids(bettor)}
+                "slip": self._slip_ids(bettor), "blocked": blocked}
 
     @staticmethod
     def _sel_button(s: dict, open_: bool, ctx: dict | None = None) -> str:
         inner = f'<span>{_e(s["label"])}</span><b>{fmt_odds(s["odds"])}</b>'
+        if open_ and ctx and (why := ctx["blocked"].get(s["id"])):
+            return f'<span class="sel locked" title="{_e(why)}">🔒 {inner}</span>'
         if open_:
             link = f'<a class="sel" href="/book/bet/{s["id"]}" title="Bet on this alone">{inner}</a>'
             if not ctx:
@@ -654,7 +661,8 @@ class BookSite:
         side = {k: "1" for k in mu["players1"]} | {k: "2" for k in mu["players2"]}
 
         def row(m: dict) -> str:
-            if m["kind"] in ("prop", "total") and m["status"] == "open" and mu["status"] == "open":
+            if (m["kind"] in ("prop", "total") and m["status"] == "open" and mu["status"] == "open"
+                    and not any(x["id"] in ctx["blocked"] for x in m["selections"])):
                 html = self._slider_row(m, name, ctx, self.book.ladder(m, models, alts.get(m["id"], [])))
             else:
                 html = self._market_row(m, mu, name, ctx)
@@ -665,6 +673,10 @@ class BookSite:
         cards = "".join(f'<div class="card fg"><h2 style="margin-top:0">{_e(head)}</h2>'
                         + "".join(row(m) for m in ms) + "</div>" for head, ms in groups.items())
         lineups = self._lineups(mu, name)
+        if ctx["blocked"].keys() & {x["id"] for m in markets for x in m["selections"]}:
+            lineups += ('<div class="msg">🔒 You\'re playing in this game, so the picks you could sway are '
+                        'locked: your own stats, the other team winning or covering, and the game\'s totals. '
+                        'Everything else is open.</div>')
         tools = self._filter_bar("Search players or stats, e.g. passing yards",
                                  [("", "All"), ("game", "Game"), ("prop", "Player props"), ("custom", "Specials")],
                                  [("", "Both teams"), ("1", mu["team1"]), ("2", mu["team2"])])
@@ -767,6 +779,7 @@ class BookSite:
             "ok": True, "id": s["id"], "label": s["label"], "odds": s["odds"], "decimal": decimal_odds(s["odds"]),
             "title": self._title(s), "matchup": f'#{s["matchup_id"]} {s["matchup_title"]}',
             "open": s["matchup_status"] == "open" and s["market_status"] == "open",
+            "why": self.book._insider(bettor["id"], s),
             "in_slip": s["id"] in self._slip_ids(bettor), "balance": bettor["balance"]},
             headers={"Cache-Control": "no-store"})
 
@@ -792,6 +805,8 @@ class BookSite:
             raise web.HTTPNotFound(text="No such bet")
         dec = decimal_odds(s["odds"])
         open_ = s["matchup_status"] == "open" and s["market_status"] == "open"
+        if open_ and (why := self.book._insider(bettor["id"], s)):
+            error, open_ = error or why, False
         err = f'<div class="msg err">{_e(error)}</div>' if error else ""
         inside = s["id"] in self._slip_ids(bettor)
         parlay = ("" if not open_ else
@@ -1376,6 +1391,18 @@ class BookSite:
             markets += [m] + sorted((a for a in everything if a["parent_id"] == m["id"]), key=lambda a: a["line"])
         live = mu["status"] in ("open", "locked")
         controls = []
+        if inside := self.book.insider_bets(mu["id"]):
+            rows = "".join(
+                f'<tr><td>{_e(b["name"])}</td><td class="small">{_e(b["label"])}'
+                f'{" (in a parlay)" if b["kind"] == "parlay" else ""}<br><span class="muted">{_e(b["why"])}</span></td>'
+                f'<td class="n">{_money(b["stake"])}</td><td><form class="inline" style="margin:0" method="post" '
+                f'action="{act}">{csrf}<input type="hidden" name="bet" value="{b["kind"]}:{b["id"]}">'
+                f'<button class="bad" name="action" value="void_bet">Void (refund)</button></form></td></tr>'
+                for b in inside)
+            controls.append(f'<div class="card"><h2 style="margin-top:0">⚠️ Inside bets</h2><p class="small muted">'
+                            f'Open bets by players in this game on things they control, placed before the rules '
+                            f'stopped them or before the player was put in the lineup. Void one to cancel it and '
+                            f'give the stake back.</p><div class="scroll"><table>{rows}</table></div></div>')
         if live:
             controls.append(
                 f'<form class="inline" method="post" action="{act}">{csrf}'
@@ -1499,6 +1526,10 @@ class BookSite:
                 self.book.delete_matchup(mid)
                 raise _redirect("/admin", f"Deleted matchup #{mid} ({mu['title']}); open bets on it were refunded "
                                           f"and the matchups after it moved up a number.")
+            elif action == "void_bet":
+                kind, _, bid = str(form.get("bet", "")).partition(":")
+                self.book.void_bet(kind, _int(bid, 0))
+                msg = "Bet voided; the stake was returned."
             elif action == "auto":
                 self.book.set_auto_settle(mid, not mu["auto_settle"])
                 msg = "Auto-settle turned " + ("off." if mu["auto_settle"] else "on.")
@@ -1584,8 +1615,22 @@ class BookSite:
     async def admin_bettors(self, request: web.Request) -> web.Response:
         self._need_admin(request)
         csrf = self._hidden(request, ADMIN_COOKIE)
+        name, names = self._names(), Names(self.db)
+        everyone = sorted(((u.lower(), names.dashed(u)) for u in self.db.known_usernames()),
+                          key=lambda kv: name(kv[0]).lower())
+
+        def plays_as(r) -> str:
+            auto = self.book.player_key(r["id"]) if r["player_key"] is None else None
+            opts = [("auto", f"Auto: {name(auto)}" if auto else "Auto: not a player"), ("none", "Not a player")]
+            cur = "auto" if r["player_key"] is None else "none" if not r["player_key"] else r["player_key"]
+            opts += everyone
+            return (f'<form class="inline" style="margin:0" method="post" action="/admin/bettors/{r["id"]}">{csrf}'
+                    f'<select name="player" aria-label="League player">'
+                    + "".join(f'<option value="{_e(k)}"{" selected" if k == cur else ""}>{_e(lbl)}</option>'
+                              for k, lbl in opts)
+                    + '</select><button class="sec" name="action" value="player">Save</button></form>')
         rows = "".join(
-            f'<tr><td>{_e(r["name"])}</td><td class="n">{_money(r["balance"])}</td>'
+            f'<tr><td>{_e(r["name"])}</td><td>{plays_as(r)}</td><td class="n">{_money(r["balance"])}</td>'
             f'<td class="n">{_money(r["at_risk"])}</td><td class="n">{r["bets"]}</td>'
             f'<td><form class="inline" style="margin:0" method="post" action="/admin/bettors/{r["id"]}">{csrf}'
             f'<input class="n" name="amount" placeholder="+500"><button name="action" value="adjust">Add</button>'
@@ -1597,7 +1642,10 @@ class BookSite:
                 "<p class='muted small'>Add money with a positive amount, take it away with a negative one. "
                 "Set password resets a bettor's password if they forgot it. "
                 "Deleting a bettor removes their bets too.</p>"
-                + (f'<div class="card scroll"><table><tr><th>Name</th><th class="n">Balance</th>'
+                "<p class='muted small'><b>Plays as</b> is the league player an account belongs to. That player "
+                "can't bet on their own stats, against their own team, or on the totals of a game they play in. "
+                "Auto matches the account's name to a league player (PLAYER_NAMES or /admin setname).</p>"
+                + (f'<div class="card scroll"><table><tr><th>Name</th><th>Plays as</th><th class="n">Balance</th>'
                    f'<th class="n">In open bets</th><th class="n">Bets</th><th></th></tr>{rows}</table></div>'
                    if rows else "<p class='muted'>Nobody has joined yet.</p>"))
         return self._page("Bettors", body)
@@ -1612,6 +1660,12 @@ class BookSite:
         if form.get("action") == "delete":
             self.book.delete_bettor(b["id"])
             raise _redirect("/admin/bettors", f"Deleted {b['name']}.")
+        if form.get("action") == "player":
+            v = str(form.get("player", "auto"))
+            self.book.set_player_key(b["id"], None if v == "auto" else "" if v == "none" else v.lower())
+            who = self.book.player_key(b["id"])
+            raise _redirect("/admin/bettors", f"{b['name']} plays as {self._names()(who)}." if who
+                            else f"{b['name']} isn't a league player.")
         if form.get("action") == "password":
             try:
                 self.book.set_password(b["id"], str(form.get("password", "")))

@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 import config
 
 from . import analytics
+from . import players as league
 from .db import Database
 from .stats import STATS, label
 
@@ -66,6 +67,13 @@ TD_STATS = ("rush_tds", "rec_tds", "def_tds", "kick_return_tds", "punt_return_td
 # Props created automatically for each player in a new matchup (only stats they have recorded)
 QB_PROPS = ("pass_yards", "pass_tds", "interceptions", "pass_completions")
 ALL_PROPS = ("receptions", "rec_yards", "any_td", "tackles", "sacks", "def_ints", "pass_deflections")
+# Inside betting: a league player's sportsbook account can't bet on what they control. Each rule can
+# be turned off in config.py. Other bettors are never affected.
+BLOCK_OWN_PROPS: bool = getattr(config, "BOOK_BLOCK_OWN_PROPS", True)            # their own stats, over or under
+BLOCK_BET_AGAINST_SELF: bool = getattr(config, "BOOK_BLOCK_BET_AGAINST_SELF", True)  # the other team's winner/spread
+BLOCK_OWN_GAME_PROPS: bool = getattr(config, "BOOK_BLOCK_OWN_GAME_PROPS", True)  # totals and game props of their game
+BLOCK_TEAMMATE_PROPS: bool = getattr(config, "BOOK_BLOCK_TEAMMATE_PROPS", False)  # a teammate's stats
+
 # Game bets on what both teams do together, over/unders settled from the whole game's stat sheet.
 # Keys start "g:" (a market's stat); the sheet has no extra points or 2-point conversions, so
 # "Points after touchdowns" is worked out from the final score.
@@ -193,6 +201,13 @@ def ensure_schema(db: Database) -> None:
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_code ON book_bettors(code)")
         if "password" not in {r["name"] for r in c.execute("PRAGMA table_info(book_bettors)")}:
             c.execute("ALTER TABLE book_bettors ADD COLUMN password TEXT")
+        if "player_key" not in {r["name"] for r in c.execute("PRAGMA table_info(book_bettors)")}:
+            # The league player an account belongs to: NULL = worked out from its name, '' = nobody
+            c.execute("ALTER TABLE book_bettors ADD COLUMN player_key TEXT")
+        for table in ("book_bets", "book_parlays"):
+            if "admin_void" not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
+                # Voided by the admin (an inside bet): settling and undoing leave it alone
+                c.execute(f"ALTER TABLE {table} ADD COLUMN admin_void INTEGER NOT NULL DEFAULT 0")
         if "parent_id" not in {r["name"] for r in c.execute("PRAGMA table_info(book_markets)")}:
             c.execute("ALTER TABLE book_markets ADD COLUMN parent_id INTEGER")
         for r in c.execute("SELECT id FROM book_bettors WHERE code IS NULL").fetchall():
@@ -970,6 +985,100 @@ class Book:
             c.commit()
 
     # --------------------------------------------------------------------- bets
+    # ------------------------------------------------------------ inside betting
+    def player_key(self, bettor_id: int) -> str | None:
+        """The league player whose account this is: set by the admin, else the league player (config
+        PLAYER_NAMES) or named player (/admin setname) with the account's name, else None."""
+        b = self.bettor(bettor_id)
+        if not b:
+            return None
+        if b["player_key"] is not None:
+            return b["player_key"] or None
+        if p := league.find(b["name"]):
+            return p.roblox_username.lower()
+        row = self.db.one("SELECT username_key FROM names WHERE lower(display_name) = lower(?)", (b["name"],))
+        return row["username_key"] if row else None
+
+    def set_player_key(self, bettor_id: int, key: str | None) -> None:
+        """None = work it out from the name again; "" = not a league player."""
+        self.db.x("UPDATE book_bettors SET player_key = ? WHERE id = ?", (key, bettor_id))
+
+    @staticmethod
+    def insider_reason(key: str | None, s: dict, mu: dict) -> str | None:
+        """Why the player `key` may not take pick `s` (a selection with its market's kind, player and
+        side) in matchup `mu`, or None. Only matchups they play in are limited."""
+        if not key:
+            return None
+        team = "team1" if key in mu["players1"] else "team2" if key in mu["players2"] else None
+        if team is None:
+            return None
+        kind = s["kind"]
+        if kind == "prop":
+            if s["player_key"] == key and BLOCK_OWN_PROPS:
+                return "You can't bet on your own stats."
+            mates = mu["players1"] if team == "team1" else mu["players2"]
+            if s["player_key"] in mates and BLOCK_TEAMMATE_PROPS:
+                return "You can't bet on a teammate's stats."
+            return None
+        if kind in ("moneyline", "spread"):
+            return "You can't bet against your own team." if s["side"] != team and BLOCK_BET_AGAINST_SELF else None
+        if kind in ("total", "yesno") and BLOCK_OWN_GAME_PROPS:
+            return "You're playing in this game, so you can't bet on its totals or game props."
+        return None
+
+    def _insider(self, bettor_id: int, s: dict) -> str | None:
+        return self.insider_reason(self.player_key(bettor_id), s, self.matchup(s["matchup_id"]))
+
+    def blocked(self, bettor_id: int, matchup_id: int) -> dict[int, str]:
+        """Selection id -> why this bettor can't take it, for every pick in a matchup (alt lines too)."""
+        key, mu = self.player_key(bettor_id), self.matchup(matchup_id)
+        if not key or not mu or key not in mu["players1"] + mu["players2"]:
+            return {}
+        out = {}
+        for r in self.db.q("SELECT s.id, s.side, m.kind, m.player_key FROM book_selections s JOIN book_markets m "
+                           "ON m.id = s.market_id WHERE m.matchup_id = ?", (matchup_id,)):
+            if why := self.insider_reason(key, dict(r), mu):
+                out[r["id"]] = why
+        return out
+
+    def insider_bets(self, matchup_id: int) -> list[dict]:
+        """Open bets in this matchup that break the inside-betting rules (placed before the rules, or
+        before the admin put the bettor in the lineup): {"kind", "id", "name", "stake", "label", "why"}."""
+        mu = self.matchup(matchup_id)
+        out = []
+        rows = self.db.q(
+            "SELECT 'bet' AS bk, b.id, b.bettor_id, b.stake, u.name, s.label, s.side, m.kind, m.player_key, "
+            "m.title FROM book_bets b JOIN book_bettors u ON u.id = b.bettor_id JOIN book_selections s "
+            "ON s.id = b.selection_id JOIN book_markets m ON m.id = s.market_id WHERE m.matchup_id = ? "
+            "AND b.status = 'pending' UNION ALL "
+            "SELECT 'parlay', p.id, p.bettor_id, p.stake, u.name, s.label, s.side, m.kind, m.player_key, m.title "
+            "FROM book_parlays p JOIN book_parlay_legs l ON l.parlay_id = p.id JOIN book_bettors u "
+            "ON u.id = p.bettor_id JOIN book_selections s ON s.id = l.selection_id JOIN book_markets m "
+            "ON m.id = s.market_id WHERE m.matchup_id = ? AND p.status = 'pending'", (matchup_id, matchup_id))
+        keys: dict[int, str | None] = {}
+        seen = set()
+        for r in rows:
+            if r["bettor_id"] not in keys:
+                keys[r["bettor_id"]] = self.player_key(r["bettor_id"])
+            why = self.insider_reason(keys[r["bettor_id"]], dict(r), mu)
+            if why and (r["bk"], r["id"]) not in seen:
+                seen.add((r["bk"], r["id"]))
+                out.append({"kind": r["bk"], "id": r["id"], "name": r["name"], "stake": r["stake"],
+                            "label": f'{r["title"]}: {r["label"]}', "why": why})
+        return out
+
+    def void_bet(self, kind: str, bet_id: int) -> None:
+        """Cancel one open bet or parlay and give the stake back."""
+        table = "book_parlays" if kind == "parlay" else "book_bets"
+        with self.db.lock:
+            c = self.db.conn
+            b = c.execute(f"SELECT * FROM {table} WHERE id = ?", (bet_id,)).fetchone()
+            if not b or b["status"] != "pending":
+                raise BookError("That bet isn't open anymore.")
+            c.execute(f"UPDATE {table} SET status = 'void', payout = stake, admin_void = 1 WHERE id = ?", (bet_id,))
+            c.execute("UPDATE book_bettors SET balance = round(balance + ?, 2) WHERE id = ?", (b["stake"], b["bettor_id"]))
+            c.commit()
+
     def place_bet(self, bettor_id: int, sel_id: int, stake: float, seen_odds: int | None = None) -> int:
         stake = round(stake, 2)
         if not stake >= MIN_STAKE:
@@ -981,6 +1090,8 @@ class Book:
                 raise BookError("That bet doesn't exist anymore.")
             if s["matchup_status"] != "open" or s["market_status"] != "open":
                 raise BookError("Betting on this is closed.")
+            if why := self._insider(bettor_id, s):
+                raise BookError(why)
             if seen_odds is not None and seen_odds != s["odds"]:
                 raise BookError(f"The odds changed to {fmt_odds(s['odds'])}. Check them and bet again.")
             b = c.execute("SELECT balance FROM book_bettors WHERE id = ?", (bettor_id,)).fetchone()
@@ -1014,6 +1125,8 @@ class Book:
             raise BookError("That bet doesn't exist anymore.")
         if s["matchup_status"] != "open" or s["market_status"] != "open":
             raise BookError("Betting on this is closed.")
+        if why := self._insider(bettor_id, s):
+            raise BookError(why)
         with self.db.lock:
             c = self.db.conn
             c.execute("DELETE FROM book_slip WHERE bettor_id = ? AND selection_id IN "
@@ -1073,6 +1186,10 @@ class Book:
             closed = [s["label"] for s in legs if s["matchup_status"] != "open" or s["market_status"] != "open"]
             if closed:
                 raise BookError("Betting closed on " + ", ".join(closed) + ". Remove it to place your bets.")
+            barred = [s["label"] for s in legs if self._insider(bettor_id, s)]
+            if barred:
+                raise BookError("You can't bet on " + ", ".join(barred) + " (you play in that game). "
+                                "Remove it to place your bets.")
             if seen is not None and sorted(seen) != sorted((s["id"], s["odds"]) for s in legs):
                 raise BookError("Your picks or their odds changed. Check the slip and bet again.")
             n_bets = self.slip_bets(len(legs), sizes)
@@ -1118,6 +1235,9 @@ class Book:
                 and s["matchup_status"] == "open" and s["market_status"] == "open"]
         if not legs:
             raise BookError("Betting has closed on every pick in that bet.")
+        legs = [s for s in legs if not self._insider(bettor_id, s)]
+        if not legs:
+            raise BookError("You play in that game, so you can't tail those picks.")
         with self.db.lock:
             c = self.db.conn
             c.execute("DELETE FROM book_slip WHERE bettor_id = ?", (bettor_id,))
@@ -1207,7 +1327,7 @@ class Book:
             return
         marks = ",".join("?" * len(sel_ids))
         for p in c.execute(f"SELECT DISTINCT p.* FROM book_parlays p JOIN book_parlay_legs l ON l.parlay_id = p.id "
-                           f"WHERE l.selection_id IN ({marks})", sel_ids).fetchall():
+                           f"WHERE l.selection_id IN ({marks}) AND NOT p.admin_void", sel_ids).fetchall():
             legs = c.execute("SELECT l.odds, s.outcome FROM book_parlay_legs l JOIN book_selections s "
                              "ON s.id = l.selection_id WHERE l.parlay_id = ?", (p["id"],)).fetchall()
             outcomes = [leg["outcome"] for leg in legs]
@@ -1310,7 +1430,7 @@ class Book:
         with self.db.lock:
             c = self.db.conn
             for bet in c.execute("SELECT b.* FROM book_bets b JOIN book_selections s ON s.id = b.selection_id "
-                                 "WHERE s.market_id = ? AND b.status != 'pending'", (market_id,)).fetchall():
+                                 "WHERE s.market_id = ? AND b.status != 'pending' AND NOT b.admin_void", (market_id,)).fetchall():
                 if bet["payout"]:
                     c.execute("UPDATE book_bettors SET balance = round(balance - ?, 2) WHERE id = ?",
                               (bet["payout"], bet["bettor_id"]))
