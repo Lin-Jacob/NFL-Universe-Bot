@@ -158,27 +158,32 @@ t.classList.add('new')});});}).catch(function(){});}
 tick();setInterval(tick,4000);document.addEventListener('visibilitychange',tick);})();</script>"""
 
 
-# Over/under sliders: moving one shows that line's odds and points the buttons at it
+# Over/under and spread sliders: moving one shows that line's odds and points the buttons at it
+# (a spread's form has data-n, the two team names; its line is team 1's handicap)
 SLIDER_JS = """<script>(function(){function fo(o){return(o>0?'+':'')+o}
-document.querySelectorAll('form.alt').forEach(function(f){
-var r=f.querySelector('input[type=range]');function u(){var L=JSON.parse(f.dataset.l),slip=JSON.parse(f.dataset.slip),x=L[+r.value];f.querySelector('.ln').textContent=x[0];
+document.querySelectorAll('form.alt').forEach(function(f){var N=f.dataset.n?JSON.parse(f.dataset.n):null;
+var r=f.querySelector('input[type=range]');function u(){var L=JSON.parse(f.dataset.l),slip=JSON.parse(f.dataset.slip),x=L[+r.value];
+f.querySelector('.ln').textContent=N?fo(x[0]):x[0];
 f.elements.line.value=x[0];var lb=f.querySelectorAll('.lb'),b=f.querySelectorAll('button.pk b'),ad=f.querySelectorAll('button.ad');
-['Over','Under'].forEach(function(w,j){lb[j].textContent=w+' '+x[0];b[j].textContent=fo(x[1+j]);
+['Over','Under'].forEach(function(w,j){lb[j].textContent=N?N[j]+' '+fo(j?-x[0]:x[0]):w+' '+x[0];b[j].textContent=fo(x[1+j]);
 var inn=x[3+j]!==null&&slip.indexOf(x[3+j])>=0;ad[j].textContent=inn?'\u2713':'+';ad[j].className=(inn?'in':'sec')+' ad';});}
 r.addEventListener('input',u);u();});})();</script>"""
 
 
 # Search box + filter buttons (see BookSite._filter_bar)
 FILTER_JS = """<script>(function(){var bar=document.currentScript.previousElementSibling,q=bar.querySelector('.fq'),
-t=bar.querySelector('.ft'),n=bar.querySelector('.fn'),kind='';
-function run(){var s=q.value.trim().toLowerCase(),tm=t?t.value:'',shown=0,all=document.querySelectorAll('.fr');
-all.forEach(function(r){var ok=(!kind||r.dataset.k===kind)&&(!tm||r.dataset.t===tm)&&
+t=bar.querySelector('.ft'),pl=bar.querySelector('.fp'),n=bar.querySelector('.fn'),kind='';
+function team(){if(!pl)return;var tm=t.value;pl.querySelectorAll('option[data-t]').forEach(function(o){
+o.hidden=o.disabled=!!tm&&o.dataset.t!==tm;});if(pl.selectedOptions[0]&&pl.selectedOptions[0].hidden)pl.value='';}
+function run(){var s=q.value.trim().toLowerCase(),tm=t?t.value:'',p=pl?pl.value:'',shown=0,all=document.querySelectorAll('.fr');
+all.forEach(function(r){var ok=(!kind||r.dataset.k===kind)&&(!tm||r.dataset.t===tm)&&(!p||r.dataset.p===p)&&
 s.split(/\\s+/).every(function(w){return r.dataset.q.indexOf(w)>=0});r.style.display=ok?'':'none';if(ok)shown++;});
 document.querySelectorAll('.fg').forEach(function(g){g.style.display=g.querySelector('.fr:not([style*="none"])')?'':'none'});
-n.textContent=(s||kind||tm)?shown+' of '+all.length:'';}
+n.textContent=(s||kind||tm||p)?shown+' of '+all.length:'';}
 bar.querySelectorAll('[data-f]').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();
 kind=a.dataset.f;bar.querySelectorAll('[data-f]').forEach(function(b){b.className=b===a?'on':''});run();});});
-q.addEventListener('input',run);if(t)t.addEventListener('change',run);})();</script>"""
+q.addEventListener('input',run);if(t)t.addEventListener('change',function(){team();run();});
+if(pl)pl.addEventListener('change',run);})();</script>"""
 
 # The bet card: tapping odds opens a small card you can drag anywhere (it remembers where) to bet
 # without leaving the page. Links still work without JavaScript (they open /book/bet/<id>).
@@ -677,7 +682,7 @@ class BookSite:
         groups: dict[str, list[dict]] = {}
         for m in markets:
             head = ("Game" if m["kind"] in ("moneyline", "spread") or (m["kind"] == "total" and not m["stat"]) else
-                    "Game props" if m["kind"] in ("total", "yesno") else
+                    "Game props" if m["kind"] in ("total", "yesno", "exact", "margin", "leader") else
                     "Specials" if m["kind"] == "custom" else name(m["player_key"]))
             groups.setdefault(head, []).append(m)
         ctx = self._parlay_ctx(request, bettor)
@@ -686,14 +691,15 @@ class BookSite:
         side = {k: "1" for k in mu["players1"]} | {k: "2" for k in mu["players2"]}
 
         def row(m: dict) -> str:
-            if (m["kind"] in ("prop", "total") and m["status"] == "open" and mu["status"] == "open"
+            if (m["kind"] in ("prop", "total", "spread") and not m["parent_id"] and m["status"] == "open" and mu["status"] == "open"
                     and not any(x["id"] in ctx["blocked"] or x["boost_from"] is not None for x in m["selections"])):
                 html = self._slider_row(m, name, ctx, self.book.ladder(m, models, alts.get(m["id"], [])))
             else:
                 html = self._market_row(m, mu, name, ctx)
-            kind = "game" if m["kind"] in ("moneyline", "spread", "total", "yesno") else m["kind"]
+            kind = "game" if m["kind"] in ("moneyline", "spread", "total", "yesno", "exact", "margin", "leader") else m["kind"]
             text = " ".join([self._title(m, name)] + [x["label"] for x in m["selections"]]).lower()
             return (f'<div class="fr" data-k="{kind}" data-t="{side.get(m["player_key"], "")}" '
+                    f'data-p="{_e(m["player_key"] or "")}" '
                     f'data-q="{_e(text)}">{html}</div>')
         cards = "".join(f'<div class="card fg"><h2 style="margin-top:0">{_e(head)}</h2>'
                         + "".join(row(m) for m in ms) + "</div>" for head, ms in groups.items())
@@ -707,7 +713,8 @@ class BookSite:
                         'locked. Everything else is open.</div>')
         tools = self._filter_bar("Search players or stats, e.g. passing yards",
                                  [("", "All"), ("game", "Game"), ("prop", "Player props"), ("custom", "Specials")],
-                                 [("", "Both teams"), ("1", mu["team1"]), ("2", mu["team2"])])
+                                 [("", "Both teams"), ("1", mu["team1"]), ("2", mu["team2"])],
+                                 [(k, name(k), t) for t in ("1", "2") for k in mu[f"players{t}"]])
         body = (self._bar(request, bettor) + _flash(request)
                 + f'<p class="small"><a href="/book">← all games</a></p><h1>#{mu["id"]} {_e(mu["title"])} '
                   f'<span class="chip">{_STATUS[mu["status"]]}</span></h1>'
@@ -715,7 +722,7 @@ class BookSite:
                   f'<p class="small muted">Lines and odds come from each player\'s past games. Props settle on the '
                   f'stat in the game; a player who doesn\'t play has their props voided (stakes returned). '
                   f'Tap a pick to bet it alone, or <b>+</b> to add it to a <a href="/book/parlay">parlay</a>. '
-                  f'Drag a slider for other lines: a higher line pays more on the over, less on the under.</p>'
+                  f'Drag a slider for other lines: a higher line pays more on the over, less on the under, and a bigger handicap pays more on a spread.</p>'
                 + tools + cards + (SLIDER_JS if "data-l=" in cards else ""))
         return self._page(mu["title"], body, live=True)
 
@@ -726,41 +733,55 @@ class BookSite:
                            for t, p in (("team1", "players1"), ("team2", "players2")))
 
     @staticmethod
-    def _filter_bar(placeholder: str, kinds: list[tuple[str, str]], teams: list[tuple[str, str]] | None = None) -> str:
-        """Search box and filter buttons over the page's .fr rows (data-q text, data-k kind, data-t team);
-        a .fg card whose rows are all hidden hides too."""
+    def _filter_bar(placeholder: str, kinds: list[tuple[str, str]], teams: list[tuple[str, str]] | None = None,
+                    players: list[tuple[str, str, str]] | None = None) -> str:
+        """Search box and filter buttons over the page's .fr rows (data-q text, data-k kind, data-t team,
+        data-p player); a .fg card whose rows are all hidden hides too. The player dropdown
+        ((key, name, team) each) lists the chosen team's players, or everyone when no team is picked."""
         chips = "".join(f'<a href="#" data-f="{k}"{" class=on" if not k else ""}>{_e(lbl)}</a>' for k, lbl in kinds)
         team = ("" if not teams else '<select class="ft" aria-label="Team">'
                 + "".join(f'<option value="{k}">{_e(lbl)}</option>' for k, lbl in teams) + "</select>")
+        if players:
+            team += ('<select class="fp" aria-label="Player"><option value="">All players</option>'
+                     + "".join(f'<option value="{_e(k)}" data-t="{t}">{_e(lbl)}</option>' for k, lbl, t in players)
+                     + "</select>")
         return (f'<div class="card filters"><input class="fq" type="search" placeholder="{_e(placeholder)}" '
                 f'aria-label="Search"><div class="tabs" style="margin:0">{chips}</div>{team}'
                 f'<span class="small muted fn"></span></div>' + FILTER_JS)
 
     def _slider_row(self, m: dict, name, ctx: dict, ladder: list[dict]) -> str:
-        """An over/under with a big slider through its lines; the pick buttons follow the slider."""
+        """An over/under or spread with a big slider through its lines; the pick buttons follow the slider."""
         if len(ladder) < 2:
             return self._market_row(m, {"status": "open"}, name, ctx)
         i = next(n for n, r in enumerate(ladder) if r["line"] == m["line"])
         data = json.dumps([[r["line"], r["over"], r["under"], r["over_id"], r["under_id"]] for r in ladder])
         cur = ladder[i]
+        teams = None
+        if m["kind"] == "spread":  # labels like the spread's own: "Bats -3.5" / "Cats +3.5"
+            teams = [x["label"].rsplit(" ", 1)[0] for s in ("team1", "team2")
+                     for x in m["selections"] if x["side"] == s]
+        fmt = (lambda v: f"{v:+g}") if teams else (lambda v: f"{v:g}")
 
         def pick(side: str) -> str:
             sid = cur[side + "_id"]
             inside = sid in ctx["slip"]
+            label = (f"{teams[0]} {cur['line']:+g}" if side == "over" else f"{teams[1]} {-cur['line']:+g}") \
+                if teams else f"{side.title()} {cur['line']:g}"
             return (f'<span class="pick-wrap"><button class="pk" name="pick" value="{side}:bet" '
-                    f'title="Bet on this alone"><span class="lb">{side.title()} {cur["line"]:g}</span>'
+                    f'title="Bet on this alone"><span class="lb">{_e(label)}</span>'
                     f'<b>{fmt_odds(cur[side])}</b></button>'
                     f'<button class="{"in" if inside else "sec"} ad" name="pick" value="{side}:parlay" '
                     f'title="Add to parlay" style="padding:7px 11px">{"✓" if inside else "+"}</button></span>')
         return (f'<form class="mk alt" method="post" action="/book/alt/{m["id"]}" data-l="{_e(data)}" '
-                f'data-slip="{_e(json.dumps(sorted(ctx["slip"])))}">{ctx["csrf"]}'
+                f'data-slip="{_e(json.dumps(sorted(ctx["slip"])))}"'
+                + (f' data-n="{_e(json.dumps(teams))}"' if teams else "") + f'>{ctx["csrf"]}'
                 f'<input type="hidden" name="next" value="{_e(ctx["next"])}">'
                 f'<input type="hidden" name="line" value="{cur["line"]:g}">'
                 f'<div class="row"><div class="t">{_e(self._title(m, name))}</div>'
-                f'<span class="ln">{cur["line"]:g}</span></div>'
+                f'<span class="ln">{fmt(cur["line"])}</span></div>'
                 f'<input type="range" class="big" min="0" max="{len(ladder) - 1}" value="{i}" step="1" '
                 f'aria-label="Line for {_e(self._title(m, name))}">'
-                f'<div class="ends"><span>{ladder[0]["line"]:g}</span><span>{ladder[-1]["line"]:g}</span></div>'
+                f'<div class="ends"><span>{fmt(ladder[0]["line"])}</span><span>{fmt(ladder[-1]["line"])}</span></div>'
                 f'<div class="row">{pick("over")} {pick("under")}</div></form>')
 
     async def alt_pick(self, request: web.Request) -> web.Response:
@@ -775,6 +796,8 @@ class BookSite:
             if side not in ("over", "under") or what not in ("bet", "parlay") or line is None:
                 raise BookError("Pick over or under.")
             m = self.book.market(self.book.alt_market(_int(request.match_info["id"], 0), line))
+            if m["kind"] == "spread":  # the slider's buttons are team 1 / team 2 on a spread
+                side = {"over": "team1", "under": "team2"}[side]
             sel = next(x for x in m["selections"] if x["side"] == side)
             if what == "bet":
                 if _ajax(request):
@@ -1606,7 +1629,10 @@ class BookSite:
                    else f'<button name="action" value="open">Reopen betting</button>')
                 + f'<button class="sec" name="action" value="auto">'
                   f'{"Turn off" if mu["auto_settle"] else "Turn on"} auto-settle</button>'
-                  f'<button class="sec" name="action" value="void">Void everything (refund)</button></form>')
+                  f'<button class="sec" name="action" value="void">Void everything (refund)</button>'
+                  f'<button class="sec" name="action" value="refresh" title="For games made before an update: adds '
+                  f'any newer kinds of bets this game is missing. Nothing already here changes.">'
+                  f'Add newer bet types</button></form>')
             games = "".join(f'<option value="{g["id"]}">#{g["id"]} {_e(g["home_team"])} {g["home_score"]} – '
                             f'{g["away_score"]} {_e(g["away_team"])}</option>' for g in self.db.recent_games(25))
             controls.append(
@@ -1742,6 +1768,9 @@ class BookSite:
             elif action == "auto":
                 self.book.set_auto_settle(mid, not mu["auto_settle"])
                 msg = "Auto-settle turned " + ("off." if mu["auto_settle"] else "on.")
+            elif action == "refresh":
+                n = self.book.add_missing_markets(mid, self._names())
+                msg = f"Added {n} new bet{'s' * (n != 1)}." if n else "This game already has every kind of bet."
             elif action == "void":
                 self.book.void_matchup(mid)
                 msg = "Matchup voided; every stake was returned."
