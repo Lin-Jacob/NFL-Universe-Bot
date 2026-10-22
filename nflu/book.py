@@ -697,11 +697,13 @@ class BookSite:
         if not self._is_admin(request):
             return self._page("Admin", self._login_html())
         name = self._names()
+        hand = ' <b class="lost">· some bets need settling by hand</b>'
         rows = "".join(
             f'<tr><td><a href="/admin/matchups/{mu["id"]}">#{mu["id"]} {_e(mu["title"])}</a><br>'
             f'<span class="small muted">{_e(mu["team1"])}: {_e(", ".join(name(k) for k in mu["players1"]))}<br>'
             f'{_e(mu["team2"])}: {_e(", ".join(name(k) for k in mu["players2"]))}</span></td>'
-            f'<td>{_STATUS[mu["status"]]}{" · game #" + str(mu["game_id"]) if mu["game_id"] else ""}</td>'
+            f'<td>{_STATUS[mu["status"]]}{" · game #" + str(mu["game_id"]) if mu["game_id"] else ""}'
+            f'{hand if mu["game_id"] and mu["status"] in ("open", "locked") else ""}</td>'
             f'<td class="small muted">{_time(mu["created_at"])}</td></tr>'
             for mu in self.book.matchups())
         table = (f'<div class="card scroll"><table><tr><th>Matchup</th><th>Status</th><th>Created</th></tr>'
@@ -865,13 +867,24 @@ class BookSite:
                   f'<div class="card">{lineups}<span class="small">{auto if live else ""}'
                   f'{" Settled from game #" + str(mu["game_id"]) + "." if mu["game_id"] else ""} '
                   f'<a href="/book/matchups/{mu["id"]}">Bettor view →</a></span></div>'
-                + "".join(controls) + edit
+                + self._leftover(mu, markets, name) + "".join(controls) + edit
                 + '<div class="card"><h2 style="margin-top:0">Markets</h2>'
                   '<p class="small muted">Edit a line and press Auto-price to re-price it from the stats, or type '
                   'your own odds and Save. Changes go live right away: bettors\' open pages update within a few '
                   'seconds. They apply to new bets only; bets already placed keep their odds.</p>'
                 + "".join(self._admin_market(request, m, name) for m in markets) + "</div>")
         return self._page(f'Admin: {mu["title"]}', body)
+
+    def _leftover(self, mu: dict, markets: list[dict], name) -> str:
+        """Warning for bets the game couldn't settle on its own (who won when the bot can't tell which
+        side each lineup played on, custom bets): nobody is paid on them until they're settled here."""
+        left = [m for m in markets if m["status"] in ("open", "locked")]
+        if not mu["game_id"] or not left:
+            return ""
+        return (f'<div class="card" style="border-color:#c0392b"><b class="lost">Game #{mu["game_id"]} settled '
+                f'the rest, but these still need settling by hand</b> (pick the result and press Settle below; '
+                f'nobody is paid on them until you do): '
+                + ", ".join(_e(self._title(m, name)) for m in left) + "</div>")
 
     async def admin_matchup_action(self, request: web.Request) -> web.Response:
         self._need_admin(request)

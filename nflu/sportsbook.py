@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import secrets
 from collections import defaultdict
@@ -35,6 +36,8 @@ import config
 from . import analytics
 from .db import Database
 from .stats import STATS, label
+
+log = logging.getLogger(__name__)
 
 START_BALANCE: float = getattr(config, "BOOK_START_BALANCE", 10_000)
 # Bookmaker's margin on a two-way market: 0.045 makes an even line about -110 / -110.
@@ -960,33 +963,48 @@ class Book:
         for m in self.markets(matchup_id):
             if m["status"] in ("settled", "void"):
                 continue
-            sels = {s["side"]: s["id"] for s in m["selections"]}
-            if m["kind"] in ("prop", "total"):
-                if m["kind"] == "total":
-                    value, what = game["home_score"] + game["away_score"], "points"
-                else:
-                    ln = lines.get(m["player_key"])
-                    if ln is None:
-                        self._grade(m["id"], {sid: "void" for sid in sels.values()},
-                                    f"Void: didn't play in game #{game_id}, stakes returned", status="void")
-                        settled += 1
-                        continue
-                    value, what = round(stat_value(ln, m["stat"]), 2), stat_label(m["stat"])
-                over = "win" if value > m["line"] else "lose" if value < m["line"] else "push"
-                under = {"win": "lose", "lose": "win", "push": "push"}[over]
-                self._grade(m["id"], {sels["over"]: over, sels["under"]: under},
-                            f"{value:g} {what} in game #{game_id}")
-                settled += 1
-            elif m["kind"] == "moneyline" and scores:
-                s1, s2 = scores
-                o1 = "win" if s1 > s2 else "lose" if s1 < s2 else "push"
-                o2 = {"win": "lose", "lose": "win", "push": "push"}[o1]
-                self._grade(m["id"], {sels["team1"]: o1, sels["team2"]: o2},
-                            f"{mu['team1']} {s1} – {s2} {mu['team2']} (game #{game_id})")
+            try:
+                done = self._settle_one(m, game, game_id, lines, scores, mu)
+            except Exception:  # one bad market mustn't stop the rest from paying out
+                log.exception("Couldn't settle market %s from game %s", m["id"], game_id)
+                done = False
+            if done:
                 settled += 1
             else:
                 left.append(m["title"])
         return {"settled": settled, "left": left}
+
+    def _settle_one(self, m: dict, game, game_id: int, lines: dict[str, dict], scores, mu: dict) -> bool:
+        """Grade one market from a game. False if the game can't answer it (settle it by hand)."""
+        sels = {s["side"]: s["id"] for s in m["selections"]}
+        if m["kind"] in ("prop", "total"):
+            if m["kind"] == "total":
+                value, what = game["home_score"] + game["away_score"], "points"
+            else:
+                ln = lines.get(m["player_key"])
+                if ln is None:
+                    self._grade(m["id"], {sid: "void" for sid in sels.values()},
+                                f"Void: didn't play in game #{game_id}, stakes returned", status="void")
+                    return True
+                value, what = round(stat_value(ln, m["stat"]), 2), stat_label(m["stat"])
+            over = "win" if value > m["line"] else "lose" if value < m["line"] else "push"
+            under = {"win": "lose", "lose": "win", "push": "push"}[over]
+            self._grade(m["id"], {sels["over"]: over, sels["under"]: under},
+                        f"{value:g} {what} in game #{game_id}")
+            return True
+        if m["kind"] == "moneyline" and not scores and game["home_score"] == game["away_score"]:
+            # A tie is a push whichever side each lineup was on
+            self._grade(m["id"], {sid: "push" for sid in sels.values()},
+                        f"Tie {game['home_score']} – {game['away_score']} (game #{game_id}), stakes returned")
+            return True
+        if m["kind"] == "moneyline" and scores:
+            s1, s2 = scores
+            o1 = "win" if s1 > s2 else "lose" if s1 < s2 else "push"
+            o2 = {"win": "lose", "lose": "win", "push": "push"}[o1]
+            self._grade(m["id"], {sels["team1"]: o1, sels["team2"]: o2},
+                        f"{mu['team1']} {s1} – {s2} {mu['team2']} (game #{game_id})")
+            return True
+        return False
 
     def on_game_saved(self, game_id: int) -> list[int]:
         """Auto-settle matchups a newly saved game belongs to: at least half of the matchup's players
@@ -994,7 +1012,9 @@ class Book:
         keys = {p["username_key"] for p in self.db.game_players(game_id)}
         done = []
         for mu in self.matchups(("open", "locked")):
-            if not mu["auto_settle"] or mu["game_id"] or game_id <= mu["base_game_id"]:
+            # A matchup already tied to this game is tried again: the game may have been saved first
+            # without its stats CSV, or have markets left over from last time
+            if not mu["auto_settle"] or mu["game_id"] not in (None, 0, game_id) or game_id <= mu["base_game_id"]:
                 continue
             players = set(mu["players1"]) | set(mu["players2"])
             if players and len(players & keys) * 2 >= len(players):

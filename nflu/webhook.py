@@ -62,11 +62,12 @@ def parse_raw(db: Database, raw_id: int, payload, source: str = "webhook") -> di
     if game.unknown_stats:
         note = "unrecognized stats kept in 'extra': " + ", ".join(sorted(game.unknown_stats))[:500]
     db.set_raw_status(raw_id, "parsed", note, game_id)
-    if not replaced:
-        try:
-            Book(db).on_game_saved(game_id)  # settle sportsbook bets on this game
-        except Exception:
-            log.exception("Sportsbook auto-settle failed for game %s", game_id)
+    # Replaced games too: a game first saved without its stats CSV only gets its players (and so can
+    # only settle bets) when it's saved again with them
+    try:
+        Book(db).on_game_saved(game_id)  # settle sportsbook bets on this game
+    except Exception:
+        log.exception("Sportsbook auto-settle failed for game %s", game_id)
     return {"ok": True, "status": "replaced" if replaced else "parsed", "raw_id": raw_id,
             "game_id": game_id, "players": len(game.players), "game": game, "replaced": replaced}
 

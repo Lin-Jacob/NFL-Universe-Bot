@@ -293,3 +293,40 @@ def test_admin_move_player(tmp_path, monkeypatch):
             r = await c.post("/admin/matchups/1", data={"csrf": csrf, "action": "remove", "player": "wrtwo"})
             assert "took wrtwo out" in (await r.text()).lower() and "wrtwo" not in Book(db).matchup(1)["players2"]
     asyncio.run(run())
+
+
+def test_settles_when_stats_arrive_later(tmp_path):
+    """A game first saved without its stats (score only) settles its matchup when it's saved again with them."""
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbking_123", "speedywr"], ["billsqb", "truckstick"])
+    sam, _ = book.create_bettor("Sam")
+    ml = book.markets(mid)[0]
+    book.place_bet(sam, ml["selections"][0]["id"], 1000)
+    full = json.loads(SAMPLE.read_text())
+    score_only = {**full, "players": []}
+    assert ingest(db, json.dumps(score_only), "test")["status"] == "parsed"
+    assert book.matchup(mid)["status"] == "open"  # no players yet: nothing to settle on
+    assert ingest(db, json.dumps(full), "test")["status"] == "replaced"
+    assert book.matchup(mid)["status"] == "settled"
+    assert book.bettor(sam)["balance"] == round(START_BALANCE - 1000 + 1000 * decimal_odds(ml["selections"][0]["odds"]), 2)
+
+
+def test_tie_and_leftovers(tmp_path):
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    sam, _ = book.create_bettor("Sam")
+    ml = book.markets(mid)[0]
+    book.place_bet(sam, ml["selections"][0]["id"], 1000)
+    custom = book.add_custom(mid, "Pick-six?", [("Yes", 400), ("No", -600)])
+    prop = next(m for m in book.markets(mid) if m["kind"] == "prop")
+    db.x("UPDATE book_selections SET side = 'broken' WHERE market_id = ? AND side = 'over'", (prop["id"],))
+    gid, _ = db.save_game(_game(20, random.Random(2), score=(14, 14)))
+    res = book.settle_from_game(mid, gid)
+    # a tie pushes the winner bet even though the sides can't be told apart; a broken market doesn't stop the rest
+    assert book.market(ml["id"])["status"] == "settled"
+    assert book.bettor(sam)["balance"] == START_BALANCE
+    assert sorted(res["left"]) == sorted([book.market(custom)["title"], prop["title"]])
+    assert res["settled"] == len(book.markets(mid)) - 2
+    assert book.matchup(mid)["status"] == "locked"
