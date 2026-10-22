@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS book_bettors (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     token       TEXT NOT NULL UNIQUE,                  -- kept in the bettor's cookie
     code        TEXT UNIQUE,                           -- typed in to get the account back (new link/device)
+    password    TEXT,                                  -- salt$hash (hash_password); NULL = none set yet
     name        TEXT NOT NULL,
     name_key    TEXT NOT NULL UNIQUE,
     balance     REAL NOT NULL,
@@ -141,6 +142,11 @@ class BookError(Exception):
     """A request the sportsbook refuses (shown to the user as-is)."""
 
 
+def _check_new_password(password: str) -> None:
+    if not 4 <= len(password) <= 100:
+        raise BookError("Pick a password of at least 4 characters.")
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -152,6 +158,8 @@ def ensure_schema(db: Database) -> None:
         if "code" not in {r["name"] for r in c.execute("PRAGMA table_info(book_bettors)")}:
             c.execute("ALTER TABLE book_bettors ADD COLUMN code TEXT")
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_code ON book_bettors(code)")
+        if "password" not in {r["name"] for r in c.execute("PRAGMA table_info(book_bettors)")}:
+            c.execute("ALTER TABLE book_bettors ADD COLUMN password TEXT")
         for r in c.execute("SELECT id FROM book_bettors WHERE code IS NULL").fetchall():
             c.execute("UPDATE book_bettors SET code = ? WHERE id = ?", (new_code(), r["id"]))
         c.commit()
@@ -164,6 +172,18 @@ def new_code() -> str:
     """Account code like 'K7QM-2XPA' (40 bits): enough that nobody guesses someone else's."""
     raw = "".join(secrets.choice(_CODE_CHARS) for _ in range(8))
     return f"{raw[:4]}-{raw[4:]}"
+
+
+def hash_password(password: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(8)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 50_000).hex()
+    return f"{salt}${digest}"
+
+
+def check_password(password: str, stored: str | None) -> bool:
+    if not stored or "$" not in stored:
+        return False
+    return secrets.compare_digest(hash_password(password, stored.split("$", 1)[0]), stored)
 
 
 def clean_code(code: str) -> str:
@@ -360,16 +380,33 @@ class Book:
     def bettor_by_code(self, code: str):
         return self.db.one("SELECT * FROM book_bettors WHERE code = ?", (clean_code(code),))
 
-    def create_bettor(self, name: str) -> tuple[int, str]:
+    def create_bettor(self, name: str, password: str | None = None) -> tuple[int, str]:
         name = " ".join(name.split())
         if not 1 <= len(name) <= 24:
             raise BookError("Pick a name between 1 and 24 characters.")
+        if password is not None:
+            _check_new_password(password)
         if self.db.one("SELECT 1 FROM book_bettors WHERE name_key = ?", (name.lower(),)):
-            raise BookError(f"Someone already goes by {name}. Pick another name.")
+            raise BookError(f"Someone already goes by {name}. Pick another name, or log in if it's you.")
         token = secrets.token_urlsafe(32)
-        cur = self.db.x("INSERT INTO book_bettors(token, code, name, name_key, balance, created_at) "
-                        "VALUES(?,?,?,?,?,?)", (token, new_code(), name, name.lower(), START_BALANCE, _now()))
+        cur = self.db.x("INSERT INTO book_bettors(token, code, name, name_key, balance, created_at, password) "
+                        "VALUES(?,?,?,?,?,?,?)", (token, new_code(), name, name.lower(), START_BALANCE, _now(),
+                                                  hash_password(password) if password is not None else None))
         return cur.lastrowid, token
+
+    def set_password(self, bettor_id: int, password: str) -> None:
+        _check_new_password(password)
+        self.db.x("UPDATE book_bettors SET password = ? WHERE id = ?", (hash_password(password), bettor_id))
+
+    def login(self, name: str, password: str) -> tuple[object, bool]:
+        """(bettor, claimed) for this name and password, or (None, False). An account made before
+        passwords existed is claimed by the first person to log in to it: their password becomes its
+        password (on purpose: this is a friends' league, not a bank)."""
+        b = self.db.one("SELECT * FROM book_bettors WHERE name_key = ?", (" ".join(name.split()).lower(),))
+        if b and b["password"] is None:
+            self.set_password(b["id"], password)
+            return self.bettor(b["id"]), True
+        return (b, False) if b and check_password(password, b["password"]) else (None, False)
 
     def adjust_balance(self, bettor_id: int, amount: float) -> None:
         self.db.x("UPDATE book_bettors SET balance = round(balance + ?, 2) WHERE id = ?", (amount, bettor_id))

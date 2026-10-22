@@ -11,7 +11,9 @@ sportsbook.START_BALANCE in fake money):
     GET  /book/me                  my balance and bets
     GET  /book/leaderboard         everyone's money
     GET  /book/join;  POST /book/join
-    POST /book/code                get your account back with its code (new link or device)
+    POST /book/login, /book/logout log in with name + password (any device), log out
+    POST /book/password            set or change my password
+    POST /book/code                get an account back with its code (older accounts with no password)
 
 Admin (user "admin", password ADMIN_PASSWORD in .env; off when it isn't set):
     GET  /admin                    login, matchups, create a matchup
@@ -133,6 +135,9 @@ class BookSite:
             web.get("/book/join", self.join_form),
             web.post("/book/join", self.join),
             web.post("/book/code", self.use_code),
+            web.post("/book/login", self.bettor_login),
+            web.post("/book/logout", self.bettor_logout),
+            web.post("/book/password", self.set_password),
             web.get("/book/matchups/{id}", self.matchup_page),
             web.get("/book/bet/{id}", self.slip),
             web.post("/book/bet/{id}", self.bet),
@@ -202,7 +207,9 @@ class BookSite:
         return (f'<div class="card bar"><span>👋 {_e(bettor["name"])}</span>'
                 f'<span class="money">{_money(bettor["balance"])}</span>'
                 f'<a href="/book">Bets</a><a href="/book/parlay">Parlay slip ({len(self._slip_ids(bettor))})</a>'
-                f'<a href="/book/me">My bets</a><a href="/book/leaderboard">Leaderboard</a></div>')
+                f'<a href="/book/me">My bets</a><a href="/book/leaderboard">Leaderboard</a>'
+                f'<form method="post" action="/book/logout" style="margin:0 0 0 auto">'
+                f'{self._hidden(request, BETTOR_COOKIE)}<button class="sec">Log out</button></form></div>')
 
     def _slip_ids(self, bettor) -> set[int]:
         return {r["selection_id"] for r in self.db.q("SELECT selection_id FROM book_slip WHERE bettor_id = ?",
@@ -243,14 +250,20 @@ class BookSite:
 
     def _join_html(self, nxt: str = "/book", error: str = "", name: str = "") -> str:
         err = f'<div class="msg err">{_e(error)}</div>' if error else ""
-        return (f"<h1>Sportsbook</h1>{err}<div class='card'><p>Bet fake money on league games. "
-                f"New here? Pick a name and you start with <b>{_money(START_BALANCE)}</b>.</p>"
-                f'<form class="inline" method="post" action="/book/join">'
-                f'<input type="hidden" name="next" value="{_e(nxt)}">'
-                f'<input name="name" maxlength="24" required placeholder="Your name" value="{_e(name)}">'
-                f"<button>Start betting</button></form></div>"
-                f"<div class='card'><p>Already have an account? Enter its code (on your My bets page) to get it "
-                f"back, e.g. when the website's link changed or you're on another device.</p>"
+        nx = f'<input type="hidden" name="next" value="{_e(nxt)}">'
+        return (f"<h1>Sportsbook</h1>{err}<div class='grid'><div class='card'><h2 style='margin-top:0'>Log in</h2>"
+                f'<form class="stack" method="post" action="/book/login">{nx}'
+                f'<input name="name" maxlength="24" required placeholder="Name" autocomplete="username" '
+                f'value="{_e(name)}"><input name="password" type="password" required placeholder="Password" '
+                f'autocomplete="current-password"><button>Log in</button></form></div>'
+                f"<div class='card'><h2 style='margin-top:0'>New here?</h2><p>Bet fake money on league games. "
+                f"Make an account and you start with <b>{_money(START_BALANCE)}</b>.</p>"
+                f'<form class="stack" method="post" action="/book/join">{nx}'
+                f'<input name="name" maxlength="24" required placeholder="Pick a name" autocomplete="username">'
+                f'<input name="password" type="password" required minlength="4" placeholder="Pick a password" '
+                f'autocomplete="new-password"><button>Start betting</button></form></div></div>'
+                f"<div class='card'><p class='small'>Made an account before passwords existed? Log in with its "
+                f"name and a new password to claim it (your money and bets stay), or enter its account code.</p>"
                 f'<form class="inline" method="post" action="/book/code">'
                 f'<input type="hidden" name="next" value="{_e(nxt)}">'
                 f'<input name="code" maxlength="12" required placeholder="ABCD-2345" autocomplete="off">'
@@ -260,7 +273,7 @@ class BookSite:
     async def index(self, request: web.Request) -> web.Response:
         bettor = self._bettor(request)
         if not bettor:
-            return self._page("Sportsbook", self._join_html())
+            return self._page("Sportsbook", _flash(request) + self._join_html())
         cards, name, ctx = [], self._names(), self._parlay_ctx(request, bettor)
         for mu in self.book.matchups(("open", "locked")):
             markets = self.book.markets(mu["id"])
@@ -295,13 +308,48 @@ class BookSite:
             raise web.HTTPSeeOther(nxt)
         name = str(form.get("name", ""))
         try:
-            bid, token = self.book.create_bettor(name)
+            _, token = self.book.create_bettor(name, str(form.get("password", "")))
         except BookError as e:
-            return self._page("Join", self._join_html(nxt, str(e), name))
-        code = self.book.bettor(bid)["code"]
+            return self._page("Join", self._join_html(nxt, str(e)))
         raise self._login_bettor(request, token, _redirect(
-            nxt, f"Welcome! Your account code is {code}. Save it: it gets your account back if the "
-                 f"website's link changes or you switch devices (it's also on My bets)."))
+            nxt, f"Welcome! You have {_money(START_BALANCE)} to bet. Log in with your name and password "
+                 f"on any device."))
+
+    async def bettor_login(self, request: web.Request) -> web.Response:
+        form = await request.post()
+        nxt = self._safe_next(form.get("next"))
+        name = str(form.get("name", ""))
+        ip = "login:" + (request.headers.get("CF-Connecting-IP") or request.remote or "?")
+        if self._too_many(ip):
+            return self._page("Log in", self._join_html(nxt, "Too many wrong passwords. Wait 10 minutes.", name))
+        try:
+            b, claimed = self.book.login(name, str(form.get("password", "")))
+        except BookError as e:  # claiming an old account with too short a password
+            return self._page("Log in", self._join_html(nxt, str(e), name))
+        if not b:
+            self._too_many(ip, failed=True)
+            await asyncio.sleep(1)
+            return self._page("Log in", self._join_html(nxt, "Wrong name or password.", name))
+        msg = (f"Welcome back, {b['name']}! This account had no password, so the one you typed is its "
+               f"password now." if claimed else f"Welcome back, {b['name']}!")
+        raise self._login_bettor(request, b["token"], _redirect(nxt, msg))
+
+    async def bettor_logout(self, request: web.Request) -> web.Response:
+        form = await request.post()
+        self._check_csrf(request, form, BETTOR_COOKIE)
+        resp = _redirect("/book", "Logged out.")
+        resp.del_cookie(BETTOR_COOKIE, path="/")
+        raise resp
+
+    async def set_password(self, request: web.Request) -> web.Response:
+        bettor = self._require_bettor(request)
+        form = await request.post()
+        self._check_csrf(request, form, BETTOR_COOKIE)
+        try:
+            self.book.set_password(bettor["id"], str(form.get("password", "")))
+        except BookError as e:
+            raise _redirect("/book/me", str(e), err=True)
+        raise _redirect("/book/me", "Password saved. Log in with your name and it on any device.")
 
     @staticmethod
     def _login_bettor(request: web.Request, token: str, resp: web.HTTPException) -> web.HTTPException:
@@ -448,9 +496,16 @@ class BookSite:
                 f'<span class="stat"><b>{_money(at_risk)}</b><span class="muted">in open bets</span></span>'
                 f'<span class="stat"><b class="{"won" if worth >= START_BALANCE else "lost"}">'
                 f'{_money(worth - START_BALANCE)}</b><span class="muted">profit</span></span>'
-                f'<div class="small">Account code <b>{_e(bettor["code"])}</b>: enter it on the join page to get '
-                f"this account back if the website's link changes or you use another device. Keep it to "
-                f"yourself.</div></div>"
+                f"</div><div class='card'><h2 style='margin-top:0'>Password</h2>"
+                + ("" if bettor["password"] else
+                   "<p class='msg err'>You don't have a password yet. Set one so you can log in on any device "
+                   "(and after the website's link changes).</p>")
+                + f'<form class="inline" method="post" action="/book/password">{self._hidden(request, BETTOR_COOKIE)}'
+                  f'<input type="hidden" name="name" value="{_e(bettor["name"])}" autocomplete="username">'
+                  f'<input name="password" type="password" required minlength="4" autocomplete="new-password" '
+                  f'placeholder="{"New password" if bettor["password"] else "Pick a password"}">'
+                  f'<button>{"Change password" if bettor["password"] else "Set password"}</button></form>'
+                  f'<p class="small muted">You log in as <b>{_e(bettor["name"])}</b>.</p></div>'
                 + (f"<h2>Parlays</h2>{self._parlays_table(parlays)}<h2>Single bets</h2>" if parlays else "")
                 + self._bets_table(bets))
         return self._page("My bets", body, live=True)
@@ -777,6 +832,20 @@ class BookSite:
                 if mu["auto_settle"] else "Auto-settle is <b>off</b>.")
         lineups = "<br>".join(f'<b>{_e(mu[t])}</b>: ' + ", ".join(_e(name(k)) for k in mu[p])
                               for t, p in (("team1", "players1"), ("team2", "players2")))
+        if live:  # each player with a button to switch teams or take them out
+            cols = []
+            for t, p, other in (("team1", "players1", "team2"), ("team2", "players2", "team1")):
+                rows = "".join(
+                    f'<tr><td style="vertical-align:middle">{_e(name(k))}</td><td><form style="display:flex;gap:6px;margin:0;white-space:nowrap" '
+                    f'method="post" '
+                    f'action="{act}">{csrf}<input type="hidden" name="player" value="{_e(k)}">'
+                    f'<button class="sec" name="action" value="move">Move to {_e(mu[other])} →</button>'
+                    f'<button class="sec" name="action" value="remove" title="Take out of the matchup">✕</button>'
+                    f"</form></td></tr>" for k in mu[p])
+                cols.append(f'<div><h2 style="margin-top:0">{_e(mu[t])}</h2><table>{rows}</table></div>')
+            lineups = (f'<div class="grid">{"".join(cols)}</div><p class="small muted">Moving a player re-prices '
+                       f"the winner odds; their props stay. Taking one out voids their props (stakes returned). "
+                       f"Add players or rename teams under Edit matchup below.</p>")
         edit = ("" if not live else
                 f'<details class="card"><summary><b>Edit matchup</b> (title, team names, players)</summary>'
                 f'<form method="post" action="{act}">{csrf}'
@@ -793,9 +862,9 @@ class BookSite:
                 f'<button name="action" value="edit">Save matchup</button></form></details>')
         body = (self._admin_bar(request) + _flash(request)
                 + f'<h1>#{mu["id"]} {_e(mu["title"])} <span class="chip">{_STATUS[mu["status"]]}</span></h1>'
-                  f'<div class="card small">{lineups}<br>{auto if live else ""}'
+                  f'<div class="card">{lineups}<span class="small">{auto if live else ""}'
                   f'{" Settled from game #" + str(mu["game_id"]) + "." if mu["game_id"] else ""} '
-                  f'<a href="/book/matchups/{mu["id"]}">Bettor view →</a></div>'
+                  f'<a href="/book/matchups/{mu["id"]}">Bettor view →</a></span></div>'
                 + "".join(controls) + edit
                 + '<div class="card"><h2 style="margin-top:0">Markets</h2>'
                   '<p class="small muted">Edit a line and press Auto-price to re-price it from the stats, or type '
@@ -818,6 +887,19 @@ class BookSite:
             if action in ("lock", "open"):
                 self.book.set_matchup_status(mid, "locked" if action == "lock" else "open")
                 msg = "Betting closed." if action == "lock" else "Betting reopened."
+            elif action in ("move", "remove"):
+                key = str(form.get("player", ""))
+                p1, p2 = list(mu["players1"]), list(mu["players2"])
+                if key not in p1 + p2:
+                    raise BookError("That player isn't in this matchup.")
+                src, dst = (p1, p2) if key in p1 else (p2, p1)
+                src.remove(key)
+                if action == "move":
+                    dst.append(key)
+                self.book.edit_matchup(mid, mu["title"], mu["team1"], mu["team2"], p1, p2, self._names())
+                to = mu["team1"] if dst is p1 else mu["team2"]
+                msg = (f"Moved {self._names()(key)} to {to}; winner odds re-priced." if action == "move" else
+                       f"Took {self._names()(key)} out; their props are voided and stakes returned.")
             elif action == "edit":
                 sides = self._sides(form)
                 msg = self.book.edit_matchup(mid, str(form.get("title", "")), str(form.get("team1", "")),
@@ -906,10 +988,13 @@ class BookSite:
             f'<td class="n">{_money(r["at_risk"])}</td><td class="n">{r["bets"]}</td>'
             f'<td><form class="inline" style="margin:0" method="post" action="/admin/bettors/{r["id"]}">{csrf}'
             f'<input class="n" name="amount" placeholder="+500"><button name="action" value="adjust">Add</button>'
+            f'<input class="n" name="password" placeholder="New password">'
+            f'<button class="sec" name="action" value="password">Set password</button>'
             f'<button class="bad" name="action" value="delete">Delete</button></form></td></tr>'
             for r in self.book.leaderboard())
         body = (self._admin_bar(request) + _flash(request) + "<h1>Bettors</h1>"
                 "<p class='muted small'>Add money with a positive amount, take it away with a negative one. "
+                "Set password resets a bettor's password if they forgot it. "
                 "Deleting a bettor removes their bets too.</p>"
                 + (f'<div class="card scroll"><table><tr><th>Name</th><th class="n">Balance</th>'
                    f'<th class="n">In open bets</th><th class="n">Bets</th><th></th></tr>{rows}</table></div>'
@@ -926,6 +1011,12 @@ class BookSite:
         if form.get("action") == "delete":
             self.book.delete_bettor(b["id"])
             raise _redirect("/admin/bettors", f"Deleted {b['name']}.")
+        if form.get("action") == "password":
+            try:
+                self.book.set_password(b["id"], str(form.get("password", "")))
+            except BookError as e:
+                raise _redirect("/admin/bettors", str(e), err=True)
+            raise _redirect("/admin/bettors", f"{b['name']}'s password is set. Tell them to log in with it.")
         amount = _float(form.get("amount"))
         if not amount:
             raise _redirect("/admin/bettors", "Enter an amount, like 500 or -500.", err=True)
