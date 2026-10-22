@@ -6,6 +6,8 @@ sportsbook.START_BALANCE in fake money):
     GET  /book                     open matchups
     GET  /book/matchups/<id>       every bet on one matchup
     GET  /book/bet/<selection>     bet slip;  POST places the bet
+    GET  /book/parlay              parlay slip (picks collected with the + buttons);  POST places it
+    POST /book/parlay/add/<sel>, /book/parlay/remove/<sel>, /book/parlay/clear
     GET  /book/me                  my balance and bets
     GET  /book/leaderboard         everyone's money
     GET  /book/join;  POST /book/join
@@ -31,8 +33,8 @@ from aiohttp import web
 from .db import Database
 from .embeds import Names
 from .site import _e, _page, _time
-from .sportsbook import (START_BALANCE, Book, BookError, bettable_stats, decimal_odds, fmt_odds,
-                         stat_label)
+from .sportsbook import (MAX_PARLAY_LEGS, START_BALANCE, Book, BookError, american_from_decimal,
+                         bettable_stats, decimal_odds, fmt_odds, stat_label)
 
 BETTOR_COOKIE = "nflu_bettor"
 ADMIN_COOKIE = "nflu_admin"
@@ -59,9 +61,24 @@ background:var(--card);color:var(--text);width:100%}
 button.sec{background:var(--chip);color:var(--text);border:1px solid var(--line)}
 button.bad{background:#c0392b}
 .pick td{padding:4px 10px}.pick label{margin-right:10px;white-space:nowrap}
+.pick-wrap{display:inline-flex;gap:4px;align-items:center;margin:2px 0}
+form.addp{display:inline;margin:0}form.addp button{padding:5px 9px;line-height:1.2}
+form.addp button.in{background:var(--win)}
+.legs td{vertical-align:middle}
 </style>"""
 
 _STATUS = {"open": "Open", "locked": "Betting closed", "settled": "Settled", "void": "Void"}
+
+# Bettor pages check /book/version every few seconds and reload when the admin changed anything,
+# unless the bettor is typing a stake (then a banner offers the reload instead).
+LIVE_JS = """<div id="live" class="msg" style="display:none;position:sticky;bottom:10px">Odds or bets just changed.
+<a href="" onclick="location.reload();return false">Reload to see them</a></div>
+<script>(function(){var v=null;function busy(){var a=document.activeElement;if(a&&a.tagName=='INPUT')return true;
+var s=document.getElementById('stake');return !!(s&&s.value);}
+function tick(){if(document.hidden)return;fetch('/book/version',{cache:'no-store'}).then(function(r){return r.json()})
+.then(function(d){if(v===null){v=d.v;return;}if(d.v!==v){if(busy()){document.getElementById('live').style.display='block';}
+else{location.reload();}}}).catch(function(){});}
+tick();setInterval(tick,5000);document.addEventListener('visibilitychange',tick);})();</script>"""
 
 
 def _money(v: float) -> str:
@@ -119,8 +136,14 @@ class BookSite:
             web.get("/book/matchups/{id}", self.matchup_page),
             web.get("/book/bet/{id}", self.slip),
             web.post("/book/bet/{id}", self.bet),
+            web.get("/book/parlay", self.parlay_page),
+            web.post("/book/parlay", self.parlay_place),
+            web.post("/book/parlay/add/{id}", self.parlay_add),
+            web.post("/book/parlay/remove/{id}", self.parlay_remove),
+            web.post("/book/parlay/clear", self.parlay_clear),
             web.get("/book/me", self.me),
             web.get("/book/leaderboard", self.leaderboard),
+            web.get("/book/version", self.version),
             web.get("/admin", self.admin),
             web.post("/admin/login", self.admin_login),
             web.post("/admin/logout", self.admin_logout),
@@ -178,26 +201,45 @@ class BookSite:
             return ""
         return (f'<div class="card bar"><span>👋 {_e(bettor["name"])}</span>'
                 f'<span class="money">{_money(bettor["balance"])}</span>'
-                f'<a href="/book">Bets</a><a href="/book/me">My bets</a>'
-                f'<a href="/book/leaderboard">Leaderboard</a></div>')
+                f'<a href="/book">Bets</a><a href="/book/parlay">Parlay slip ({len(self._slip_ids(bettor))})</a>'
+                f'<a href="/book/me">My bets</a><a href="/book/leaderboard">Leaderboard</a></div>')
+
+    def _slip_ids(self, bettor) -> set[int]:
+        return {r["selection_id"] for r in self.db.q("SELECT selection_id FROM book_slip WHERE bettor_id = ?",
+                                                     (bettor["id"],))}
+
+    def _parlay_ctx(self, request: web.Request, bettor) -> dict:
+        """What the + (add to parlay) buttons on a page need."""
+        return {"csrf": self._hidden(request, BETTOR_COOKIE), "next": request.path,
+                "slip": self._slip_ids(bettor)}
 
     @staticmethod
-    def _sel_button(s: dict, open_: bool) -> str:
+    def _sel_button(s: dict, open_: bool, ctx: dict | None = None) -> str:
         inner = f'<span>{_e(s["label"])}</span><b>{fmt_odds(s["odds"])}</b>'
         if open_:
-            return f'<a class="sel" href="/book/bet/{s["id"]}">{inner}</a>'
+            link = f'<a class="sel" href="/book/bet/{s["id"]}" title="Bet on this alone">{inner}</a>'
+            if not ctx:
+                return link
+            inside = s["id"] in ctx["slip"]
+            action = "remove" if inside else "add"
+            tip = "In your parlay slip (tap to take it out)" if inside else "Add to parlay"
+            return (f'<span class="pick-wrap">{link}<form class="addp" method="post" '
+                    f'action="/book/parlay/{action}/{s["id"]}">{ctx["csrf"]}'
+                    f'<input type="hidden" name="next" value="{_e(ctx["next"])}">'
+                    f'<button class="{"in" if inside else "sec"}" title="{tip}" aria-label="{tip}">'
+                    f'{"✓" if inside else "+"}</button></form></span>')
         mark = {"win": " ✅", "lose": "", "push": " ↩", "void": " ↩"}.get(s.get("outcome") or "", "")
         return f'<span class="sel">{inner}{mark}</span>'
 
-    def _market_row(self, m: dict, mu: dict, name) -> str:
+    def _market_row(self, m: dict, mu: dict, name, ctx: dict | None = None) -> str:
         open_ = m["status"] == "open" and mu["status"] == "open"
         note = (f'<div class="small muted">{_e(m["result"])}</div>' if m["result"]
                 else "" if open_ else f'<div class="small muted">{_STATUS[m["status"]]}</div>')
-        sels = " ".join(self._sel_button(s, open_) for s in m["selections"])
+        sels = " ".join(self._sel_button(s, open_, ctx) for s in m["selections"])
         return f'<div class="mk"><div class="t">{_e(self._title(m, name))}{note}</div><div>{sels}</div></div>'
 
-    def _page(self, title: str, body: str) -> web.Response:
-        return _page(title, CSS + body)
+    def _page(self, title: str, body: str, live: bool = False) -> web.Response:
+        return _page(title, CSS + body + (LIVE_JS if live else ""))
 
     def _join_html(self, nxt: str = "/book", error: str = "", name: str = "") -> str:
         err = f'<div class="msg err">{_e(error)}</div>' if error else ""
@@ -219,7 +261,7 @@ class BookSite:
         bettor = self._bettor(request)
         if not bettor:
             return self._page("Sportsbook", self._join_html())
-        cards, name = [], self._names()
+        cards, name, ctx = [], self._names(), self._parlay_ctx(request, bettor)
         for mu in self.book.matchups(("open", "locked")):
             markets = self.book.markets(mu["id"])
             main = [m for m in markets if m["kind"] in ("moneyline", "total")]
@@ -227,7 +269,7 @@ class BookSite:
             cards.append(
                 f'<div class="card"><h2 style="margin-top:0"><a href="/book/matchups/{mu["id"]}">{_e(mu["title"])}</a> '
                 f'<span class="chip">{_STATUS[mu["status"]]}</span></h2>'
-                + "".join(self._market_row(m, mu, name) for m in main)
+                + "".join(self._market_row(m, mu, name, ctx) for m in main)
                 + f'<p class="small"><a href="/book/matchups/{mu["id"]}">All {len(markets)} bets'
                   f'{f" ({n_props} player props and more)" if n_props else ""} →</a></p></div>')
         recent = self.book.matchups(("settled",))[:5]
@@ -235,7 +277,7 @@ class BookSite:
         body = (self._bar(request, bettor) + _flash(request) + "<h1>Sportsbook</h1>"
                 + ("".join(cards) or "<p class='muted'>No games are open for betting right now. Check back soon.</p>")
                 + (f"<h2>Recently settled</h2><ul>{past}</ul>" if past else ""))
-        return self._page("Sportsbook", body)
+        return self._page("Sportsbook", body, live=True)
 
     async def join_form(self, request: web.Request) -> web.Response:
         if self._bettor(request):
@@ -307,8 +349,9 @@ class BookSite:
             head = ("Game" if m["kind"] in ("moneyline", "total") else
                     "Specials" if m["kind"] == "custom" else name(m["player_key"]))
             groups.setdefault(head, []).append(m)
+        ctx = self._parlay_ctx(request, bettor)
         cards = "".join(f'<div class="card"><h2 style="margin-top:0">{_e(head)}</h2>'
-                        + "".join(self._market_row(m, mu, name) for m in ms) + "</div>" for head, ms in groups.items())
+                        + "".join(self._market_row(m, mu, name, ctx) for m in ms) + "</div>" for head, ms in groups.items())
         lineups = " · ".join(f'<b>{_e(mu[t])}</b>: ' + ", ".join(_e(name(k)) for k in mu[p])
                              for t, p in (("team1", "players1"), ("team2", "players2")))
         body = (self._bar(request, bettor) + _flash(request)
@@ -316,9 +359,10 @@ class BookSite:
                   f'<span class="chip">{_STATUS[mu["status"]]}</span></h1>'
                   f'<p class="muted small">{lineups}</p>'
                   f'<p class="small muted">Lines and odds come from each player\'s past games. Props settle on the '
-                  f'stat in the game; a player who doesn\'t play has their props voided (stakes returned).</p>'
+                  f'stat in the game; a player who doesn\'t play has their props voided (stakes returned). '
+                  f'Tap a pick to bet it alone, or <b>+</b> to add it to a <a href="/book/parlay">parlay</a>.</p>'
                 + cards)
-        return self._page(mu["title"], body)
+        return self._page(mu["title"], body, live=True)
 
     async def slip(self, request: web.Request, error: str = "", stake: str = "") -> web.Response:
         bettor = self._require_bettor(request)
@@ -328,6 +372,12 @@ class BookSite:
         dec = decimal_odds(s["odds"])
         open_ = s["matchup_status"] == "open" and s["market_status"] == "open"
         err = f'<div class="msg err">{_e(error)}</div>' if error else ""
+        inside = s["id"] in self._slip_ids(bettor)
+        parlay = ("" if not open_ else
+                  f'<p class="small">✓ In your <a href="/book/parlay">parlay slip</a>.</p>' if inside else
+                  f'<form method="post" action="/book/parlay/add/{s["id"]}" style="margin-top:12px">'
+                  f'{self._hidden(request, BETTOR_COOKIE)}<input type="hidden" name="next" value="/book/parlay">'
+                  f'<button class="sec">Add to parlay instead</button></form>')
         form = (f'<form class="stack" method="post" action="/book/bet/{s["id"]}">{self._hidden(request, BETTOR_COOKIE)}'
                 f'<input type="hidden" name="odds" value="{s["odds"]}">'
                 f'<label>Stake ($)<br><input id="stake" name="stake" inputmode="decimal" required '
@@ -345,8 +395,8 @@ class BookSite:
                   f'<h1>Bet slip</h1><div class="card"><div class="muted small">{_e(self._title(s))}</div>'
                   f'<div class="score">{_e(s["label"])} <span class="odds">{fmt_odds(s["odds"])}</span></div>'
                   f'<p class="small muted">Decimal {dec:.2f}: a $100 bet pays back {_money(100 * dec)}. '
-                  f'You have {_money(bettor["balance"])}.</p>{form}</div>')
-        return self._page("Bet slip", body)
+                  f'You have {_money(bettor["balance"])}.</p>{form}{parlay}</div>')
+        return self._page("Bet slip", body, live=True)
 
     async def bet(self, request: web.Request) -> web.Response:
         bettor = self._require_bettor(request)
@@ -390,7 +440,8 @@ class BookSite:
     async def me(self, request: web.Request) -> web.Response:
         bettor = self._require_bettor(request)
         bets = self.book.bets_for(bettor["id"])
-        at_risk = sum(b["stake"] for b in bets if b["status"] == "pending")
+        parlays = self.book.parlays_for(bettor["id"])
+        at_risk = sum(b["stake"] for b in bets + parlays if b["status"] == "pending")
         worth = bettor["balance"] + at_risk
         body = (self._bar(request, bettor) + _flash(request) + f"<h1>My bets</h1><div class='card'>"
                 f'<span class="stat"><b>{_money(bettor["balance"])}</b><span class="muted">to bet</span></span>'
@@ -400,8 +451,128 @@ class BookSite:
                 f'<div class="small">Account code <b>{_e(bettor["code"])}</b>: enter it on the join page to get '
                 f"this account back if the website's link changes or you use another device. Keep it to "
                 f"yourself.</div></div>"
+                + (f"<h2>Parlays</h2>{self._parlays_table(parlays)}<h2>Single bets</h2>" if parlays else "")
                 + self._bets_table(bets))
-        return self._page("My bets", body)
+        return self._page("My bets", body, live=True)
+
+    def _parlays_table(self, parlays: list[dict]) -> str:
+        name = self._names()
+        icon = {"win": "✅", "lose": "❌", "push": "↩", "void": "↩", None: "⏳"}
+        rows = []
+        for p in parlays:
+            if p["status"] == "pending":
+                res = f'<span class="muted">Pending · to win {_money(p["stake"] * (p["decimal"] - 1))}</span>'
+            elif p["status"] == "won":
+                res = f'<span class="won">Won {_money(p["payout"] - p["stake"])}</span>'
+            elif p["status"] == "lost":
+                res = f'<span class="lost">Lost {_money(p["stake"])}</span>'
+            else:
+                res = '<span class="muted">Void, stake returned</span>'
+            legs = "<br>".join(
+                f'{icon.get(leg["outcome"], "")} <a href="/book/matchups/{leg["matchup_id"]}">{_e(self._title(leg, name))}'
+                f'</a>: {_e(leg["label"])} <span class="odds">{fmt_odds(leg["odds"])}</span>'
+                + (f' <span class="small muted">({_e(leg["result"])})</span>' if leg["result"] else "")
+                for leg in p["legs"])
+            rows.append(f'<tr><td class="small">{len(p["legs"])}-leg parlay '
+                        f'<span class="odds">{fmt_odds(american_from_decimal(p["decimal"]))}</span><br>{legs}</td>'
+                        f'<td class="n">{_money(p["stake"])}</td><td>{res}</td>'
+                        f'<td class="small muted">{_time(p["placed_at"])}</td></tr>')
+        return ('<div class="card scroll"><table><tr><th>Picks</th><th class="n">Stake</th><th>Result</th>'
+                f'<th>Placed</th></tr>{"".join(rows)}</table></div>')
+
+    # -------------------------------------------------------------- parlays
+    async def parlay_page(self, request: web.Request, error: str = "", stake: str = "") -> web.Response:
+        bettor = self._require_bettor(request)
+        legs = self.book.slip(bettor["id"])
+        name = self._names()
+        csrf = self._hidden(request, BETTOR_COOKIE)
+        err = f'<div class="msg err">{_e(error)}</div>' if error else _flash(request)
+        if not legs:
+            body = (self._bar(request, bettor) + err + "<h1>Parlay slip</h1><div class='card'><p>Your slip is "
+                    "empty. Open a <a href='/book'>game</a> and tap <b>+</b> next to the picks you want. A parlay "
+                    "multiplies the odds of every pick and pays only if they all win.</p></div>")
+            return self._page("Parlay slip", body)
+        rows = []
+        for s in legs:
+            open_ = s["matchup_status"] == "open" and s["market_status"] == "open"
+            rows.append(f'<tr><td><a href="/book/matchups/{s["matchup_id"]}">{_e(s["matchup_title"])}</a><br>'
+                        f'<span class="small">{_e(self._title(s, name))}</span></td>'
+                        f'<td>{_e(s["label"])} <span class="odds">{fmt_odds(s["odds"])}</span>'
+                        + ("" if open_ else ' <span class="lost small">betting closed</span>') + "</td>"
+                        f'<td><form class="addp" method="post" action="/book/parlay/remove/{s["id"]}">{csrf}'
+                        f'<input type="hidden" name="next" value="/book/parlay">'
+                        f'<button class="sec" title="Remove">✕</button></form></td></tr>')
+        dec = self.book.parlay_decimal([s["odds"] for s in legs])
+        seen = ",".join(f'{s["id"]}:{s["odds"]}' for s in legs)
+        if len(legs) < 2:
+            form = "<p class='muted'>Add at least one more pick to make a parlay.</p>"
+        else:
+            form = (f'<form class="stack" method="post" action="/book/parlay">{csrf}'
+                    f'<input type="hidden" name="seen" value="{seen}">'
+                    f'<label>Stake ($)<br><input id="stake" name="stake" inputmode="decimal" required '
+                    f'value="{_e(stake)}" placeholder="100"></label>'
+                    f'<div>To win <b id="win">$0.00</b>, paid back <b id="ret">$0.00</b></div>'
+                    f"<button>Place {len(legs)}-leg parlay</button></form>"
+                    f"<script>(function(){{var i=document.getElementById('stake'),d={dec};"
+                    f"function f(v){{return '$'+v.toLocaleString(undefined,{{minimumFractionDigits:2,maximumFractionDigits:2}})}}"
+                    f"function u(){{var s=parseFloat((i.value||'').replace(/[$,]/g,''))||0;"
+                    f"document.getElementById('win').textContent=f(s*(d-1));document.getElementById('ret').textContent=f(s*d);}}"
+                    f"i.addEventListener('input',u);u();}})();</script>")
+        body = (self._bar(request, bettor) + err + "<h1>Parlay slip</h1>"
+                f'<div class="card scroll"><table class="legs">{"".join(rows)}</table></div>'
+                f'<div class="card"><div class="score">{len(legs)} picks · '
+                f'<span class="odds">{fmt_odds(american_from_decimal(dec))}</span></div>'
+                f'<p class="small muted">Decimal {dec:.2f}: a $100 parlay pays back {_money(100 * dec)}. Every pick '
+                f"has to win. A pick that pushes or is voided drops out and the rest still count. Up to "
+                f"{MAX_PARLAY_LEGS} picks, one per bet. You have {_money(bettor['balance'])}.</p>{form}"
+                f'<form method="post" action="/book/parlay/clear" style="margin-top:12px">{csrf}'
+                f'<button class="sec">Clear slip</button></form></div>')
+        return self._page("Parlay slip", body, live=True)
+
+    async def _slip_change(self, request: web.Request, fn) -> web.Response:
+        bettor = self._require_bettor(request)
+        form = await request.post()
+        self._check_csrf(request, form, BETTOR_COOKIE)
+        nxt = self._safe_next(form.get("next"))
+        try:
+            msg = fn(bettor["id"])
+        except BookError as e:
+            raise _redirect(nxt, str(e), err=True)
+        raise _redirect(nxt, msg) if msg else web.HTTPSeeOther(nxt)
+
+    async def parlay_add(self, request: web.Request) -> web.Response:
+        sel = _int(request.match_info["id"], 0)
+
+        def add(bid: int) -> str:
+            self.book.slip_add(bid, sel)
+            n = len(self._slip_ids({"id": bid}))
+            return f"Added to your parlay slip ({n} pick{'s' * (n != 1)})."
+        return await self._slip_change(request, add)
+
+    async def parlay_remove(self, request: web.Request) -> web.Response:
+        sel = _int(request.match_info["id"], 0)
+        return await self._slip_change(request, lambda bid: self.book.slip_remove(bid, sel))
+
+    async def parlay_clear(self, request: web.Request) -> web.Response:
+        return await self._slip_change(request, lambda bid: self.book.slip_remove(bid))
+
+    async def parlay_place(self, request: web.Request) -> web.Response:
+        bettor = self._require_bettor(request)
+        form = await request.post()
+        self._check_csrf(request, form, BETTOR_COOKIE)
+        stake = _float(form.get("stake"))
+        seen = []
+        for part in str(form.get("seen", "")).split(","):
+            sid, _, odds = part.partition(":")
+            if _int(sid) is not None and _int(odds) is not None:
+                seen.append((_int(sid), _int(odds)))
+        try:
+            if stake is None:
+                raise BookError("Enter how much to bet.")
+            self.book.place_parlay(bettor["id"], stake, seen)
+        except BookError as e:
+            return await self.parlay_page(request, str(e), str(form.get("stake", "")))
+        raise _redirect("/book/me", f"Parlay placed: {_money(stake)}. Good luck!")
 
     def _leader_table(self, rows: list[dict]) -> str:
         if not rows:
@@ -415,11 +586,14 @@ class BookSite:
                 '<th class="n">Profit</th><th class="n">In open bets</th><th class="n">W-L</th>'
                 f'<th class="n">Bets</th></tr>{body}</table></div>')
 
+    async def version(self, request: web.Request) -> web.Response:
+        return web.json_response({"v": self.book.version()}, headers={"Cache-Control": "no-store"})
+
     async def leaderboard(self, request: web.Request) -> web.Response:
         body = (self._bar(request, self._bettor(request)) + "<h1>Sportsbook leaderboard</h1>"
                 "<p class='muted'>Total = money left to bet plus money in open bets.</p>"
                 + self._leader_table(self.book.leaderboard()))
-        return self._page("Leaderboard", body)
+        return self._page("Leaderboard", body, live=True)
 
     # ---------------------------------------------------------------- admin
     def _admin_bar(self, request: web.Request) -> str:
@@ -477,18 +651,14 @@ class BookSite:
             for mu in self.book.matchups())
         table = (f'<div class="card scroll"><table><tr><th>Matchup</th><th>Status</th><th>Created</th></tr>'
                  f"{rows}</table></div>" if rows else "<p class='muted'>No matchups yet.</p>")
-        pick = "".join(
-            f'<tr><td>{_e(Names(self.db).dashed(u))}</td><td>'
-            + "".join(f'<label><input type="radio" name="p:{_e(u.lower())}" value="{v}"{" checked" if not v else ""}>'
-                      f" {lbl}</label>" for v, lbl in (("", "Out"), ("1", "Team 1"), ("2", "Team 2")))
-            + "</td></tr>" for u in sorted(self.db.known_usernames(), key=lambda u: name(u.lower()).lower()))
+        pick = self._pick_table()
         create = (f'<div class="card"><h2 style="margin-top:0">New matchup</h2>'
                   f'<form method="post" action="/admin/matchups">{self._hidden(request, ADMIN_COOKIE)}'
                   f'<div class="inline" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">'
                   f'<input name="title" placeholder="Title (optional)"></div>'
                   f'<p class="small muted">Put each player on Team 1 or Team 2. When the game comes in, the bot '
                   f"works out which side each team played from its players and settles the winner.</p>"
-                  f'<div class="scroll"><table class="pick">{pick}</table></div>'
+                  f'{pick}'
                   f'<p class="small muted">Players with no games yet (comma-separated names):</p>'
                   f'<div style="display:flex;gap:8px;flex-wrap:wrap"><input name="extra1" placeholder="Team 1 extras">'
                   f'<input name="extra2" placeholder="Team 2 extras"></div>'
@@ -496,10 +666,22 @@ class BookSite:
         body = self._admin_bar(request) + _flash(request) + "<h1>Matchups</h1>" + table + create
         return self._page("Admin", body)
 
-    async def admin_create(self, request: web.Request) -> web.Response:
-        self._need_admin(request)
-        form = await request.post()
-        self._check_csrf(request, form, ADMIN_COOKIE)
+    def _pick_table(self, mu: dict | None = None) -> str:
+        """Out / Team 1 / Team 2 radio buttons for every player (and anyone already in the matchup)."""
+        name, names = self._names(), Names(self.db)
+        on = {k: "1" for k in mu["players1"]} | {k: "2" for k in mu["players2"]} if mu else {}
+        people = {u.lower(): names.dashed(u) for u in self.db.known_usernames()}
+        people.update({k: name(k) for k in on if k not in people})
+        rows = "".join(
+            f'<tr><td>{_e(label)}</td><td>'
+            + "".join(f'<label><input type="radio" name="p:{_e(k)}" value="{v}"'
+                      f'{" checked" if on.get(k, "") == v else ""}> {lbl}</label>'
+                      for v, lbl in (("", "Out"), ("1", mu["team1"] if mu else "Team 1"),
+                                     ("2", mu["team2"] if mu else "Team 2")))
+            + "</td></tr>" for k, label in sorted(people.items(), key=lambda kv: name(kv[0]).lower()))
+        return f'<div class="scroll"><table class="pick">{rows}</table></div>'
+
+    def _sides(self, form) -> dict[str, list[str]]:
         sides: dict[str, list[str]] = {"1": [], "2": []}
         for k, v in form.items():
             if k.startswith("p:") and v in sides:
@@ -508,8 +690,15 @@ class BookSite:
             for raw in str(form.get(f"extra{team}", "")).split(","):
                 if raw.strip():
                     key = self.db.resolve_player(raw) or raw.strip().lower()
-                    if key not in sides[team]:
+                    if key not in sides["1"] + sides["2"]:
                         sides[team].append(key)
+        return sides
+
+    async def admin_create(self, request: web.Request) -> web.Response:
+        self._need_admin(request)
+        form = await request.post()
+        self._check_csrf(request, form, ADMIN_COOKIE)
+        sides = self._sides(form)
         try:
             mid = self.book.create_matchup(str(form.get("title", "")), sides["1"], sides["2"], self._names())
         except BookError as e:
@@ -588,15 +777,30 @@ class BookSite:
                 if mu["auto_settle"] else "Auto-settle is <b>off</b>.")
         lineups = "<br>".join(f'<b>{_e(mu[t])}</b>: ' + ", ".join(_e(name(k)) for k in mu[p])
                               for t, p in (("team1", "players1"), ("team2", "players2")))
+        edit = ("" if not live else
+                f'<details class="card"><summary><b>Edit matchup</b> (title, team names, players)</summary>'
+                f'<form method="post" action="{act}">{csrf}'
+                f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0">'
+                f'<input name="title" value="{_e(mu["title"])}" placeholder="Title">'
+                f'<input name="team1" value="{_e(mu["team1"])}" placeholder="Team 1 name">'
+                f'<input name="team2" value="{_e(mu["team2"])}" placeholder="Team 2 name"></div>'
+                f'{self._pick_table(mu)}'
+                f'<p class="small muted">Players with no games yet (comma-separated names):</p>'
+                f'<div style="display:flex;gap:8px;flex-wrap:wrap"><input name="extra1" placeholder="Team 1 extras">'
+                f'<input name="extra2" placeholder="Team 2 extras"></div>'
+                f'<p class="small muted">Taking a player out voids their props (stakes returned). Added players get '
+                f'the usual props. Changing the lineups re-prices the winner odds.</p>'
+                f'<button name="action" value="edit">Save matchup</button></form></details>')
         body = (self._admin_bar(request) + _flash(request)
                 + f'<h1>#{mu["id"]} {_e(mu["title"])} <span class="chip">{_STATUS[mu["status"]]}</span></h1>'
                   f'<div class="card small">{lineups}<br>{auto if live else ""}'
                   f'{" Settled from game #" + str(mu["game_id"]) + "." if mu["game_id"] else ""} '
                   f'<a href="/book/matchups/{mu["id"]}">Bettor view →</a></div>'
-                + "".join(controls)
+                + "".join(controls) + edit
                 + '<div class="card"><h2 style="margin-top:0">Markets</h2>'
                   '<p class="small muted">Edit a line and press Auto-price to re-price it from the stats, or type '
-                  'your own odds and Save. Changes apply to new bets only.</p>'
+                  'your own odds and Save. Changes go live right away: bettors\' open pages update within a few '
+                  'seconds. They apply to new bets only; bets already placed keep their odds.</p>'
                 + "".join(self._admin_market(request, m, name) for m in markets) + "</div>")
         return self._page(f'Admin: {mu["title"]}', body)
 
@@ -614,6 +818,10 @@ class BookSite:
             if action in ("lock", "open"):
                 self.book.set_matchup_status(mid, "locked" if action == "lock" else "open")
                 msg = "Betting closed." if action == "lock" else "Betting reopened."
+            elif action == "edit":
+                sides = self._sides(form)
+                msg = self.book.edit_matchup(mid, str(form.get("title", "")), str(form.get("team1", "")),
+                                             str(form.get("team2", "")), sides["1"], sides["2"], self._names())
             elif action == "auto":
                 self.book.set_auto_settle(mid, not mu["auto_settle"])
                 msg = "Auto-settle turned " + ("off." if mu["auto_settle"] else "on.")

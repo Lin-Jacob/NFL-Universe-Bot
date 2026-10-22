@@ -7,7 +7,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from nflu.db import Database
 from nflu.parser import ParsedGame, ParsedPlayer
-from nflu.sportsbook import (START_BALANCE, Book, Models, decimal_odds, default_line, p_over, price,
+from nflu.sportsbook import (START_BALANCE, Book, BookError, Models, decimal_odds, default_line, p_over, price,
                              to_american)
 from nflu.webhook import WebhookServer, ingest
 from tests.test_bot import SAMPLE, SECRET
@@ -180,3 +180,74 @@ def test_web_flow(tmp_path, monkeypatch):
                 assert SECRET not in await (await c.get(path)).text(), path
             assert (await c.get("/book/matchups/99")).status == 404
     asyncio.run(run())
+
+
+def test_parlays(tmp_path):
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    bettor, _ = book.create_bettor("Pat")
+    mk = {(m["player_key"], m["stat"]): m for m in book.markets(mid)}
+    py = mk[("qbone", "pass_yards")]
+    rec = mk[("wrone", "receptions")]
+    tk = mk[("wrtwo", "tackles")]
+    over = lambda m: next(s for s in m["selections"] if s["side"] == "over")  # noqa: E731
+    under = lambda m: next(s for s in m["selections"] if s["side"] == "under")  # noqa: E731
+
+    book.slip_add(bettor, over(py)["id"])
+    book.slip_add(bettor, under(py)["id"])  # same market: swaps the pick
+    assert [s["id"] for s in book.slip(bettor)] == [under(py)["id"]]
+    try:
+        book.place_parlay(bettor, 100)
+        raise AssertionError("one pick isn't a parlay")
+    except BookError:
+        pass
+    book.slip_add(bettor, over(py)["id"])
+    book.slip_add(bettor, over(rec)["id"])
+    book.slip_add(bettor, over(tk)["id"])
+    seen = [(s["id"], s["odds"]) for s in book.slip(bettor)]
+    try:
+        book.place_parlay(bettor, 100, seen[:2])
+        raise AssertionError("stale slip accepted")
+    except BookError:
+        pass
+    pid = book.place_parlay(bettor, 100, seen)
+    assert book.slip(bettor) == [] and book.bettor(bettor)["balance"] == START_BALANCE - 100
+    assert book.leaderboard()[0]["at_risk"] == 100
+
+    # leg 1 wins, leg 2 pushes (drops out), leg 3 wins -> paid at legs 1 x 3
+    book.settle_market(py["id"], over(py)["id"])
+    assert book.parlays_for(bettor)[0]["status"] == "pending"
+    book.settle_market(rec["id"], None)
+    book.settle_market(tk["id"], over(tk)["id"])
+    p = book.parlays_for(bettor)[0]
+    expect = round(100 * decimal_odds(over(py)["odds"]) * decimal_odds(over(tk)["odds"]), 2)
+    assert p["id"] == pid and p["status"] == "won" and p["payout"] == expect
+    assert book.bettor(bettor)["balance"] == round(START_BALANCE - 100 + expect, 2)
+
+    # regrading a leg as a loss takes the winnings back
+    book.unsettle_market(tk["id"])
+    assert book.parlays_for(bettor)[0]["status"] == "pending"
+    assert book.bettor(bettor)["balance"] == START_BALANCE - 100
+    book.settle_market(tk["id"], under(tk)["id"])
+    assert book.parlays_for(bettor)[0]["status"] == "lost"
+    assert book.bettor(bettor)["balance"] == START_BALANCE - 100
+
+
+def test_live_edit(tmp_path):
+    db = _db(tmp_path)
+    book = Book(db)
+    mid = book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    v0 = book.version()
+    bettor, _ = book.create_bettor("Lee")
+    prop = next(m for m in book.markets(mid) if m["player_key"] == "wrtwo")
+    book.place_bet(bettor, prop["selections"][0]["id"], 100)
+    ml = book.markets(mid)[0]
+    msg = book.edit_matchup(mid, "Big game", "Hawks", "Owls", ["qbone", "wrone", "newguy"], ["qbtwo"])
+    assert "1 player added" in msg and "1 taken out" in msg
+    mu = book.matchup(mid)
+    assert (mu["title"], mu["team1"], mu["team2"]) == ("Big game", "Hawks", "Owls")
+    assert [s["label"] for s in book.market(ml["id"])["selections"]] == ["Hawks", "Owls"]
+    assert book.market(prop["id"])["status"] == "void" and book.bettor(bettor)["balance"] == START_BALANCE
+    assert any(m["player_key"] == "newguy" for m in book.markets(mid))
+    assert book.version() != v0
