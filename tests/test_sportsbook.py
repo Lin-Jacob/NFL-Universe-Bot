@@ -429,6 +429,13 @@ def test_pick_order_and_new_pages(tmp_path, monkeypatch):
             html = await (await c.get("/book/feed")).text()
             assert "Cy" in html and "2-leg parlay" in html
             assert "Single bets" in await (await c.get("/book/feed?show=singles")).text()
+            v = (await (await c.get("/book/version")).json())["f"]
+            bk = Book(db)
+            bk.place_bet(bk.create_bettor("Dee")[0], bk.markets(1)[0]["selections"][0]["id"], 5)
+            assert (await (await c.get("/book/version")).json())["f"] != v
+            part = await (await c.get("/book/feed", headers={"X-Requested-With": "fetch"})).text()
+            assert part.startswith('<div class="card scroll">') and "Dee" in part and "<h1>" not in part
+            assert "Dee" not in await (await c.get("/book/feed?view=history")).text()
             assert "Alt line" in await (await c.get("/admin/matchups/1")).text()
     asyncio.run(run())
 
@@ -509,3 +516,35 @@ def test_delete_renumbers_and_bet_card_api(tmp_path, monkeypatch):
     assert book.bettor(zed)["balance"] == START_BALANCE - 60
     assert {b["matchup_id"] for b in book.bets_for(zed)} == {2}
     assert book.create_matchup("", ["qbone"], ["qbtwo"]) == 3
+
+
+def test_parlay_cart(tmp_path):
+    db = _db(tmp_path)
+    book = Book(db)
+    for _ in range(2):
+        book.create_matchup("", ["qbone", "wrone"], ["qbtwo", "wrtwo"])
+    book.create_bettor("Zed")
+    a, b = book.markets(1)[0]["selections"][0], book.markets(2)[0]["selections"][0]
+
+    async def run():
+        async with TestClient(TestServer(WebhookServer(db, SECRET).app)) as c:
+            await c.post("/book/login", data={"name": "zed", "password": "pw12"})
+            html = await (await c.get("/book")).text()
+            assert 'id="cartbtn"' in html and 'id="cart"' in html
+            assert 'id="cartbtn"' not in await (await c.get("/book/parlay")).text()
+            csrf = re.search(r'data-csrf="(\w+)"', html).group(1)
+            ajax = {"X-Requested-With": "fetch"}
+            assert (await (await c.get("/book/api/slip")).json())["legs"] == []
+            for s in (a, b):
+                await c.post(f"/book/parlay/add/{s['id']}", data={"csrf": csrf, "next": "/book"}, headers=ajax)
+            d = await (await c.get("/book/api/slip")).json()
+            assert [g["id"] for g in d["legs"]] == [a["id"], b["id"]] and all(g["open"] for g in d["legs"])
+            assert d["decimal"] == book.parlay_decimal([a["odds"], b["odds"]])
+            r = await (await c.post("/book/parlay", data={"csrf": csrf, "stake": "", "seen": d["seen"], "size": "2"},
+                                    headers=ajax)).json()
+            assert not r["ok"] and "how much" in r["msg"]
+            r = await (await c.post("/book/parlay", data={"csrf": csrf, "stake": "25", "seen": d["seen"], "size": "2"},
+                                    headers=ajax)).json()
+            assert r["ok"] and r["balance"] == START_BALANCE - 25
+            assert (await (await c.get("/book/api/slip")).json())["legs"] == []
+    asyncio.run(run())

@@ -10,7 +10,7 @@ sportsbook.START_BALANCE in fake money):
                                    round robins and/or each pick alone
     POST /book/parlay/add/<sel>, /book/parlay/remove/<sel>, /book/parlay/clear
     POST /book/alt/<market>        bet or slip a line picked on an over/under's slider
-    GET  /book/feed                everyone's parlays and bets;  POST /book/tail/<kind>/<id> copies one
+    GET  /book/feed                live feed of open bets (?view=history: settled ones);  POST /book/tail/<kind>/<id> copies one
     GET  /book/me                  my balance and bets
     GET  /book/leaderboard         everyone's money
     GET  /book/join;  POST /book/join
@@ -96,6 +96,8 @@ border:4px solid var(--card);box-shadow:0 1px 6px rgba(0,0,0,.45)}
 .teams{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0}
 .teams ol{margin:6px 0 0;padding-left:22px;min-height:1.4em}.teams .t1 b{color:var(--accent)}.teams .t2 b{color:#c0392b}
 .tabs{display:flex;gap:6px;margin:0 0 12px}.tabs a{padding:6px 14px;border:1px solid var(--line);border-radius:999px}
+@keyframes flash{from{background:rgba(255,200,0,.35)}to{background:transparent}}
+tr.new td{animation:flash 3s}
 .tabs a.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 button.ad.in{background:var(--win)}
 .filters{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;position:sticky;top:0;z-index:5}
@@ -108,6 +110,18 @@ touch-action:none;user-select:none;font-weight:700}#betcard .bh span{flex:1}
 #betcard .bb{padding:12px;display:grid;gap:10px}#betcard .pick{font-size:18px;font-weight:700}
 #betcard .q{display:flex;gap:6px;flex-wrap:wrap}#betcard .q button{padding:4px 10px}
 #betcard .bm{min-height:1.2em}
+#cartbtn{position:fixed;right:16px;bottom:16px;z-index:40;border-radius:999px;padding:12px 18px;
+box-shadow:0 6px 20px rgba(0,0,0,.3);background:var(--chip);color:var(--text);border:1px solid var(--line)}
+#cartbtn.has{background:var(--accent);color:#fff;border-color:var(--accent)}
+#cartbtn .cn{display:inline-block;min-width:1.4em;padding:0 5px;border-radius:999px;background:rgba(255,255,255,.25)}
+#cart{position:fixed;right:16px;bottom:74px;z-index:45;width:360px;max-width:calc(100vw - 32px);max-height:70vh;
+display:none;flex-direction:column;background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:12px;
+box-shadow:0 12px 40px rgba(0,0,0,.35)}
+#cart .ch{display:flex;gap:8px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--line)}
+#cart .ch b{white-space:nowrap}#cart .ch .cc{flex:1}#cart .ch .x{padding:2px 9px}
+#cart .cl{overflow:auto;flex:1}#cart .ci{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line)}
+#cart .ci>div{flex:1}#cart .ci button{padding:2px 9px}
+#cart .cf{display:grid;gap:8px;padding:10px 12px}#cart .cs{width:100%}
 .opts label{display:flex;gap:8px;align-items:center;margin:4px 0}
 </style>"""
 
@@ -119,17 +133,31 @@ LIVE_JS = """<div id="live" class="msg" style="display:none;position:sticky;bott
 <a href="" onclick="location.reload();return false">Reload to see them</a></div>
 <script>(function(){var v=null;function busy(){var a=document.activeElement;if(a&&a.tagName=='INPUT')return true;
 var s=document.getElementById('stake'),c=document.getElementById('betcard');
-return !!(s&&s.value)||!!(c&&c.style.display==='block');}
+var k=document.getElementById('cart');
+return !!(s&&s.value)||!!(c&&c.style.display==='block')||!!(k&&k.style.display==='flex');}
 function tick(){if(document.hidden)return;fetch('/book/version',{cache:'no-store'}).then(function(r){return r.json()})
 .then(function(d){if(v===null){v=d.v;return;}if(d.v!==v){if(busy()){document.getElementById('live').style.display='block';}
 else{location.reload();}}}).catch(function(){});}
 tick();setInterval(tick,5000);document.addEventListener('visibilitychange',tick);})();</script>"""
 
 
+# Everyone's bets: when anything changes, fetch the list again and swap it in, lighting up new rows
+FEED_JS = """<script>(function(){var v=null,box=document.getElementById('feed');
+function keys(){var o={};box.querySelectorAll('tr[data-k]').forEach(function(t){o[t.dataset.k]=1});return o;}
+function tick(){if(document.hidden)return;fetch('/book/version',{cache:'no-store'}).then(function(r){return r.json()})
+.then(function(d){var n=d.v+'|'+d.f;if(v===null){v=n;return;}if(n===v)return;v=n;var old=keys();
+return fetch(location.href,{headers:{'X-Requested-With':'fetch'},cache:'no-store'}).then(function(r){return r.text()})
+.then(function(h){box.innerHTML=h;box.querySelectorAll('time[datetime]').forEach(function(t){
+var x=new Date(t.getAttribute('datetime'));if(!isNaN(x))t.textContent=x.toLocaleString(undefined,{dateStyle:'medium',timeStyle:'short'});});
+box.querySelectorAll('tr[data-k]').forEach(function(t){if(!old[t.dataset.k])
+t.classList.add('new')});});}).catch(function(){});}
+tick();setInterval(tick,4000);document.addEventListener('visibilitychange',tick);})();</script>"""
+
+
 # Over/under sliders: moving one shows that line's odds and points the buttons at it
 SLIDER_JS = """<script>(function(){function fo(o){return(o>0?'+':'')+o}
-document.querySelectorAll('form.alt').forEach(function(f){var L=JSON.parse(f.dataset.l),slip=JSON.parse(f.dataset.slip),
-r=f.querySelector('input[type=range]');function u(){var x=L[+r.value];f.querySelector('.ln').textContent=x[0];
+document.querySelectorAll('form.alt').forEach(function(f){
+var r=f.querySelector('input[type=range]');function u(){var L=JSON.parse(f.dataset.l),slip=JSON.parse(f.dataset.slip),x=L[+r.value];f.querySelector('.ln').textContent=x[0];
 f.elements.line.value=x[0];var lb=f.querySelectorAll('.lb'),b=f.querySelectorAll('button.pk b'),ad=f.querySelectorAll('button.ad');
 ['Over','Under'].forEach(function(w,j){lb[j].textContent=w+' '+x[0];b[j].textContent=fo(x[1+j]);
 var inn=x[3+j]!==null&&slip.indexOf(x[3+j])>=0;ad[j].textContent=inn?'\u2713':'+';ad[j].className=(inn?'in':'sec')+' ad';});}
@@ -185,13 +213,70 @@ if(d.ok){sel.balance=d.balance;$('.bal').textContent=f(d.balance);$('.st').value
 sel.decimal=d.decimal;$('.pick .odds').textContent=fo(d.odds);upd();}});});
 $('.ad').addEventListener('click',function(){if(!sel)return;var fd=new FormData();fd.set('csrf',cs);fd.set('next','/book');
 fetch('/book/parlay/add/'+sel.id,{method:'POST',body:fd,headers:H}).then(function(r){return r.json()}).then(function(d){
-msg(d.msg,!d.ok);if(d.ok){$('.ad').textContent='\\u2713 In your parlay slip';$('.ad').disabled=true;slipCount(d.count);}});});
+msg(d.msg,!d.ok);if(d.ok){$('.ad').textContent='\\u2713 In your parlay slip';$('.ad').disabled=true;slipCount(d.count);
+if(window.bookCart)window.bookCart.refresh();}});});
 var h=$('.bh'),dx=0,dy=0,drag=false;h.addEventListener('pointerdown',function(e){if(e.target.closest('button'))return;
 drag=true;dx=e.clientX-c.offsetLeft;dy=e.clientY-c.offsetTop;h.setPointerCapture(e.pointerId);});
 h.addEventListener('pointermove',function(e){if(!drag)return;var x=Math.max(0,Math.min(innerWidth-60,e.clientX-dx)),
 y=Math.max(0,Math.min(innerHeight-40,e.clientY-dy));c.style.left=x+'px';c.style.top=y+'px';});
 h.addEventListener('pointerup',function(){if(!drag)return;drag=false;try{localStorage.setItem('betcard-pos',
 JSON.stringify([c.offsetLeft,c.offsetTop]));}catch(e){}});})();</script>"""
+
+# The parlay cart: a button that follows you on every sportsbook page, opening a panel with the picks
+# in your slip. The + buttons add and remove picks without reloading, and the parlay is placed from
+# the panel; the full slip page (/book/parlay) is still there for round robins.
+CART_HTML = """<button id="cartbtn" type="button" aria-label="Parlay slip">🧾 Parlay <b class="cn">0</b></button>
+<div id="cart" role="dialog" aria-label="Parlay slip"><div class="ch"><b>Parlay slip</b>
+<span class="small muted cc"></span><button type="button" class="sec x" aria-label="Close">✕</button></div>
+<div class="cl"></div><div class="cf"><div class="co"></div>
+<label class="small">Stake ($) <input class="cs" inputmode="decimal" placeholder="100" autocomplete="off"></label>
+<div class="small">To win <b class="cw">$0.00</b> · paid back <b class="cr">$0.00</b></div>
+<button type="button" class="cp">Place parlay</button><div class="cm small"></div>
+<div class="small"><a href="/book/parlay">Round robins and more →</a> · <a href="#" class="cx">Clear</a></div></div></div>"""
+
+CART_JS = """<script>(function(){var c=document.getElementById('cart'),btn=document.getElementById('cartbtn'),
+cs=document.getElementById('betcard').dataset.csrf,H={'X-Requested-With':'fetch'},S=null;function $(x){return c.querySelector(x)}
+function f(v){return '$'+v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}function fo(o){return(o>0?'+':'')+o}
+function post(url,data){var fd=new FormData();fd.set('csrf',cs);fd.set('next','/book');for(var k in data)fd.set(k,data[k]);
+return fetch(url,{method:'POST',body:fd,headers:H}).then(function(r){return r.json()});}
+function show(o){c.style.display=o?'flex':'none';try{sessionStorage.setItem('cart-open',o?'1':'')}catch(e){}}
+function upd(){if(!S)return;var s=parseFloat(($('.cs').value||'').replace(/[$,]/g,''))||0,d=S.decimal;
+$('.cw').textContent=f(s*(d-1));$('.cr').textContent=f(s*d);}
+function mark(ids){document.querySelectorAll('form.addp').forEach(function(fm){var m=fm.action.match(/\\/parlay\\/(add|remove)\\/(\\d+)/);
+if(!m)return;var inn=ids.indexOf(+m[2])>=0,b=fm.querySelector('button');fm.action='/book/parlay/'+(inn?'remove':'add')+'/'+m[2];
+if(!/tail/.test(fm.action)){b.textContent=inn?'\\u2713':'+';b.className=inn?'in':'sec';}});
+document.querySelectorAll('form.alt').forEach(function(fm){fm.dataset.slip=JSON.stringify(ids);
+var r=fm.querySelector('input[type=range]');if(r)r.dispatchEvent(new Event('input'));});
+document.querySelectorAll('a[href="/book/parlay"]').forEach(function(a){if(/slip \\(/i.test(a.textContent))
+a.textContent=a.textContent.replace(/\\(\\d+\\)/,'('+ids.length+')');});}
+function draw(d){S=d;var n=d.legs.length;btn.querySelector('.cn').textContent=n;btn.className=n?'has':'';
+$('.cc').textContent=n?n+' pick'+(n==1?'':'s'):'';var l=$('.cl');l.innerHTML='';
+if(!n){l.innerHTML='<p class="small muted" style="margin:10px 12px">Empty. Tap <b>+</b> next to any pick to add it.</p>';}
+d.legs.forEach(function(g){var row=document.createElement('div');row.className='ci';var t=document.createElement('div');
+t.innerHTML='<div class="small muted"></div><div></div>';t.firstChild.textContent=g.matchup+' \\u00b7 '+g.title;
+t.lastChild.textContent=g.label+' ';var o=document.createElement('span');o.className='odds';o.textContent=fo(g.odds);
+t.lastChild.appendChild(o);if(!g.open){var z=document.createElement('span');z.className='lost small';z.textContent=' betting closed';
+t.lastChild.appendChild(z);}var x=document.createElement('button');x.type='button';x.className='sec';x.textContent='\\u2715';
+x.title='Remove';x.onclick=function(){post('/book/parlay/remove/'+g.id).then(refresh)};row.appendChild(t);row.appendChild(x);l.appendChild(row);});
+$('.co').innerHTML=n>=2?'<b>'+n+'-pick parlay</b> <span class="odds">'+fo(d.american)+'</span>':
+'<span class="small muted">'+(n?'Add one more pick to make a parlay.':'')+'</span>';$('.cp').disabled=n<2;
+$('.cf').style.display=n?'grid':'none';mark(d.legs.map(function(g){return g.id}));upd();}
+function refresh(openIt){return fetch('/book/api/slip',{headers:H,cache:'no-store'}).then(function(r){return r.json()})
+.then(function(d){if(d.ok){draw(d);if(openIt===true)show(true);}});}
+window.bookCart={refresh:refresh};
+btn.onclick=function(){show(c.style.display!=='flex')};$('.x').onclick=function(){show(false)};$('.cs').oninput=upd;
+$('.cx').onclick=function(e){e.preventDefault();post('/book/parlay/clear').then(refresh)};
+$('.cp').onclick=function(){if(!S)return;$('.cp').disabled=true;post('/book/parlay',{stake:$('.cs').value,seen:S.seen,
+size:S.legs.length}).then(function(d){var m=$('.cm');m.textContent=d.msg;m.className='cm small '+(d.ok?'won':'lost');
+if(d.ok){$('.cs').value='';var e=document.querySelector('.bar .money');if(e)e.textContent=f(d.balance);}refresh();});};
+document.addEventListener('submit',function(e){var fm=e.target;if(!fm.matches('form.addp')||/tail/.test(fm.action))return;
+e.preventDefault();post(fm.action,{}).then(function(d){if(!d.ok){alertMsg(d.msg)}refresh(/\\/add\\//.test(fm.action));});});
+document.addEventListener('click',function(e){var b=e.target.closest('form.alt button[value$=":parlay"]');if(!b)return;
+e.preventDefault();var fd=new FormData(b.form);fd.set('pick',b.value);fetch(b.form.action,{method:'POST',body:fd,headers:H})
+.then(function(r){return r.json()}).then(function(d){if(!d.ok){alertMsg(d.msg);return;}if(d.sel){var L=JSON.parse(b.form.dataset.l);
+L.forEach(function(x){if(x[0]==d.line)x[d.side==='over'?3:4]=d.sel});b.form.dataset.l=JSON.stringify(L);}refresh(d.in_slip);});},true);
+function alertMsg(t){show(true);var m=$('.cm');m.textContent=t;m.className='cm small lost';$('.cf').style.display='grid';}
+refresh();try{if(sessionStorage.getItem('cart-open'))show(true)}catch(e){}})();</script>"""
 
 BETCARD_HTML = """<div id="betcard" role="dialog" aria-label="Bet slip" data-csrf="{csrf}">
 <div class="bh" title="Drag to move"><span>⠿ Bet slip</span><button class="x" type="button" aria-label="Close">✕</button></div>
@@ -277,6 +362,7 @@ class BookSite:
             web.post("/book/alt/{id}", self.alt_pick),
             web.get("/book/feed", self.feed),
             web.get("/book/api/sel/{id}", self.api_selection),
+            web.get("/book/api/slip", self.api_slip),
             web.post("/book/tail/{kind}/{id}", self.tail),
             web.get("/book/me", self.me),
             web.get("/book/leaderboard", self.leaderboard),
@@ -343,7 +429,8 @@ class BookSite:
                 f'<a href="/book/leaderboard">Leaderboard</a>'
                 f'<form method="post" action="/book/logout" style="margin:0 0 0 auto">'
                 f'{self._hidden(request, BETTOR_COOKIE)}<button class="sec">Log out</button></form></div>'
-                + BETCARD_HTML.replace("{csrf}", self._csrf(request, BETTOR_COOKIE)) + BETCARD_JS)
+                + BETCARD_HTML.replace("{csrf}", self._csrf(request, BETTOR_COOKIE)) + BETCARD_JS
+                + ("" if request.path == "/book/parlay" else CART_HTML + CART_JS))
 
     def _slip_ids(self, bettor) -> set[int]:
         return {r["selection_id"] for r in self.db.q("SELECT selection_id FROM book_slip WHERE bettor_id = ?",
@@ -650,13 +737,17 @@ class BookSite:
                 if _ajax(request):
                     return web.json_response({"ok": True, "sel": sel["id"]})
                 raise web.HTTPSeeOther(f"/book/bet/{sel['id']}")
-            if sel["id"] in self._slip_ids(bettor):
+            inside = sel["id"] in self._slip_ids(bettor)
+            if inside:
                 self.book.slip_remove(bettor["id"], sel["id"])
                 msg = f"Took {sel['label']} out of your parlay slip."
             else:
                 self.book.slip_add(bettor["id"], sel["id"])
                 n = len(self._slip_ids(bettor))
                 msg = f"Added {sel['label']} to your parlay slip ({n} pick{'s' * (n != 1)})."
+            if _ajax(request):
+                return web.json_response({"ok": True, "msg": msg, "sel": sel["id"], "line": m["line"], "side": side,
+                                          "in_slip": not inside})
         except BookError as e:
             if _ajax(request):
                 return web.json_response({"ok": False, "msg": str(e)})
@@ -674,6 +765,21 @@ class BookSite:
             "title": self._title(s), "matchup": f'#{s["matchup_id"]} {s["matchup_title"]}',
             "open": s["matchup_status"] == "open" and s["market_status"] == "open",
             "in_slip": s["id"] in self._slip_ids(bettor), "balance": bettor["balance"]},
+            headers={"Cache-Control": "no-store"})
+
+    async def api_slip(self, request: web.Request) -> web.Response:
+        """The parlay cart: the picks in the slip with their current odds."""
+        bettor = self._bettor(request)
+        if not bettor:
+            return web.json_response({"ok": False})
+        legs = self.book.slip(bettor["id"])
+        dec = self.book.parlay_decimal([s["odds"] for s in legs])
+        return web.json_response({
+            "ok": True, "decimal": dec, "american": american_from_decimal(dec) if dec > 1 else 0,
+            "seen": ",".join(f'{s["id"]}:{s["odds"]}' for s in legs), "balance": bettor["balance"],
+            "legs": [{"id": s["id"], "label": s["label"], "odds": s["odds"], "title": self._title(s),
+                      "matchup": f'#{s["matchup_id"]} {s["matchup_title"]}',
+                      "open": s["matchup_status"] == "open" and s["market_status"] == "open"} for s in legs]},
             headers={"Cache-Control": "no-store"})
 
     async def slip(self, request: web.Request, error: str = "", stake: str = "") -> web.Response:
@@ -940,7 +1046,12 @@ class BookSite:
                 raise BookError("Pick what to bet: the parlay, a round robin or each pick alone.")
             res = self.book.place_slip(bettor["id"], stake, seen, sizes, keep=bool(form.get("keep")))
         except BookError as e:
+            if _ajax(request):
+                return web.json_response({"ok": False, "msg": str(e)})
             return await self.parlay_page(request, str(e), str(form.get("stake", "")), set(sizes))
+        if _ajax(request):
+            return web.json_response({"ok": True, "balance": self.book.bettor(bettor["id"])["balance"],
+                                      "msg": f"Parlay placed: {_money(stake)}. Good luck! It's under My bets."})
         parts = ([f"{len(res['parlays'])} parlay{'s' * (len(res['parlays']) != 1)}"] if res["parlays"] else []) + (
             [f"{len(res['singles'])} straight bet{'s' * (len(res['singles']) != 1)}"] if res["singles"] else [])
         raise _redirect("/book/parlay" if form.get("keep") else "/book/me",
@@ -948,18 +1059,20 @@ class BookSite:
 
     # ------------------------------------------------------- everyone's bets
     async def feed(self, request: web.Request) -> web.Response:
-        """Everyone's parlays (or single bets), newest first, each with a Tail button that copies it."""
+        """Everyone's bets. Live: open bets, newest first, updating on the page as bets come in, each with
+        a Tail button that copies it. Bet history: settled bets with their results."""
         bettor = self._require_bettor(request)
-        show = request.query.get("show", "parlays")
-        show = show if show in ("parlays", "singles", "all") else "parlays"
-        items = [d for d in self.book.feed(150) if show == "all" or d["kind"] == ("parlay" if show == "parlays"
-                                                                                  else "bet")][:60]
+        view = "history" if request.query.get("view") == "history" else "live"
+        show = request.query.get("show", "all")
+        show = show if show in ("parlays", "singles", "all") else "all"
+        items = [d for d in self.book.feed(200, pending=view == "live")
+                 if show == "all" or d["kind"] == ("parlay" if show == "parlays" else "bet")][:80]
         name, csrf = self._names(), self._hidden(request, BETTOR_COOKIE)
         icon = {"win": "✅", "lose": "❌", "push": "↩", "void": "↩", None: "⏳"}
         rows = []
         for d in items:
             if d["status"] == "pending":
-                res = f'<span class="muted">Pending · to win {_money(d["stake"] * (d["decimal"] - 1))}</span>'
+                res = f'<span class="muted">Open · to win {_money(d["stake"] * (d["decimal"] - 1))}</span>'
             elif d["status"] == "won":
                 res = f'<span class="won">Won {_money(d["payout"] - d["stake"])}</span>'
             elif d["status"] == "lost":
@@ -980,19 +1093,29 @@ class BookSite:
                         f'<button title="Copy these picks into your parlay slip">Tail</button></form>')
             what = (f'{len(d["legs"])}-leg parlay <span class="odds">{fmt_odds(american_from_decimal(d["decimal"]))}'
                     f'</span><br>' if d["kind"] == "parlay" else "")
-            rows.append(f'<tr><td><b>{_e(d["name"])}</b><br><span class="small muted">{_time(d["placed_at"])}</span></td>'
+            rows.append(f'<tr data-k="{d["kind"]}{d["id"]}"><td><b>{_e(d["name"])}</b><br>'
+                        f'<span class="small muted">{_time(d["placed_at"])}</span></td>'
                         f'<td class="small">{what}{legs}</td><td class="n">{_money(d["stake"])}</td>'
-                        f'<td>{res}</td><td>{tail}</td></tr>')
-        tabs = "".join(f'<a href="/book/feed?show={k}"{" class=on" if k == show else ""}>{lbl}</a>'
-                       for k, lbl in (("parlays", "Parlays"), ("singles", "Single bets"), ("all", "All")))
+                        f'<td>{res}</td>{"<td>" + tail + "</td>" if view == "live" else ""}</tr>')
+        empty = "No open bets right now." if view == "live" else "No bets have been settled yet."
         table = ('<div class="card scroll"><table><tr><th>Bettor</th><th>Picks</th><th class="n">Stake</th>'
-                 f'<th>Result</th><th></th></tr>{"".join(rows)}</table></div>' if rows
-                 else "<p class='muted'>Nobody has placed one yet.</p>")
+                 f'<th>Result</th>{"<th></th>" if view == "live" else ""}</tr>{"".join(rows)}</table></div>'
+                 if rows else f"<p class='muted'>{empty}</p>")
+        if _ajax(request):
+            return web.Response(text=table, content_type="text/html", headers={"Cache-Control": "no-store"})
+        q = lambda v, k: f"/book/feed?view={v}" + ("" if k == "all" else f"&show={k}")
+        tabs = "".join(f'<a href="{q(v, show)}"{" class=on" if v == view else ""}>{lbl}</a>'
+                       for v, lbl in (("live", "🔴 Live"), ("history", "Bet history")))
+        kinds = "".join(f'<a href="{q(view, k)}"{" class=on" if k == show else ""}>{lbl}</a>'
+                        for k, lbl in (("all", "All"), ("parlays", "Parlays"), ("singles", "Single bets")))
+        note = ("Everyone's open bets as they're placed. This list updates by itself. Like someone's bet? "
+                "<b>Tail</b> copies its picks (the ones still open) at today's odds: a parlay goes into your "
+                "parlay slip, a single bet opens its bet slip. You pick your own stake."
+                if view == "live" else "Bets that have been settled, newest first, with how they did.")
         body = (self._bar(request, bettor) + _flash(request) + "<h1>Everyone's bets</h1><div class='tabs'>"
-                + tabs + "</div><p class='small muted'>Like someone's bet? <b>Tail</b> copies its picks (the ones "
-                  "still open) at today's odds: a parlay goes into your parlay slip, a single bet opens its bet "
-                  "slip. You pick your own stake.</p>" + table)
-        return self._page("Everyone's bets", body, live=True)
+                + tabs + "</div><div class='tabs small'>" + kinds + f"</div><p class='small muted'>{note}</p>"
+                + f'<div id="feed">{table}</div>' + FEED_JS)
+        return self._page("Everyone's bets", body)
 
     async def tail(self, request: web.Request) -> web.Response:
         bettor = self._require_bettor(request)
@@ -1022,7 +1145,7 @@ class BookSite:
                 f'<th class="n">Bets</th></tr>{body}</table></div>')
 
     async def version(self, request: web.Request) -> web.Response:
-        return web.json_response({"v": self.book.version()}, headers={"Cache-Control": "no-store"})
+        return web.json_response({"v": self.book.version(), "f": self.book.feed_version()}, headers={"Cache-Control": "no-store"})
 
     async def leaderboard(self, request: web.Request) -> web.Response:
         body = (self._bar(request, self._bettor(request)) + "<h1>Sportsbook leaderboard</h1>"

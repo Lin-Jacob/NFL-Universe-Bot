@@ -628,6 +628,13 @@ class Book:
             "        || players1 || players2, ',') FROM book_matchups) c")
         return hashlib.sha256("|".join(str(v) for v in tuple(row)).encode()).hexdigest()[:16]
 
+    def feed_version(self) -> str:
+        """Changes whenever a bet or parlay is placed, settled or removed, for the live bets feed."""
+        row = self.db.one("SELECT (SELECT COUNT(*) || ':' || COALESCE(MAX(id), 0) || ':' || SUM(status = 'pending') "
+                          "FROM book_bets) a, (SELECT COUNT(*) || ':' || COALESCE(MAX(id), 0) || ':' || "
+                          "SUM(status = 'pending') FROM book_parlays) b")
+        return f"{row['a']}|{row['b']}"
+
     def _add_total(self, matchup_id: int, model: dict, line: float) -> int:
         po = p_over(model, line)
         oo, ou = price([po, 1 - po])
@@ -952,10 +959,12 @@ class Book:
             c.commit()
         return legs
 
-    def feed(self, limit: int = 60) -> list[dict]:
+    def feed(self, limit: int = 60, pending: bool | None = None) -> list[dict]:
         """Everyone's latest bets and parlays, newest first: {"kind": "bet" | "parlay", "id", "name",
         "bettor_id", "stake", "status", "payout", "placed_at", "decimal", "legs": [...]}; a leg has the
-        pick, its odds when placed and whether betting on it is still open."""
+        pick, its odds when placed and whether betting on it is still open. pending=True keeps only
+        open bets, False only settled ones."""
+        only = "" if pending is None else f"WHERE status {'=' if pending else '!='} 'pending' "
         leg_sql = ("SELECT {odds} AS odds, s.id AS selection_id, s.label, s.outcome, m.title AS market_title, "
                    "m.result, m.kind, m.player_key, m.stat, m.status AS market_status, mu.status AS matchup_status, "
                    "mu.title AS matchup_title, mu.id AS matchup_id FROM {src} JOIN book_selections s "
@@ -963,12 +972,12 @@ class Book:
                    "JOIN book_matchups mu ON mu.id = m.matchup_id WHERE {where} ORDER BY {order}")
         out = []
         for r in self.db.q("SELECT b.*, u.name FROM book_bets b JOIN book_bettors u ON u.id = b.bettor_id "
-                           "ORDER BY b.id DESC LIMIT ?", (limit,)):
+                           + only.replace("status", "b.status") + "ORDER BY b.id DESC LIMIT ?", (limit,)):
             legs = self.db.q(leg_sql.format(odds="b.odds", src="book_bets b", sel="b.selection_id",
                                             where="b.id = ?", order="b.id"), (r["id"],))
             out.append(dict(r, kind="bet", legs=[dict(x) for x in legs], decimal=decimal_odds(r["odds"])))
         for r in self.db.q("SELECT p.*, u.name FROM book_parlays p JOIN book_bettors u ON u.id = p.bettor_id "
-                           "ORDER BY p.id DESC LIMIT ?", (limit,)):
+                           + only.replace("status", "p.status") + "ORDER BY p.id DESC LIMIT ?", (limit,)):
             legs = [dict(x) for x in self.db.q(leg_sql.format(odds="l.odds", src="book_parlay_legs l",
                                                               sel="l.selection_id", where="l.parlay_id = ?",
                                                               order="l.id"), (r["id"],))]
