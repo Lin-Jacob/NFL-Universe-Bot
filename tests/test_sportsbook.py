@@ -111,11 +111,12 @@ def test_web_flow(tmp_path, monkeypatch):
         async with TestClient(TestServer(srv.app)) as c:
             # new visitor is asked for a name
             html = await (await c.get("/book")).text()
-            assert "Pick a name" in html and "$10,000.00" in html
+            assert "Pick a password" in html and "$10,000.00" in html
             assert "Sportsbook" in await (await c.get("/")).text()
-            r = await c.post("/book/join", data={"name": "<i>Ann</i>", "next": "/book"})
+            assert "at least 4" in await (await c.post("/book/join", data={"name": "Ann", "password": "x"})).text()
+            r = await c.post("/book/join", data={"name": "<i>Ann</i>", "password": "pass1", "next": "/book"})
             html = await r.text()
-            assert r.status == 200 and "&lt;i&gt;Ann&lt;/i&gt;" in html and "account code is" in html
+            assert r.status == 200 and "&lt;i&gt;Ann&lt;/i&gt;" in html and "Welcome!" in html
             assert (await c.post("/book/join", data={"name": "Ann2"})).status == 200  # already joined: no-op
             assert len(Book(db).leaderboard()) == 1
 
@@ -166,6 +167,26 @@ def test_web_flow(tmp_path, monkeypatch):
                 assert "No account has that code" in await (await c2.post("/book/code", data={"code": "zzzz"})).text()
                 r = await c2.post("/book/code", data={"code": code.lower().replace("-", " "), "next": "/book/me"})
                 assert "Welcome back" in (html := await r.text()) and "$9,750.00" in html
+            # name + password works on another device; log out works
+            async with TestClient(TestServer(srv.app)) as c3:
+                r = await c3.post("/book/login", data={"name": "<i>ann</i>", "password": "nope"})
+                assert "Wrong name or password" in await r.text()
+                r = await c3.post("/book/login", data={"name": "<i>ann</i>", "password": "pass1", "next": "/book/me"})
+                html = await r.text()
+                assert "Welcome back" in html and "$9,750.00" in html and "Change password" in html
+                lcsrf = re.search(r'name="csrf" value="(\w+)"', html).group(1)
+                r = await c3.post("/book/password", data={"csrf": lcsrf, "password": "pass2"})
+                assert "Password saved" in await r.text()
+                r = await c3.post("/book/logout", data={"csrf": lcsrf})
+                assert "Logged out" in (html := await r.text()) and "Log in" in html
+                assert Book(db).login("<i>Ann</i>", "pass2")[0] and not Book(db).login("<i>Ann</i>", "pass1")[0]
+                # an old account with no password is claimed by logging in, keeping its money and bets
+                old_id, _ = Book(db).create_bettor("Old Timer")
+                Book(db).adjust_balance(old_id, 123)
+                r = await c3.post("/book/login", data={"name": "old timer", "password": "mine", "next": "/book/me"})
+                assert "its password now" in (html := await r.text()) and "$10,123.00" in html
+                assert Book(db).login("Old Timer", "mine") == (Book(db).bettor(old_id), False)
+                assert Book(db).login("Old Timer", "other")[0] is None
 
             # the game arrives by webhook and settles the matchup
             p = json.loads(SAMPLE.read_text())
