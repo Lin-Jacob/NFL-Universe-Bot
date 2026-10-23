@@ -267,6 +267,9 @@ def ensure_schema(db: Database) -> None:
             if "premium" not in cols:
                 # Bet insurance paid on top of the stake (kept by the book; the stake comes back on a loss)
                 c.execute(f"ALTER TABLE {table} ADD COLUMN premium REAL NOT NULL DEFAULT 0")
+        if "insured_sel" not in {r["name"] for r in c.execute("PRAGMA table_info(book_parlays)")}:
+            # The one parlay pick that's insured: if it's the only pick that loses, the stake comes back
+            c.execute("ALTER TABLE book_parlays ADD COLUMN insured_sel INTEGER")
         sel_cols = {r["name"] for r in c.execute("PRAGMA table_info(book_selections)")}
         if "boost_from" not in sel_cols:
             # An odds boost: the odds before it, and the biggest stake allowed at the boosted odds
@@ -1782,9 +1785,11 @@ class Book:
 
     def place_slip(self, bettor_id: int, stake: float, seen: list[tuple[int, int]] | None = None,
                    sizes: list[int] | None = None, keep: bool = False, promo_id: int | None = None,
-                   insure: bool = False) -> dict:
+                   insure_sel: int | None = None) -> dict:
         """Bet the slip, stake on each bet: sizes [n] = one parlay of every pick; add 1 for each pick
         on its own, or any k for every k-pick parlay from the slip (a round robin), all at once.
+        insure_sel = one pick of a parlay to insure (pick insurance, INSURANCE_PCT of the stake): if it's
+        the only pick that loses, the stake comes back.
         seen = [(selection id, odds)] the bettor was shown; if any pick or its odds changed since,
         nothing is placed so they can look again. keep=True leaves the picks in the slip.
         Returns {"singles": [bet ids], "parlays": [parlay ids], "cost": total staked}."""
@@ -1819,7 +1824,11 @@ class Book:
                 raise BookError("A promo goes on one bet: place the parlay on its own to use it.")
             if n_bets > MAX_SLIP_BETS:
                 raise BookError(f"That's {n_bets} bets; the most at once is {MAX_SLIP_BETS}. Pick fewer sizes.")
-            premium = self._premium(promo, stake, insure)
+            if insure_sel and (n_bets != 1 or sizes[0] < 2):
+                raise BookError("Pick insurance goes on one parlay: bet the parlay on its own to use it.")
+            if insure_sel and insure_sel not in {s["id"] for s in legs}:
+                raise BookError("Insure one of the picks in your parlay.")
+            premium = self._premium(promo, stake, bool(insure_sel))
             cost = round((stake + premium) * n_bets, 2)
             b = c.execute("SELECT balance FROM book_bettors WHERE id = ?", (bettor_id,)).fetchone()
             if not b or b["balance"] + 1e-9 < cost:
@@ -1831,8 +1840,6 @@ class Book:
             for k in sizes:
                 for combo in itertools.combinations(legs, k):
                     boost, nosweat = self._promo_terms(promo, stake, parlay_boost(k) if k > 1 else 0.0)
-                    if premium:
-                        nosweat = stake
                     if k == 1:
                         singles.append(c.execute("INSERT INTO book_bets(bettor_id, selection_id, stake, odds, "
                                                  "placed_at, boost, nosweat, promo_id, premium) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -1840,8 +1847,9 @@ class Book:
                                                   nosweat, promo["id"] if promo else None, premium)).lastrowid)
                         continue
                     pid = c.execute("INSERT INTO book_parlays(bettor_id, stake, placed_at, boost, nosweat, promo_id, "
-                                    "premium) VALUES(?,?,?,?,?,?,?)", (bettor_id, stake, now, boost, nosweat,
-                                                                       promo["id"] if promo else None, premium)).lastrowid
+                                    "premium, insured_sel) VALUES(?,?,?,?,?,?,?,?)",
+                                    (bettor_id, stake, now, boost, nosweat, promo["id"] if promo else None, premium,
+                                     insure_sel or None)).lastrowid
                     for s in combo:
                         c.execute("INSERT INTO book_parlay_legs(parlay_id, selection_id, odds) VALUES(?,?,?)",
                                   (pid, s["id"], s["odds"]))
@@ -1946,8 +1954,8 @@ class Book:
         for p in self.db.q("SELECT * FROM book_parlays WHERE bettor_id = ? ORDER BY id DESC", (bettor_id,)):
             d = dict(p)
             d["legs"] = [dict(r) for r in self.db.q(
-                "SELECT l.odds, s.label, s.outcome, m.title AS market_title, m.result, m.kind, m.player_key, "
-                "m.stat, mu.title AS matchup_title, mu.id AS matchup_id FROM book_parlay_legs l "
+                "SELECT l.odds, l.selection_id, s.label, s.outcome, m.title AS market_title, m.result, m.kind, "
+                "m.player_key, m.stat, mu.title AS matchup_title, mu.id AS matchup_id FROM book_parlay_legs l "
                 "JOIN book_selections s ON s.id = l.selection_id JOIN book_markets m ON m.id = s.market_id "
                 "JOIN book_matchups mu ON mu.id = m.matchup_id WHERE l.parlay_id = ? ORDER BY l.id", (p["id"],))]
             d["decimal"] = self.parlay_decimal([leg["odds"] for leg in d["legs"]]) if d["legs"] else 1.0
@@ -1965,10 +1973,16 @@ class Book:
         marks = ",".join("?" * len(sel_ids))
         for p in c.execute(f"SELECT DISTINCT p.* FROM book_parlays p JOIN book_parlay_legs l ON l.parlay_id = p.id "
                            f"WHERE l.selection_id IN ({marks}) AND NOT p.admin_void", sel_ids).fetchall():
-            legs = c.execute("SELECT l.odds, s.outcome FROM book_parlay_legs l JOIN book_selections s "
+            legs = c.execute("SELECT l.odds, l.selection_id, s.outcome FROM book_parlay_legs l JOIN book_selections s "
                              "ON s.id = l.selection_id WHERE l.parlay_id = ?", (p["id"],)).fetchall()
             outcomes = [leg["outcome"] for leg in legs]
-            if "lose" in outcomes:
+            losers = [leg["selection_id"] for leg in legs if leg["outcome"] == "lose"]
+            saved = "insured_sel" in p.keys() and p["insured_sel"] and losers == [p["insured_sel"]]
+            if saved and None in outcomes:  # only the insured pick has lost so far: wait for the rest
+                status, payout = "pending", 0.0
+            elif saved:  # pick insurance: the insured pick was the only miss, so the stake comes back
+                status, payout = "lost", round(max(p["stake"], payout_for(p, "lose", 1.0)), 2)
+            elif "lose" in outcomes:
                 status, payout = "lost", payout_for(p, "lose", 1.0)
             elif None in outcomes:
                 status, payout = "pending", 0.0
