@@ -260,24 +260,25 @@ def table(rows: list[list[str]], headers: list[str]) -> str:
     return f"```\n{text}\n```"
 
 
-MVP_ICON = {"MVP": "🏆", **GROUP_ICON}
 SEASON_GOLD = 0xF1C40F
 
 
 def season_embed(db: Database, season, race: dict, final: bool) -> discord.Embed:
-    """A season's awards (final=True, when it ends) or its current MVP race."""
-    from .analytics import MVP_ROLES  # local: analytics imports db, keep embeds light at import
+    """A season's stat awards (final=True, when it ends) or the race for them while it's going."""
+    from .awards import STAT_AWARDS, vote_awards  # local: awards imports analytics, which imports db
 
     names = Names(db)
     span = f"Started {when(season['started_at'], 'D')}"
     if season["ended_at"]:
         span += f" · ended {when(season['ended_at'], 'D')}"
-    title = f"🏆 {season['name']} awards" if final else f"📅 {season['name']}" + (
-        "" if season["ended_at"] else " · MVP race")
+    limit = int(getattr(config, "SEASON_GAMES", 20) or 0)
+    count = f"{race['games']}/{limit} games" if limit and not season["ended_at"] else f"{race['games']} games"
+    title = f"🏆 {season['name']} · stat awards" if final else f"📅 {season['name']}" + (
+        "" if season["ended_at"] else " · awards race")
     e = discord.Embed(title=title, color=SEASON_GOLD if final else config.EMBED_COLOR,
-                      description=f"{span} · {race['games']} games")
-    for role, award in MVP_ROLES.items():
-        rows = race["roles"].get(role) or []
+                      description=f"{span} · {count}")
+    for key, (award, icon) in STAT_AWARDS.items():
+        rows = race["roles"].get(key) or []
         if not rows:
             value = "No eligible players"
         else:
@@ -287,8 +288,38 @@ def season_embed(db: Database, season, race: dict, final: bool) -> discord.Embed
             if rest:
                 value += "\n" + " · ".join(f"{['🥈', '🥉'][i] if i < 2 else f'{i + 2}.'} {names(r['username'])} "
                                            f"{fmt_num(r['points'])}" for i, r in enumerate(rest))
-        label_ = f"{MVP_ICON.get(role, '')} {award}" + (" MVP" if role != "MVP" else "")
-        e.add_field(name=label_, value=value[:1024], inline=role != "MVP")
-    e.set_footer(text=f"Ranked by fantasy points earned in that role this season. "
+        e.add_field(name=f"{icon} {award}", value=value[:1024], inline=key != "PTS")
+    voted = ", ".join(t for t, _ in vote_awards().values())
+    if season["ended_at"] and season["vote_ends_at"] and not season["vote_results"]:
+        e.add_field(name="🗳️ Vote for the rest", inline=False, value=(
+            f"{voted}: players vote with `/vote` or on the website until {when(season['vote_ends_at'], 'f')}. "
+            f"You can't vote for yourself, and a vote counts more the more of the season's games you played."))
+    elif season["vote_results"]:
+        e.add_field(name="🗳️ Voted awards", inline=False, value="Voting has closed: see `/season votes:True`.")
+    else:
+        e.add_field(name="🗳️ Voted awards", inline=False, value=f"{voted}: voted on by the players when the season ends.")
+    e.set_footer(text=f"Stat awards: fantasy points earned in that role this season. "
                       f"Needs {race['min_games']}+ games in the role to qualify.")
+    return e
+
+
+def vote_embed(db: Database, season, results: dict, final: bool = True) -> discord.Embed:
+    """The players' vote for a season's voted awards: winners by weighted votes."""
+    from .awards import vote_awards
+
+    names = Names(db)
+    e = discord.Embed(title=f"🗳️ {season['name']} · voted awards" + ("" if final else " (votes so far)"),
+                      color=SEASON_GOLD if final else config.EMBED_COLOR,
+                      description=f"{results['voters']} players voted. Each vote is weighted by the share of "
+                                  f"the season's games the voter played.")
+    for key, (award, icon) in vote_awards().items():
+        rows = results["roles"].get(key) or []
+        if not rows:
+            value = "No votes"
+        else:
+            w = rows[0]
+            value = f"**{names(w['username'])}** · {fmt_num(w['weight'])} ({w['votes']} vote{'s' if w['votes'] != 1 else ''})"
+            if rows[1:]:
+                value += "\n" + " · ".join(f"{names(r['username'])} {fmt_num(r['weight'])}" for r in rows[1:3])
+        e.add_field(name=f"{icon} {award}", value=value[:1024], inline=key != "MVP")
     return e

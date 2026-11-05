@@ -16,16 +16,18 @@ import os
 import signal
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 import config
 from nflu.admin import Admin
 from nflu.commands import Stats
 from nflu.db import Database
-from nflu.embeds import game_embed
+from nflu import analytics
+from nflu.embeds import game_embed, season_embed, vote_embed
 from nflu.feed import PAIR_WINDOW, nearest_csv, nflu_embed, nflu_server_id, server_allowed
 from nflu.parser import ParsedGame
+from nflu.season_admin import SeasonAdmin
 from nflu.tunnel import Tunnel
 from nflu.players import players
 from nflu.webhook import WebhookServer, ingest
@@ -63,9 +65,11 @@ class NFLUBot(commands.Bot):
         self.apply_config()
         await self.add_cog(Stats(self))
         await self.add_cog(Admin(self))
+        await self.add_cog(SeasonAdmin(self))
         await self.webhook.start()
         url = await self.tunnel.start()
         self._print_banner(url)
+        self.season_watch.start()
 
         guild_id = os.getenv("GUILD_ID")
         guild = discord.Object(id=int(guild_id)) if guild_id else None
@@ -152,7 +156,42 @@ class NFLUBot(commands.Bot):
                 pass
         return res
 
+    # ----------------------------------------------------------------- seasons
+    @tasks.loop(minutes=5)
+    async def season_watch(self) -> None:
+        """Post a season's awards once it fills up, and close MVP votes whose time is up."""
+        try:
+            await self.announce_pending_season()
+            for s in self.db.votes_due():
+                await self.close_vote(s["id"])
+        except Exception:
+            log.exception("Season check failed")
+
+    @season_watch.before_loop
+    async def _season_watch_ready(self) -> None:
+        await self.wait_until_ready()
+
+    async def announce_pending_season(self) -> None:
+        """A season that ended by reaching SEASON_GAMES games: post its stat awards and open the vote."""
+        sid = self.db.get_setting("season_announce_pending")
+        if not sid:
+            return
+        s = self.db.season(int(sid))
+        if s and s["mvps"] and await self.announce_embed(season_embed(self.db, s, json.loads(s["mvps"]), final=True)):
+            self.db.set_setting("season_announce_pending", None)
+        elif not s:
+            self.db.set_setting("season_announce_pending", None)
+
+    async def close_vote(self, season_id: int) -> dict:
+        """Count a season's MVP vote, save the result and post it."""
+        results = analytics.vote_results(self.db, season_id)
+        self.db.close_voting(season_id, results)
+        await self.announce_embed(vote_embed(self.db, self.db.season(season_id), results))
+        return results
+
     async def close(self) -> None:
+        if self.season_watch.is_running():
+            self.season_watch.cancel()
         await self.tunnel.stop()
         await self.webhook.stop()
         await super().close()
@@ -216,6 +255,7 @@ class NFLUBot(commands.Bot):
         e = game_embed(self.db, game_id, "🔁 Updated: " if replaced else "🏈 Final: ")
         if e:
             await channel.send(embed=e)
+        await self.announce_pending_season()  # this game may have been the season's last
         return True
 
     async def announce_embed(self, embed: discord.Embed) -> bool:

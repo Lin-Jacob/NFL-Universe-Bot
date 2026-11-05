@@ -22,6 +22,9 @@ Admin (user "admin", password ADMIN_PASSWORD in .env; off when it isn't set):
     GET  /admin                    login, house profit/loss, matchups, create a matchup
     GET  /admin/matchups/<id>      edit lines and odds, lock, add props/custom bets, settle
     GET  /admin/bettors            adjust balances
+
+Season awards vote (league players, logged in with their sportsbook account):
+    GET  /vote                     ballot for the season whose vote is open;  POST casts or changes votes
 """
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ from aiohttp import web
 
 from .db import Database
 from .embeds import Names
-from . import players
+from . import analytics, awards, players
 from .site import _e, _page, _time
 from .sportsbook import (GIVE_TIER_REWARDS, INSURANCE_PCT, MAX_PARLAY_LEGS, MAX_SLIP_BETS, PARLAY_BOOSTS, PROMO_KINDS, START_BALANCE,
                          TIERS, TIER_REWARDS, Book, BookError,
@@ -404,6 +407,8 @@ class BookSite:
             web.post("/admin/promos", self.admin_promos_action),
             web.get("/book/leaderboard", self.leaderboard),
             web.get("/book/version", self.version),
+            web.get("/vote", self.vote_page),
+            web.post("/vote", self.vote_submit),
             web.get("/admin", self.admin),
             web.post("/admin/login", self.admin_login),
             web.post("/admin/logout", self.admin_logout),
@@ -592,7 +597,8 @@ class BookSite:
 
     @staticmethod
     def _safe_next(nxt: str | None) -> str:
-        return nxt if nxt and nxt.startswith("/book") and "//" not in nxt else "/book"
+        ok = nxt and (nxt.startswith("/book") or nxt == "/vote") and "//" not in nxt
+        return nxt if ok else "/book"
 
     async def join(self, request: web.Request) -> web.Response:
         form = await request.post()
@@ -677,6 +683,65 @@ class BookSite:
             await asyncio.sleep(1)
             return self._page("Join", self._join_html(nxt, "No account has that code."))
         raise self._login_bettor(request, b["token"], _redirect(nxt, f"Welcome back, {b['name']}!"))
+
+    # ------------------------------------------------------------ award votes
+    async def vote_page(self, request: web.Request) -> web.Response:
+        """Ballot for the open season vote. Same rules as /vote in Discord (awards.cast)."""
+        s = self.db.voting_season()
+        if not s:
+            last = self.db.q("SELECT * FROM seasons WHERE vote_results IS NOT NULL ORDER BY id DESC LIMIT 1")
+            more = (f' See <a href="/seasons/{last[0]["id"]}">{_e(last[0]["name"])}\'s results</a>.' if last else "")
+            return _page("Vote", f"<h1>Season awards vote</h1>{_flash(request)}<div class='card'>No vote is open "
+                                 f"right now. Voting opens when a season ends.{more}</div>")
+        bettor = self._require_bettor(request)
+        voter = self.book.player_key(bettor["id"])
+        names = Names(self.db)
+        if not voter:
+            return _page("Vote", f"<h1>{_e(s['name'])} awards vote</h1><div class='card'>Only league players can "
+                                 f"vote, and this account (<b>{_e(bettor['name'])}</b>) isn't linked to one. Log in "
+                                 f"with your league player name, or ask an admin to set <b>Plays as</b>.</div>")
+        weight, games, total = analytics.voter_weight(self.db, s["id"], voter)
+        if not games:
+            return _page("Vote", f"<h1>{_e(s['name'])} awards vote</h1><div class='card'>Only players who played in "
+                                 f"{_e(s['name'])} can vote, and {_e(names(voter))} didn't play a game in it.</div>")
+        mine = awards.my_votes(self.db, s["id"], voter)
+        cands = awards.candidates(self.db, s["id"], exclude=voter)
+        rows = []
+        for key, (title, icon) in awards.vote_awards().items():
+            opts = ['<option value="">(no vote)</option>'] + [
+                f'<option value="{_e(k)}"{" selected" if mine.get(key) == k else ""}>{_e(names.dashed(u))}</option>'
+                for k, u in cands]
+            rows.append(f'<tr><td>{icon} <b>{_e(title)}</b></td><td><select name="award_{_e(key)}">'
+                        f'{"".join(opts)}</select></td></tr>')
+        body = (f"<h1>{_e(s['name'])} awards vote</h1>{_flash(request)}"
+                f"<div class='card'>Voting as <b>{_e(names.dashed(voter))}</b>. You played <b>{games}</b> of the "
+                f"season's {total} games, so each of your votes counts <b>{weight:g}</b> "
+                f"(players with 75% of the games count 1, 50% count 0.75, 25% count 0.5). You can't vote for "
+                f"yourself, and you can change your votes until {_time(s['vote_ends_at'])}.</div>"
+                f'<form method="post" action="/vote">{self._hidden(request, BETTOR_COOKIE)}'
+                f'<div class="card scroll"><table>{"".join(rows)}</table></div><button>Save my votes</button></form>'
+                f'<p class="small muted">The stat awards (best QB, receiver, DB...) come from the numbers: see '
+                f'<a href="/seasons/{s["id"]}">{_e(s["name"])}</a>.</p>')
+        return _page("Vote", body)
+
+    async def vote_submit(self, request: web.Request) -> web.Response:
+        bettor = self._require_bettor(request)
+        form = await request.post()
+        self._check_csrf(request, form, BETTOR_COOKIE)
+        voter = self.book.player_key(bettor["id"])
+        saved, errors = 0, []
+        for key, (title, _) in awards.vote_awards().items():
+            cand = str(form.get(f"award_{key}", "")).strip().lower()
+            if not cand:
+                continue
+            try:
+                awards.cast(self.db, voter, key, cand)
+                saved += 1
+            except awards.VoteError as e:
+                errors.append(f"{title}: {e}")
+        if errors:
+            raise _redirect("/vote", " ".join(errors), err=True)
+        raise _redirect("/vote", f"Saved {saved} vote{'s' if saved != 1 else ''}." if saved else "No votes picked.")
 
     def _require_bettor(self, request: web.Request):
         bettor = self._bettor(request)

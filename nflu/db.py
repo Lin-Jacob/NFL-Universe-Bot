@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+import config
 
 from .fantasy import fantasy_points, stat_group
 from .parser import ParsedGame
@@ -88,7 +90,22 @@ CREATE TABLE IF NOT EXISTS seasons (
     name         TEXT NOT NULL,
     started_at   TEXT NOT NULL,
     ended_at     TEXT,
-    mvps         TEXT
+    mvps         TEXT,                                -- stat awards, worked out when it ended
+    vote_ends_at TEXT,                                -- MVP voting is open from ended_at until this
+    vote_results TEXT                                 -- set when voting closes (JSON)
+);
+
+-- Players' MVP votes. One vote per voter per award per season (voting again replaces it).
+-- weight = how much it counts, from the share of the season's games the voter played.
+CREATE TABLE IF NOT EXISTS season_votes (
+    season_id     INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+    role          TEXT NOT NULL,                      -- MVP, QB, RB, WR, DB, DL, ST
+    voter_key     TEXT NOT NULL,
+    candidate_key TEXT NOT NULL,
+    weight        REAL NOT NULL,
+    voter_discord INTEGER,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (season_id, role, voter_key)
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -111,6 +128,12 @@ def _parse_time(value: str | None) -> datetime | None:
     except ValueError:
         return None
     return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def _iso(value: str | None) -> str:
+    """A time normalized to the bot's own ISO format (UTC), so stored season times compare cleanly."""
+    t = _parse_time(value)
+    return t.astimezone(timezone.utc).isoformat(timespec="seconds") if t else _now()
 
 
 class Database:
@@ -137,9 +160,13 @@ class Database:
         if "pos_stats" not in pg_cols:
             # Filled for existing games by /admin reparseall
             self.conn.execute("ALTER TABLE player_games ADD COLUMN pos_stats TEXT NOT NULL DEFAULT '{}'")
+        s_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(seasons)")}
+        for col in ("vote_ends_at", "vote_results"):
+            if col not in s_cols:
+                self.conn.execute(f"ALTER TABLE seasons ADD COLUMN {col} TEXT")
         if not self.conn.execute("SELECT 1 FROM settings WHERE key = 'seasons_v1'").fetchone():
             # games.season used to be an unused column fixed at 1: start everyone off-season
-            # (/admin startseason include_past_games pulls them into the first season)
+            # (/seasonadmin start include_past_games pulls them into the first season)
             if not self.conn.execute("SELECT 1 FROM seasons").fetchone():
                 self.conn.execute("UPDATE games SET season = 0")
             self.conn.execute("INSERT INTO settings(key, value) VALUES('seasons_v1', '1')")
@@ -220,9 +247,10 @@ class Database:
                            played, source, raw_id, game_id))
                 c.execute("DELETE FROM player_games WHERE game_id = ?", (game_id,))
             else:
+                season = self._season_for_new_game(played)
                 cur = c.execute("INSERT INTO games(external_id, season, week, home_team, away_team, "
                                 "home_score, away_score, played_at, source, raw_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                                (g.external_id, self.season_for(played), g.week, g.home_team, g.away_team,
+                                (g.external_id, season, g.week, g.home_team, g.away_team,
                                  g.home_score, g.away_score, played, source, raw_id))
                 game_id = cur.lastrowid
             removed = {r[0] for r in c.execute("SELECT username_key FROM removed_players WHERE game_id = ?",
@@ -238,6 +266,8 @@ class Database:
                            fantasy_points(p.stats, p.pos_stats)))
             self._rescore_game(game_id)
             c.commit()
+            if not replaced and season:
+                self._end_if_full(season, played)
             return game_id, replaced
 
     def delete_game(self, game_id: int) -> bool:
@@ -419,26 +449,109 @@ class Database:
                 return s["id"]
         return 0
 
-    def start_season(self, name: str | None = None, include_past_games: bool = False) -> sqlite3.Row:
-        """Open the next season. include_past_games pulls every game not in a season yet into it."""
+    def start_season(self, name: str | None = None, include_past_games: bool = False,
+                     started_at: str | None = None) -> sqlite3.Row:
+        """Open the next season. include_past_games files every game not in a season yet, oldest
+        first, into this season and (once it has SEASON_GAMES games) the seasons after it."""
         with self.lock:
             if self.active_season():
                 raise ValueError("a season is already in progress")
             sid = (self.one("SELECT COALESCE(MAX(id), 0) n FROM seasons")["n"]) + 1
+            loose = self.q("SELECT id, played_at FROM games WHERE season = 0 ORDER BY played_at, id") \
+                if include_past_games else []
+            start = loose[0]["played_at"] if loose else (started_at or _now())
             self.conn.execute("INSERT INTO seasons(id, name, started_at) VALUES(?,?,?)",
-                              (sid, (name or "").strip() or f"Season {sid}", _now()))
-            if include_past_games:
-                self.conn.execute("UPDATE games SET season = ? WHERE season = 0", (sid,))
+                              (sid, (name or "").strip() or f"Season {sid}", _iso(start)))
             self.conn.commit()
-            return self.season(sid)
+            first = sid
+            for g in loose:
+                cur = self.active_season()
+                if cur is None:  # the last one filled up: the next game opens a new one
+                    cur = self.start_season(started_at=g["played_at"])
+                self.conn.execute("UPDATE games SET season = ? WHERE id = ?", (cur["id"], g["id"]))
+                self.conn.commit()
+                self._end_if_full(cur["id"], g["played_at"])
+            return self.season(first)
 
-    def end_season(self, season_id: int, mvps: dict) -> None:
-        self.x("UPDATE seasons SET ended_at = ?, mvps = ? WHERE id = ?", (_now(), json.dumps(mvps), season_id))
+    def _season_for_new_game(self, played_at: str) -> int:
+        """Season for a newly saved game. With no season open, a game played after the last one
+        ended starts the next season (unless SEASON_AUTO_START is False)."""
+        sid = self.season_for(played_at)
+        if sid or self.active_season() or not getattr(config, "SEASON_AUTO_START", True):
+            return sid
+        last = self.latest_season()
+        t = _parse_time(played_at)
+        if last and t and last["ended_at"] and t < _parse_time(last["ended_at"]):
+            return 0  # an old game imported late, from before the last season ended
+        return self.start_season(started_at=played_at)["id"]
+
+    def _end_if_full(self, season_id: int, played_at: str | None) -> None:
+        """End the open season once it has SEASON_GAMES games, and flag it for the bot to announce."""
+        limit = int(getattr(config, "SEASON_GAMES", 20) or 0)
+        s = self.season(season_id)
+        if not limit or not s or s["ended_at"] or self.season_game_count(season_id) < limit:
+            return
+        from .analytics import season_mvps  # local: analytics imports this module
+        # Ends just after its last game, so games played after that (even ones imported in a batch
+        # by /admin backfill) go into the next season
+        times = [_parse_time(r["played_at"]) for r in self.q("SELECT played_at FROM games WHERE season = ?",
+                                                              (season_id,))]
+        t = max(filter(None, times + [_parse_time(played_at)]), default=None) or _parse_time(_now())
+        self.end_season(season_id, season_mvps(self, season_id), ended_at=(t + timedelta(seconds=1)).isoformat(
+            timespec="seconds"))
+        self.set_setting("season_announce_pending", str(season_id))
+
+    def end_season(self, season_id: int, mvps: dict, ended_at: str | None = None) -> None:
+        """Close a season with its stat awards, and open MVP voting for SEASON_VOTE_DAYS days."""
+        end = ended_at or _now()
+        days = float(getattr(config, "SEASON_VOTE_DAYS", 3))
+        start = max(_parse_time(end), _parse_time(_now()))  # a season filed from old games still gets a vote
+        vote_end = (start + timedelta(days=days)).isoformat(timespec="seconds")
+        self.x("UPDATE seasons SET ended_at = ?, mvps = ?, vote_ends_at = ?, vote_results = NULL WHERE id = ?",
+               (end, json.dumps(mvps), vote_end, season_id))
 
     def reopen_season(self, season_id: int) -> None:
         if self.active_season():
             raise ValueError("another season is in progress")
-        self.x("UPDATE seasons SET ended_at = NULL, mvps = NULL WHERE id = ?", (season_id,))
+        with self.lock:
+            self.conn.execute("UPDATE seasons SET ended_at = NULL, mvps = NULL, vote_ends_at = NULL, "
+                              "vote_results = NULL WHERE id = ?", (season_id,))
+            self.conn.execute("DELETE FROM season_votes WHERE season_id = ?", (season_id,))
+            self.conn.commit()
+
+    # ------------------------------------------------------------ MVP voting
+    def voting_season(self) -> sqlite3.Row | None:
+        """The season whose MVP vote is open right now, if any."""
+        return self.one("SELECT * FROM seasons WHERE ended_at IS NOT NULL AND vote_results IS NULL "
+                        "AND vote_ends_at IS NOT NULL ORDER BY id DESC LIMIT 1")
+
+    def votes_due(self) -> list[sqlite3.Row]:
+        """Open votes whose time is up."""
+        now = _parse_time(_now())
+        return [s for s in self.q("SELECT * FROM seasons WHERE ended_at IS NOT NULL AND vote_results IS NULL "
+                                  "AND vote_ends_at IS NOT NULL") if _parse_time(s["vote_ends_at"]) <= now]
+
+    def cast_vote(self, season_id: int, role: str, voter_key: str, candidate_key: str, weight: float,
+                  voter_discord: int | None = None) -> bool:
+        """Record a vote. Returns True if it replaced the voter's earlier vote for that award."""
+        with self.lock:
+            had = self.conn.execute("SELECT 1 FROM season_votes WHERE season_id=? AND role=? AND voter_key=?",
+                                    (season_id, role, voter_key)).fetchone() is not None
+            self.conn.execute("INSERT INTO season_votes(season_id, role, voter_key, candidate_key, weight, "
+                              "voter_discord, created_at) VALUES(?,?,?,?,?,?,?) "
+                              "ON CONFLICT(season_id, role, voter_key) DO UPDATE SET "
+                              "candidate_key=excluded.candidate_key, weight=excluded.weight, "
+                              "created_at=excluded.created_at",
+                              (season_id, role, voter_key, candidate_key, weight, voter_discord, _now()))
+            self.conn.commit()
+            return had
+
+    def season_votes(self, season_id: int) -> list[sqlite3.Row]:
+        return self.q("SELECT * FROM season_votes WHERE season_id = ? ORDER BY role, created_at", (season_id,))
+
+    def close_voting(self, season_id: int, results: dict) -> None:
+        self.x("UPDATE seasons SET vote_results = ?, vote_ends_at = COALESCE(vote_ends_at, ?) WHERE id = ?",
+               (json.dumps(results), _now(), season_id))
 
     def set_game_season(self, game_id: int, season_id: int) -> bool:
         return self.x("UPDATE games SET season = ? WHERE id = ?", (season_id, game_id)).rowcount > 0
@@ -478,10 +591,13 @@ class Database:
                        (f"%{q}%",))
         return row["username_key"] if row else None
 
-    def player_lines(self, username_key: str) -> list[dict]:
-        sql = ("SELECT pg.*, g.week, g.home_team, g.away_team, g.home_score, g.away_score, "
+    def player_lines(self, username_key: str, season: int | None = None) -> list[dict]:
+        sql = ("SELECT pg.*, g.week, g.season, g.home_team, g.away_team, g.home_score, g.away_score, "
                "g.played_at FROM player_games pg JOIN games g ON g.id = pg.game_id WHERE pg.username_key = ?")
         params: list = [username_key]
+        if season is not None:
+            sql += " AND g.season = ?"
+            params.append(season)
         sql += " ORDER BY g.played_at DESC, g.id DESC"
         return [self._pg(r) for r in self.q(sql, tuple(params))]
 

@@ -12,10 +12,10 @@ from discord.ext import commands
 
 import config
 
-from . import analytics, players
+from . import analytics, awards, players
 from .ask import ask as ask_league
 from .embeds import (GROUP_ICON, Names, career_card, displayed, fmt_num, full_width, game_embed, player_card,
-                     score_line, season_embed, short_line, stats_block, table, when)
+                     score_line, season_embed, short_line, stats_block, table, vote_embed, when)
 from .fantasy import breakdown
 from .stats import POSITIONS, STATS, label
 from .views import Pager
@@ -74,6 +74,23 @@ class Stats(commands.Cog):
             if len(out) >= 25:
                 break
         return out
+
+    async def season_autocomplete(self, _: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
+        """'Overall' (0) plus every season, newest first."""
+        active = self.db.active_season()
+        out = [app_commands.Choice(name="Overall (all seasons)", value=0)]
+        for srow in reversed(self.db.seasons()):
+            tag = " (current)" if active and active["id"] == srow["id"] else ""
+            out.append(app_commands.Choice(name=f"{srow['name']}{tag}"[:100], value=srow["id"]))
+        cur = current.lower().strip()
+        return [c for c in out if not cur or cur in c.name.lower() or cur == str(c.value)][:25]
+
+    def _scope(self, season: int | None) -> tuple[int | None, str]:
+        """(season id or None for overall, title suffix like ' · Season 2')."""
+        if not season:
+            return None, ""
+        srow = self.db.season(season)
+        return season, f" · {srow['name'] if srow else f'Season {season}'}"
 
     @app_commands.command(name="games", description="Every game played, newest first, with date and time")
     async def games(self, inter: discord.Interaction):
@@ -159,11 +176,12 @@ class Stats(commands.Cog):
                                 "averages, ◀ ▶ flips players")
     @app_commands.choices(view=[app_commands.Choice(name="Simple (summary)", value="simple"),
                                 app_commands.Choice(name="Complex (career stat cards)", value="complex")])
-    @app_commands.autocomplete(name=player_autocomplete)
+    @app_commands.autocomplete(name=player_autocomplete, season=season_autocomplete)
     async def player(self, inter: discord.Interaction, name: str | None = None,
-                     view: app_commands.Choice[str] | None = None):
+                     view: app_commands.Choice[str] | None = None, season: int | None = None):
+        sid, suffix = self._scope(season)
         if view and view.value == "complex":
-            await self._career_cards(inter, name)
+            await self._career_cards(inter, name, sid)
             return
         if not name:
             await inter.response.send_message("Pick a player, or use `view: Complex` to flip through everyone.",
@@ -172,12 +190,12 @@ class Stats(commands.Cog):
         key = await self._resolve(inter, name)
         if not key:
             return
-        summ = analytics.player_summary(self.db, key)
+        summ = analytics.player_summary(self.db, key, sid)
         names = Names(self.db)
         if not summ:
-            await inter.response.send_message(f"**{names.full(key)}** has no games yet.")
+            await inter.response.send_message(f"**{names.full(key)}** has no games{suffix or ' yet'}.")
             return
-        e = discord.Embed(title=names.full(summ["username"]), color=config.EMBED_COLOR,
+        e = discord.Embed(title=names.full(summ["username"]) + suffix, color=config.EMBED_COLOR,
                           description=f"{summ['games']} games played")
         e.add_field(name="Fantasy", value=f"Total **{fmt_num(summ['fantasy_total'])}**\n"
                                           f"Per {config.FANTASY_RATE_SNAPS} snaps **{fmt_num(summ['fantasy_rate'])}**"
@@ -190,9 +208,9 @@ class Stats(commands.Cog):
             e.add_field(name=title, value=body, inline=True)
         await inter.response.send_message(embed=e)
 
-    async def _career_cards(self, inter: discord.Interaction, name: str | None) -> None:
-        """Career stat cards for every player in /fantasy order, starting on `name` (or #1)."""
-        ranked, short = analytics.fantasy_rates(self.db)
+    async def _career_cards(self, inter: discord.Interaction, name: str | None, season: int | None = None) -> None:
+        """Career (or one season's) stat cards for every player in /fantasy order, starting on `name` (or #1)."""
+        ranked, short = analytics.fantasy_rates(self.db, season)
         order = [r["username"].lower() for r in ranked + short]
         if not order:
             await inter.response.send_message("No player stats recorded yet.")
@@ -209,7 +227,7 @@ class Stats(commands.Cog):
         names = Names(self.db)
 
         def card(page: int) -> discord.Embed:
-            e = career_card(analytics.career(self.db, order[page]), page + 1, len(order), names)
+            e = career_card(analytics.career(self.db, order[page], season), page + 1, len(order), names)
             e.set_footer(text=f"Player {page + 1} of {len(order)} (ranked like /fantasy) · ◀ ▶ to flip players · "
                               "/g = per game")
             return e
@@ -256,33 +274,38 @@ class Stats(commands.Cog):
 
     # ------------------------------------------------------------ leaderboards
     @app_commands.command(name="leaders", description="Stat leaders")
-    @app_commands.describe(stat="Which stat", per_game="Rank by per-game average instead of totals")
-    @app_commands.autocomplete(stat=stat_autocomplete)
-    async def leaders(self, inter: discord.Interaction, stat: str, per_game: bool = False):
+    @app_commands.describe(stat="Which stat", per_game="Rank by per-game average instead of totals",
+                           season="One season, or Overall (default)")
+    @app_commands.autocomplete(stat=stat_autocomplete, season=season_autocomplete)
+    async def leaders(self, inter: discord.Interaction, stat: str, per_game: bool = False, season: int | None = None):
         if stat != "fantasy" and stat not in STATS:
             await inter.response.send_message("Pick a stat from the list.", ephemeral=True)
             return
-        rows = analytics.leaders(self.db, stat, 10, per_game)
+        sid, suffix = self._scope(season)
+        rows = analytics.leaders(self.db, stat, 10, per_game, season=sid)
         if not rows:
             await inter.response.send_message("Nobody has recorded that stat yet.")
             return
         names = Names(self.db)
         stat_name = "Fantasy points" if stat == "fantasy" else label(stat)
-        e = discord.Embed(title=f"{stat_name} leaders" + (" (per game)" if per_game else ""),
+        e = discord.Embed(title=f"{stat_name} leaders" + (" (per game)" if per_game else "") + suffix,
                           color=config.EMBED_COLOR,
                           description="\n".join(f"**{i + 1}.** {names(n)} · **{fmt_num(v)}** ({g} GP)"
                                                 for i, (n, v, g) in enumerate(rows)))
         await inter.response.send_message(embed=e)
 
     @app_commands.command(name="fantasy", description="Fantasy leaderboard by points per snap (fair for late joiners)")
-    async def fantasy(self, inter: discord.Interaction):
-        ranked, short = analytics.fantasy_rates(self.db)
+    @app_commands.describe(season="One season, or Overall (default)")
+    @app_commands.autocomplete(season=season_autocomplete)
+    async def fantasy(self, inter: discord.Interaction, season: int | None = None):
+        sid, suffix = self._scope(season)
+        ranked, short = analytics.fantasy_rates(self.db, sid)
         if not ranked and not short:
             await inter.response.send_message("No fantasy points recorded yet.")
             return
         names = Names(self.db)
         per = config.FANTASY_RATE_SNAPS
-        games = len(self.db.recent_games(limit=100000))
+        games = self.db.season_game_count(sid) if sid else len(self.db.recent_games(limit=100000))
 
         def row(i: int, r: dict) -> str:
             return (f"`{i + 1:>2}.` **{names.dashed(r['username'])}**\n"
@@ -294,7 +317,7 @@ class Stats(commands.Cog):
         pages = max(1, 1 + (max(0, len(rest) - per_page) + per_page - 1) // per_page)  # page 1 has the podium
 
         def render(page: int) -> discord.Embed:
-            e = discord.Embed(title="🏆 Fantasy Leaderboard", color=FANTASY_GOLD,
+            e = discord.Embed(title="🏆 Fantasy Leaderboard" + suffix, color=FANTASY_GOLD,
                               description=f"Ranked by **points per {per} snaps** so joining a game late "
                                           f"doesn't cost you.\n{len(ranked) + len(short)} players · "
                                           f"{games} game{'s' if games != 1 else ''}")
@@ -331,11 +354,14 @@ class Stats(commands.Cog):
         await Pager(inter.user.id, pages, render).send(inter)
 
     @app_commands.command(name="stats", description="Position leaderboards (QB, RB, WR, DB, DL, ST) ranked by points")
-    @app_commands.describe(position="Show the full ranking for one position")
+    @app_commands.describe(position="Show the full ranking for one position", season="One season, or Overall (default)")
     @app_commands.choices(position=[app_commands.Choice(name=f"{code} · {title}", value=code)
                                     for code, (title, _) in POSITIONS.items()])
-    async def stats(self, inter: discord.Interaction, position: app_commands.Choice[str] | None = None):
+    @app_commands.autocomplete(season=season_autocomplete)
+    async def stats(self, inter: discord.Interaction, position: app_commands.Choice[str] | None = None,
+                    season: int | None = None):
         names = Names(self.db)
+        sid, suffix = self._scope(season)
 
         def lines(rows: list[dict]) -> list[str]:
             return [f"{_rank(i)} {names(r['username'])} · **{fmt_num(r['points'])}** pts ({r['games']} GP)\n"
@@ -343,15 +369,16 @@ class Stats(commands.Cog):
 
         if position:
             code = position.value
-            rows = analytics.position_leaders(self.db, code, 15)
-            e = discord.Embed(title=f"{code} · {POSITIONS[code][0]}", color=config.EMBED_COLOR,
+            rows = analytics.position_leaders(self.db, code, 15, sid)
+            e = discord.Embed(title=f"{code} · {POSITIONS[code][0]}{suffix}", color=config.EMBED_COLOR,
                               description="\n".join(lines(rows))[:4000] or "No one has scored at this position yet.")
         else:
-            e = discord.Embed(title="Position leaderboards", color=config.EMBED_COLOR,
-                              description="Fantasy points earned at each position across all games. "
+            e = discord.Embed(title="Position leaderboards" + suffix, color=config.EMBED_COLOR,
+                              description="Fantasy points earned at each position "
+                                          + ("this season. " if sid else "across all games. ") +
                                           "Use `/stats position:` for a full ranking.")
             for code, (title, _) in POSITIONS.items():
-                value, out = "", lines(analytics.position_leaders(self.db, code, 5))
+                value, out = "", lines(analytics.position_leaders(self.db, code, 5, sid))
                 for ln in out:  # keep whole entries within Discord's 1024-character field limit
                     if len(value) + len(ln) + 1 > 1024:
                         break
@@ -361,21 +388,71 @@ class Stats(commands.Cog):
                           "Cornerback, DLine, Special Teams")
         await inter.response.send_message(embed=e)
 
-    @app_commands.command(name="season", description="A season's MVPs by role (or the current MVP race)")
-    @app_commands.describe(number="Season number (default: the current or latest season)")
-    async def season(self, inter: discord.Interaction, number: int | None = None):
-        s = self.db.season(number) if number is not None else (self.db.active_season() or self.db.latest_season())
+    @app_commands.command(name="season", description="A season's awards: stat awards and the players' vote")
+    @app_commands.describe(number="Season (default: the current or latest season)",
+                           votes="Show the voted awards instead of the stat awards")
+    @app_commands.autocomplete(number=season_autocomplete)
+    async def season(self, inter: discord.Interaction, number: int | None = None, votes: bool = False):
+        s = self.db.season(number) if number else (self.db.active_season() or self.db.latest_season())
         if not s:
             all_ = ", ".join(str(r["id"]) for r in self.db.seasons())
             await inter.response.send_message(
-                (f"There's no season {number}. Seasons: {all_}." if number is not None and all_ else
-                 "No seasons yet. An admin starts one with `/admin startseason`."), ephemeral=True)
+                (f"There's no season {number}. Seasons: {all_}." if number and all_ else
+                 "No seasons yet. One starts with the next game played."), ephemeral=True)
+            return
+        if votes:
+            if s["vote_results"]:
+                await inter.response.send_message(embed=vote_embed(self.db, s, json.loads(s["vote_results"])))
+            elif s["ended_at"]:
+                n = analytics.vote_results(self.db, s["id"])["voters"]
+                await inter.response.send_message(
+                    f"Voting for **{s['name']}** is open until {when(s['vote_ends_at'], 'f')} "
+                    f"({n} players have voted so far). Results are posted when it closes.", ephemeral=True)
+            else:
+                await inter.response.send_message(f"**{s['name']}** is still going. Voting opens when it ends.",
+                                                  ephemeral=True)
             return
         if s["ended_at"] and s["mvps"]:  # awards as they were handed out
             e = season_embed(self.db, s, json.loads(s["mvps"]), final=True)
         else:
             e = season_embed(self.db, s, analytics.season_mvps(self.db, s["id"]), final=False)
         await inter.response.send_message(embed=e)
+
+    async def vote_candidate_ac(self, inter: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        s = self.db.voting_season()
+        if not s:
+            return []
+        me = players.for_discord(self.db, inter.user.id)
+        names = Names(self.db)
+        cur = current.lower().strip()
+        out = []
+        for key, username in awards.candidates(self.db, s["id"], exclude=me.roblox_username.lower() if me else None):
+            label_ = names.dashed(username)
+            if not cur or cur in label_.lower():
+                out.append(app_commands.Choice(name=label_[:100], value=username))
+        return out[:25]
+
+    @app_commands.command(name="vote", description="Vote for a season award (league players only)")
+    @app_commands.describe(award="Which award", player="Who you're voting for (not yourself)")
+    @app_commands.choices(award=[app_commands.Choice(name=f"{icon} {title}"[:100], value=key)
+                                 for key, (title, icon) in awards.vote_awards().items()])
+    @app_commands.autocomplete(player=vote_candidate_ac)
+    async def vote(self, inter: discord.Interaction, award: app_commands.Choice[str], player: str):
+        me = players.for_discord(self.db, inter.user.id)
+        voter = me.roblox_username.lower() if me else None
+        if not voter and (row := self.db.name_for_discord(inter.user.id)):
+            voter = row["username_key"]
+        try:
+            res = awards.cast(self.db, voter, award.value, self.db.resolve_player(player), inter.user.id)
+        except awards.VoteError as err:
+            await inter.response.send_message(str(err), ephemeral=True)
+            return
+        names = Names(self.db)
+        await inter.response.send_message(
+            f"{'Changed your vote' if res['replaced'] else 'Voted'}: **{names(res['candidate'])}** for "
+            f"**{res['title']}** in {res['season']['name']}. Your vote counts **{fmt_num(res['weight'])}** "
+            f"(you played {res['games']} of {res['total']} games). Voting closes "
+            f"{when(res['season']['vote_ends_at'], 'R')}.", ephemeral=True)
 
     @app_commands.command(name="points", description="How a player's fantasy points were scored in a game")
     @app_commands.describe(game_id="Game number (default: their latest game)")
@@ -592,7 +669,9 @@ class Stats(commands.Cog):
             "`/stats [position]` QB, RB, WR, DB, DL and ST rankings by points\n"
             "`/fantasy` fantasy leaderboard by points per 100 snaps (fair if you joined late)\n"
             "`/leaders stat` top 10 in any single stat\n"
-            "`/season [number]` MVPs for each role, or the current season's MVP race\n"
+            "`/season [number]` a season's stat awards (`votes:True` for the voted ones)\n"
+            "`/vote award player` vote for MVP, Most Improved and more when a season ends\n"
+            "Add `season:` to `/stats`, `/fantasy`, `/leaders` or `/player` for one season's numbers\n"
             "`/odds team1 team2` win chances for two lineups (players separated by commas)"))
         e.add_field(name="👤 Players", inline=False, value=(
             "`/player name` a player's totals, fantasy points and best game\n"
@@ -617,6 +696,7 @@ class Stats(commands.Cog):
                 "`/admin intfault` move an INT's −2 to the player at fault, or excuse it · `intfaults` · "
                 "`removeintfault`\n"
                 "`/admin import` · `rawlog` · `raw` · `reparse` raw game data\n"
-                "`/admin startseason` · `endseason` (posts each role's MVP) · `reopenseason` · `setseason` seasons\n"
+                "`/seasonadmin start` · `end` · `reopen` · `move` · `closevote` seasons and the awards vote "
+                "(a season also ends by itself after SEASON_GAMES games)\n"
                 "`/admin channel` · `announce` · `recalc` · `admins` · `webhookurl` settings"))
         await inter.response.send_message(embed=e, ephemeral=True)
