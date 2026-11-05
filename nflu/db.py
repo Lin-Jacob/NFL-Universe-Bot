@@ -157,6 +157,7 @@ class Database:
         self.conn.executescript(SCHEMA)
         self._migrate()
         self.lock = threading.RLock()
+        self._first_season_from_past_games()
 
     def _migrate(self) -> None:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(raw_payloads)")}
@@ -181,6 +182,33 @@ class Database:
                 self.conn.execute("UPDATE games SET season = 0")
             self.conn.execute("INSERT INTO settings(key, value) VALUES('seasons_v1', '1')")
         self.conn.commit()
+
+    def _first_season_from_past_games(self) -> None:
+        """Once, when seasons are new: the games already played (with SEASON_MIN_PLAYERS+ players)
+        become Season 1. If Season 1 was already started by a new game, the earlier games join it.
+        More than SEASON_GAMES of them carry on into Season 2 and so on. Runs one time only."""
+        if self.get_setting("seasons_past_filed") or not getattr(config, "SEASON_FILE_PAST_GAMES", True):
+            return
+        rows = self.seasons()
+        if not rows:
+            if self.one("SELECT 1 FROM games WHERE season = 0"):
+                self.start_season("Season 1", include_past_games=True)
+        elif len(rows) == 1 and rows[0]["ended_at"] is None:
+            first = rows[0]
+            start = _parse_time(first["started_at"])
+            earlier = [g for g in self.q("SELECT id, played_at FROM games WHERE season = 0 ORDER BY played_at, id")
+                       if self.counts_for_season(g["id"])
+                       and (t := _parse_time(g["played_at"])) is not None and t < start]
+            if earlier:
+                self.x("UPDATE seasons SET started_at = ? WHERE id = ?", (_iso(earlier[0]["played_at"]), first["id"]))
+                for g in earlier:
+                    if self.active_season() is None:  # filled up: the rest go into the next season
+                        cur = self.start_season(started_at=g["played_at"])
+                    else:
+                        cur = self.active_season()
+                    self.set_game_season(g["id"], cur["id"])
+                    self._end_if_full(cur["id"], g["played_at"])
+        self.set_setting("seasons_past_filed", "1")
 
     # ------------------------------------------------------------------ utils
     def q(self, sql: str, params: tuple | dict = ()) -> list[sqlite3.Row]:
