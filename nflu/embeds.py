@@ -258,3 +258,37 @@ def table(rows: list[list[str]], headers: list[str]) -> str:
     if len(text) > 3900:
         text = text[:3900] + "\n…"
     return f"```\n{text}\n```"
+
+
+MVP_ICON = {"MVP": "🏆", **GROUP_ICON}
+SEASON_GOLD = 0xF1C40F
+
+
+def season_embed(db: Database, season, race: dict, final: bool) -> discord.Embed:
+    """A season's awards (final=True, when it ends) or its current MVP race."""
+    from .analytics import MVP_ROLES  # local: analytics imports db, keep embeds light at import
+
+    names = Names(db)
+    span = f"Started {when(season['started_at'], 'D')}"
+    if season["ended_at"]:
+        span += f" · ended {when(season['ended_at'], 'D')}"
+    title = f"🏆 {season['name']} awards" if final else f"📅 {season['name']}" + (
+        "" if season["ended_at"] else " · MVP race")
+    e = discord.Embed(title=title, color=SEASON_GOLD if final else config.EMBED_COLOR,
+                      description=f"{span} · {race['games']} games")
+    for role, award in MVP_ROLES.items():
+        rows = race["roles"].get(role) or []
+        if not rows:
+            value = "No eligible players"
+        else:
+            winner, rest = rows[0], rows[1:]
+            value = (f"**{names(winner['username'])}** · {fmt_num(winner['points'])} pts "
+                     f"({winner['games']} GP, {fmt_num(winner['avg'])}/game)")
+            if rest:
+                value += "\n" + " · ".join(f"{['🥈', '🥉'][i] if i < 2 else f'{i + 2}.'} {names(r['username'])} "
+                                           f"{fmt_num(r['points'])}" for i, r in enumerate(rest))
+        label_ = f"{MVP_ICON.get(role, '')} {award}" + (" MVP" if role != "MVP" else "")
+        e.add_field(name=label_, value=value[:1024], inline=role != "MVP")
+    e.set_footer(text=f"Ranked by fantasy points earned in that role this season. "
+                      f"Needs {race['min_games']}+ games in the role to qualify.")
+    return e

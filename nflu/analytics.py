@@ -244,3 +244,43 @@ def position_leaders(db: Database, pos: str, limit: int = 10) -> list[dict]:
     rows = [dict(e, points=round(e["points"], 2), stats=dict(e["stats"])) for e in agg.values()]
     rows.sort(key=lambda r: r["points"], reverse=True)
     return rows[:limit]
+
+
+# Awards handed out at the end of a season: the overall MVP, then one per position group
+MVP_ROLES: dict[str, str] = {"MVP": "Most Valuable Player", "QB": "Quarterback", "RB": "Running back",
+                             "WR": "Receiver", "DB": "Defensive back", "DL": "Defensive lineman",
+                             "ST": "Special teams"}
+
+
+def season_mvps(db: Database, season_id: int, top: int = 3) -> dict:
+    """The MVP race for one season: for the overall award and each position (QB/RB/WR/DB/DL/ST),
+    players ranked by the fantasy points they earned there in that season's games, best first.
+
+    The same points as /stats, so the scoring in config.py decides it. To be eligible a player must
+    have played that role in SEASON_MVP_MIN_GAMES games (default 3), lowered to half the season's
+    games when the season is shorter, so someone with one huge game can't win it. Ties go to the
+    better points-per-game. Returns {"games": n, "min_games": m, "roles": {"MVP": [row...], "QB": ...}},
+    each row {username_key, username, points, games, avg}."""
+    lines = db.all_player_lines(season=season_id)
+    n_games = len({ln["game_id"] for ln in lines})
+    min_games = min(int(getattr(config, "SEASON_MVP_MIN_GAMES", 3)), max(1, math.ceil(n_games / 2)))
+    agg: dict[str, dict[str, dict]] = {role: {} for role in MVP_ROLES}
+
+    def add(role: str, ln: dict, points: float) -> None:
+        e = agg[role].setdefault(ln["username_key"], {"username_key": ln["username_key"],
+                                                       "username": ln["username"], "points": 0.0, "games": 0})
+        e["points"] += points
+        e["games"] += 1
+
+    for ln in lines:
+        add("MVP", ln, ln["fantasy_points"])
+        for code, st in by_group(ln["stats"], ln["pos_stats"]).items():
+            if code in agg and st:
+                add(code, ln, group_points(code, st))
+    roles = {}
+    for role, players in agg.items():
+        rows = [dict(e, points=round(e["points"], 2), avg=round(e["points"] / e["games"], 2))
+                for e in players.values() if e["games"] >= min_games and e["points"] > 0]
+        rows.sort(key=lambda r: (r["points"], r["avg"]), reverse=True)
+        roles[role] = rows[:top]
+    return {"games": n_games, "min_games": min_games, "roles": roles}

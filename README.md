@@ -227,6 +227,7 @@ Notes:
 | `/leaders stat [per_game]` | Top 10 in any stat, or fantasy points |
 | `/fantasy` | Fantasy leaderboard ranked by points per 100 snaps, so players who joined late aren't penalized. Players under `FANTASY_MIN_SNAPS` are listed separately |
 | `/stats [position]` | Position leaderboards: QB (Passing), RB (Rushing), WR (Receiving), DB (Cornerback), DL (DLine), ST (Special Teams), ranked by fantasy points earned at that position |
+| `/season [number]` | A season's MVP for each role, or the current season's MVP race (see "Seasons and MVPs" below) |
 | `/points name [game_id]` | How a player's fantasy points were scored |
 | `/scoring` | Fantasy scoring rules |
 | `/odds team1 team2` | Win chances for two lineups. List each team's players separated by commas (real names or Roblox usernames, with autocomplete). Shows each team's win %, moneyline and decimal odds, projected fantasy points, and each player's rating. See "Matchup odds" below |
@@ -251,6 +252,9 @@ Anywhere a player name is asked for you can type a mapped real name, a Roblox us
 | `/admin intfaults [game]`, `/admin removeintfault fault_id` | List / undo interception rulings |
 | `/admin rawlog`, `/admin raw`, `/admin reparse` | Inspect and re-process raw webhook deliveries |
 | `/admin reparseall` | Re-read every saved game with the current parser (run after a bot update) |
+| `/admin startseason [name] [include_past_games]` | Start a new season. Games from then on count toward it. `include_past_games` also adds every game that isn't in a season yet |
+| `/admin endseason [confirm]` | End the season and post the MVP for each role in the results channel. Without `confirm:True` it only shows you a preview |
+| `/admin reopenseason`, `/admin setseason game_id season` | Undo ending the latest season, or move one game into a season (0 = none) |
 | `/admin channel [channel]` | Where final scores are posted automatically |
 | `/admin announce game_id` | Re-post a game's result |
 | `/admin recalc` | Reload `config.py` (scoring and admins) and recalculate all fantasy points |
@@ -258,6 +262,19 @@ Anywhere a player name is asked for you can type a mapped real name, a Roblox us
 | `/admin admins` | List admins |
 
 ---
+
+### Seasons and MVPs
+
+An admin starts a season with `/admin startseason` and ends it with `/admin endseason`. Every game played in between counts toward that season. A game is placed by when it was played, so a game imported later with `/admin backfill` still lands in the season it was played in. Games played while no season is running aren't in any season, but they still count in every all-time stat. When you start your first season, `include_past_games:True` puts the games you've already played into it.
+
+When a season ends, the bot hands out seven awards and posts them in the results channel (`/admin channel`):
+
+- **Most Valuable Player:** most fantasy points in the season, all roles combined
+- **Quarterback, Running back, Receiver, Defensive back, Defensive lineman and Special teams MVP:** most fantasy points earned in that role (QB, RB, WR, DB, DL, ST), the same points `/stats` ranks by
+
+To qualify for an award, a player must have played that role in at least `SEASON_MVP_MIN_GAMES` games of the season (default 3, set it in `config.py`). For a season shorter than 5 games, half the season's games is enough. Ties go to the better points per game. The runners-up are listed too.
+
+`/season` shows the current MVP race while a season is running, and the final awards once it ends. The awards are saved when the season ends, so later scoring changes don't change who won. `/admin endseason` without `confirm:True` shows a preview first, and `/admin reopenseason` undoes ending the latest season.
 
 ## 5. Fantasy scoring
 

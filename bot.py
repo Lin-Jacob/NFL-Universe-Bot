@@ -195,20 +195,35 @@ class NFLUBot(commands.Bot):
     async def on_webhook_game(self, game_id: int, game: ParsedGame, replaced: bool) -> None:
         await self.announce_game(game_id, replaced)
 
-    async def announce_game(self, game_id: int, replaced: bool) -> bool:
+    async def announce_channel(self):
+        """The results channel (/admin channel or ANNOUNCE_CHANNEL_ID), or None if unset or missing."""
         chan_id = self.db.get_setting("announce_channel") or os.getenv("ANNOUNCE_CHANNEL_ID")
         if not chan_id:
-            return False
+            return None
         channel = self.get_channel(int(chan_id))
         if channel is None:
             try:
                 channel = await self.fetch_channel(int(chan_id))
             except discord.DiscordException:
                 log.warning("Announcement channel %s not found", chan_id)
-                return False
+                return None
+        return channel
+
+    async def announce_game(self, game_id: int, replaced: bool) -> bool:
+        channel = await self.announce_channel()
+        if channel is None:
+            return False
         e = game_embed(self.db, game_id, "🔁 Updated: " if replaced else "🏈 Final: ")
         if e:
             await channel.send(embed=e)
+        return True
+
+    async def announce_embed(self, embed: discord.Embed) -> bool:
+        """Post an embed (e.g. season awards) in the results channel. False if there isn't one."""
+        channel = await self.announce_channel()
+        if channel is None:
+            return False
+        await channel.send(embed=embed)
         return True
 
 

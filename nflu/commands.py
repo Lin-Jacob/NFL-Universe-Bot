@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import TYPE_CHECKING
 
 import discord
@@ -14,7 +15,7 @@ import config
 from . import analytics, players
 from .ask import ask as ask_league
 from .embeds import (GROUP_ICON, Names, career_card, displayed, fmt_num, full_width, game_embed, player_card,
-                     score_line, short_line, stats_block, table, when)
+                     score_line, season_embed, short_line, stats_block, table, when)
 from .fantasy import breakdown
 from .stats import POSITIONS, STATS, label
 from .views import Pager
@@ -360,6 +361,22 @@ class Stats(commands.Cog):
                           "Cornerback, DLine, Special Teams")
         await inter.response.send_message(embed=e)
 
+    @app_commands.command(name="season", description="A season's MVPs by role (or the current MVP race)")
+    @app_commands.describe(number="Season number (default: the current or latest season)")
+    async def season(self, inter: discord.Interaction, number: int | None = None):
+        s = self.db.season(number) if number is not None else (self.db.active_season() or self.db.latest_season())
+        if not s:
+            all_ = ", ".join(str(r["id"]) for r in self.db.seasons())
+            await inter.response.send_message(
+                (f"There's no season {number}. Seasons: {all_}." if number is not None and all_ else
+                 "No seasons yet. An admin starts one with `/admin startseason`."), ephemeral=True)
+            return
+        if s["ended_at"] and s["mvps"]:  # awards as they were handed out
+            e = season_embed(self.db, s, json.loads(s["mvps"]), final=True)
+        else:
+            e = season_embed(self.db, s, analytics.season_mvps(self.db, s["id"]), final=False)
+        await inter.response.send_message(embed=e)
+
     @app_commands.command(name="points", description="How a player's fantasy points were scored in a game")
     @app_commands.describe(game_id="Game number (default: their latest game)")
     @app_commands.autocomplete(name=player_autocomplete)
@@ -575,6 +592,7 @@ class Stats(commands.Cog):
             "`/stats [position]` QB, RB, WR, DB, DL and ST rankings by points\n"
             "`/fantasy` fantasy leaderboard by points per 100 snaps (fair if you joined late)\n"
             "`/leaders stat` top 10 in any single stat\n"
+            "`/season [number]` MVPs for each role, or the current season's MVP race\n"
             "`/odds team1 team2` win chances for two lineups (players separated by commas)"))
         e.add_field(name="👤 Players", inline=False, value=(
             "`/player name` a player's totals, fantasy points and best game\n"
@@ -599,5 +617,6 @@ class Stats(commands.Cog):
                 "`/admin intfault` move an INT's −2 to the player at fault, or excuse it · `intfaults` · "
                 "`removeintfault`\n"
                 "`/admin import` · `rawlog` · `raw` · `reparse` raw game data\n"
+                "`/admin startseason` · `endseason` (posts each role's MVP) · `reopenseason` · `setseason` seasons\n"
                 "`/admin channel` · `announce` · `recalc` · `admins` · `webhookurl` settings"))
         await inter.response.send_message(embed=e, ephemeral=True)
