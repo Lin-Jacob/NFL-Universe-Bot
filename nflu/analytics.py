@@ -345,3 +345,52 @@ def vote_results(db: Database, season_id: int) -> dict:
         rows.sort(key=lambda r: (r["weight"], r["votes"]), reverse=True)
         out[role] = rows
     return {"voters": len(voters), "roles": out}
+
+
+# ---------------------------------------------------------- comparison charts
+def line_points(ln: dict, pos: str | None) -> float | None:
+    """A stat line's fantasy points, or only those earned at one position (None = didn't play it)."""
+    if not pos:
+        return ln["fantasy_points"]
+    st = by_group(ln["stats"], ln["pos_stats"]).get(pos)
+    return group_points(pos, st) if st else None
+
+
+def game_series(db: Database, season: int | None = None, pos: str | None = None, last: int | None = None
+                ) -> tuple[list[dict], dict[str, dict]]:
+    """Every player's points game by game, for comparing them on one chart.
+
+    Returns (games, players): games = [{id, played_at}] oldest first (the last `last` of them),
+    players = {username_key: {username, values: [points or None per game], total, games}}, where
+    None = they didn't play that game (or not at `pos`). Totals cover only those games."""
+    rows = db.q("SELECT id, played_at FROM games" + (" WHERE season = ?" if season else "")
+                + " ORDER BY played_at, id", (season,) if season else ())
+    games = [dict(r) for r in rows][-last:] if last else [dict(r) for r in rows]
+    index = {g["id"]: i for i, g in enumerate(games)}
+    players: dict[str, dict] = {}
+    for ln in db.all_player_lines(season=season):
+        i = index.get(ln["game_id"])
+        if i is None:
+            continue
+        v = line_points(ln, pos)
+        if v is None:
+            continue
+        e = players.setdefault(ln["username_key"], {"username": ln["username"], "values": [None] * len(games),
+                                                    "total": 0.0, "games": 0})
+        e["values"][i] = round(v, 2)
+        e["total"] += v
+        e["games"] += 1
+    for e in players.values():
+        e["total"] = round(e["total"], 2)
+    return games, players
+
+
+def cumulative(values: list[float | None]) -> list[float | None]:
+    """Running total; None before a player's first game, then flat through games they missed."""
+    out, run, started = [], 0.0, False
+    for v in values:
+        if v is not None:
+            run += v
+            started = True
+        out.append(round(run, 2) if started else None)
+    return out

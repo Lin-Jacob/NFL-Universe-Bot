@@ -294,7 +294,15 @@ Shares in between are worked out on a sliding scale (for example, 60% of the gam
 
 **Season stats vs overall stats:** `/stats`, `/fantasy`, `/leaders` and `/player` take an optional `season:` (autocompletes, **Overall** is the default) to show one season's numbers. On the website, a **Stats for** picker at the top of the home, games, players, player, fantasy, positions and leaders pages switches between Overall and any season. **Seasons** lists every season, and each season's page shows its stat awards (the live race while it's going) and its voted awards. `/season [number]` shows the stat awards in Discord, and `votes:True` shows the voted ones.
 
-**Charts on the website:** each player's page has a line chart of their fantasy points game by game (the dashed line is their average), plus bar charts of points by position and by season. The fantasy, positions, position, leaders and game pages have bar charts of the top players. Hover over a bar or point to see its exact value. Every chart follows the season picker.
+**Charts on the website:** the **Fantasy** leaderboard has a **Compare players** line chart with everyone's points on one chart. Filters above it:
+- **Position:** All, or QB, RB, WR, DB, DL or ST, to count only the points earned there. The bar chart below then ranks points at that position.
+- **Show:** *Added up*, a running total (the default, best for seeing who's pulling ahead), or *Each game*.
+- **Games:** all games, or the last 5, 10, 20 or 40.
+- **Players:** tick up to 8 to compare (the top 5 are ticked to start).
+
+The season picker applies too. Hover a line to bring it forward, or a point to see that game's value. Click a point to open the game.
+
+Each player's page has a line chart of their fantasy points game by game, with tabs to show only one position's points (the dashed line is their average). There are also bar charts of points by position and by season. The fantasy, positions, position, leaders and game pages have bar charts of the top players. Hover over a bar or point to see its exact value. Every chart follows the season picker.
 
 ## 5. Fantasy scoring
 
