@@ -163,3 +163,36 @@ def test_small_games_dont_count(tmp_path, monkeypatch):
     db.save_game(_game("d", _t(3), full))
     db.save_game(_game("e", _t(4), full))
     assert db.season(1)["ended_at"] and db.season_game_count(1) == 3  # small games didn't fill it
+
+
+def test_past_games_become_season_1(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "SEASON_GAMES", 80, raising=False)
+    monkeypatch.setattr(config, "SEASON_MIN_PLAYERS", 8, raising=False)
+    full = {f"p{i}": {"WR": {"receptions": 1}} for i in range(8)}
+    small = {f"p{i}": {"WR": {"receptions": 1}} for i in range(3)}
+
+    def old_db(path, n_games):
+        db = Database(path)
+        for i in range(n_games):
+            db.save_game(_game(f"g{i}", _t(i), small if i == 1 else full))
+        # as if these were saved before seasons existed
+        db.conn.execute("DELETE FROM seasons")
+        db.conn.execute("UPDATE games SET season = 0")
+        db.conn.execute("DELETE FROM settings WHERE key = 'seasons_past_filed'")
+        db.conn.commit()
+        return db
+
+    db = old_db(tmp_path / "a.db", 5)
+    db.conn.close()
+    db = Database(tmp_path / "a.db")  # the bot starting after the update
+    assert db.season(1)["name"] == "Season 1" and db.season_game_count(1) == 4  # the 3-player game isn't in it
+    assert db.active_season()["id"] == 1
+
+    # Season 1 already started by a game played after the update: the earlier games join it
+    db = old_db(tmp_path / "b.db", 3)
+    db.save_game(_game("new", "2031-01-01T00:00:00+00:00", full))
+    assert db.season_game_count(1) == 1
+    db.conn.close()
+    db = Database(tmp_path / "b.db")
+    assert db.season_game_count(1) == 3 and len(db.seasons()) == 1
+    assert db.season(1)["started_at"].startswith("2030-01-01T00")
