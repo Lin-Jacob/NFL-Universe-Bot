@@ -130,6 +130,16 @@ def _parse_time(value: str | None) -> datetime | None:
     return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
+def season_length() -> int:
+    """Games in a season (SEASON_GAMES in config.py, default 80; 0 = seasons only end by hand)."""
+    return int(getattr(config, "SEASON_GAMES", 80) or 0)
+
+
+def season_min_players() -> int:
+    """Players a game needs to count toward a season (SEASON_MIN_PLAYERS, default 8)."""
+    return int(getattr(config, "SEASON_MIN_PLAYERS", 8) or 0)
+
+
 def _iso(value: str | None) -> str:
     """A time normalized to the bot's own ISO format (UTC), so stored season times compare cleanly."""
     t = _parse_time(value)
@@ -247,7 +257,7 @@ class Database:
                            played, source, raw_id, game_id))
                 c.execute("DELETE FROM player_games WHERE game_id = ?", (game_id,))
             else:
-                season = self._season_for_new_game(played)
+                season = 0  # decided below, once we know how many players it had
                 cur = c.execute("INSERT INTO games(external_id, season, week, home_team, away_team, "
                                 "home_score, away_score, played_at, source, raw_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
                                 (g.external_id, season, g.week, g.home_team, g.away_team,
@@ -266,9 +276,32 @@ class Database:
                            fantasy_points(p.stats, p.pos_stats)))
             self._rescore_game(game_id)
             c.commit()
-            if not replaced and season:
-                self._end_if_full(season, played)
+            self._place_in_season(game_id)
             return game_id, replaced
+
+    def _place_in_season(self, game_id: int) -> None:
+        """Put a game in its season if it counts (SEASON_MIN_PLAYERS or more players), or take it out
+        if it no longer does. Games that don't count stay saved and in every all-time stat and log.
+        A game already in a season stays in it (so /seasonadmin move sticks)."""
+        g = self.game(game_id)
+        if not g:
+            return
+        if not self.counts_for_season(game_id):
+            if g["season"]:
+                self.x("UPDATE games SET season = 0 WHERE id = ?", (game_id,))
+            return
+        if g["season"]:
+            return
+        season = self._season_for_new_game(g["played_at"])
+        if season:
+            self.x("UPDATE games SET season = ? WHERE id = ?", (season, game_id))
+            self._end_if_full(season, g["played_at"])
+
+    def player_count(self, game_id: int) -> int:
+        return self.one("SELECT count(*) n FROM player_games WHERE game_id = ?", (game_id,))["n"]
+
+    def counts_for_season(self, game_id: int) -> bool:
+        return self.player_count(game_id) >= season_min_players()
 
     def delete_game(self, game_id: int) -> bool:
         """Delete a game, its stat lines and rulings. Its raw payload is kept (so /admin backfill still
@@ -338,6 +371,7 @@ class Database:
                                   "VALUES(?,?,?,?)", (game_id, username, key, json.dumps(stats)))
             self._rescore_game(game_id)
             self.conn.commit()
+            self._place_in_season(game_id)  # a hand-entered game counts once it has enough players
             return self.conn.execute("SELECT fantasy_points FROM player_games WHERE game_id=? AND username_key=?",
                                      (game_id, key)).fetchone()["fantasy_points"]
 
@@ -351,6 +385,8 @@ class Database:
                 self.conn.execute("INSERT OR IGNORE INTO removed_players(game_id, username_key) VALUES(?,?)",
                                   (game_id, key))
             self.conn.commit()
+            if ok:
+                self._place_in_season(game_id)  # under SEASON_MIN_PLAYERS now: no longer counts
             return ok
 
     def recompute_fantasy(self) -> int:
@@ -457,8 +493,8 @@ class Database:
             if self.active_season():
                 raise ValueError("a season is already in progress")
             sid = (self.one("SELECT COALESCE(MAX(id), 0) n FROM seasons")["n"]) + 1
-            loose = self.q("SELECT id, played_at FROM games WHERE season = 0 ORDER BY played_at, id") \
-                if include_past_games else []
+            loose = [g for g in self.q("SELECT id, played_at FROM games WHERE season = 0 ORDER BY played_at, id")
+                     if self.counts_for_season(g["id"])] if include_past_games else []
             start = loose[0]["played_at"] if loose else (started_at or _now())
             self.conn.execute("INSERT INTO seasons(id, name, started_at) VALUES(?,?,?)",
                               (sid, (name or "").strip() or f"Season {sid}", _iso(start)))
@@ -487,7 +523,7 @@ class Database:
 
     def _end_if_full(self, season_id: int, played_at: str | None) -> None:
         """End the open season once it has SEASON_GAMES games, and flag it for the bot to announce."""
-        limit = int(getattr(config, "SEASON_GAMES", 20) or 0)
+        limit = season_length()
         s = self.season(season_id)
         if not limit or not s or s["ended_at"] or self.season_game_count(season_id) < limit:
             return
@@ -558,6 +594,12 @@ class Database:
 
     def season_game_count(self, season_id: int) -> int:
         return self.one("SELECT count(*) n FROM games WHERE season = ?", (season_id,))["n"]
+
+    def season_progress(self, season_id: int) -> tuple[int, int, float]:
+        """(games played, games in a season, % complete). The total is 0 when seasons have no set
+        length; a season ended early shows the share it reached."""
+        n, total = self.season_game_count(season_id), season_length()
+        return n, total, (min(100.0, n / total * 100) if total else 0.0)
 
     # ---------------------------------------------------------------- players
     def resolve_player(self, query: str) -> str | None:

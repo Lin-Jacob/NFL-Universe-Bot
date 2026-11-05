@@ -31,7 +31,7 @@ import config
 
 from . import analytics, charts
 from .awards import STAT_AWARDS, vote_awards
-from .db import Database
+from .db import Database, season_min_players
 from .embeds import Names, displayed, fmt_num, short_line
 from .fantasy import breakdown, by_group, group_points
 from .stats import CATEGORY_ORDER, MAX_STATS, POSITIONS, STATS, label
@@ -77,6 +77,8 @@ form.season{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 14
 .tabs a.on{background:var(--accent);color:#fff}
 .award{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line)}
 .award:last-child{border-bottom:none}
+.prog{height:10px;border-radius:999px;background:var(--chip);overflow:hidden;margin:6px 0 2px;min-width:120px}
+.prog span{display:block;height:100%;background:var(--accent);border-radius:999px}
 """ + charts.CSS
 
 # Turns <time datetime="..."> into the viewer's local date and time; the season picker submits on change.
@@ -175,6 +177,14 @@ class Site:
                 f'for="season-pick">Stats for</label><select id="season-pick" name="season">{"".join(opts)}</select>'
                 f'{keep}<noscript><button>Show</button></noscript></form>')
 
+    def _progress(self, sid: int, bar: bool = True) -> str:
+        """'34 of 80 games · 42.5% complete' with a progress bar."""
+        n, total, pct = self.db.season_progress(sid)
+        if not total:
+            return f"{n} games"
+        text = f"{n} of {total} games · {pct:.1f}% complete"
+        return text + (f'<div class="prog" title="{text}"><span style="width:{pct:.1f}%"></span></div>' if bar else "")
+
     def _scope_note(self, sid: int | None) -> str:
         if not sid:
             return "across all games"
@@ -197,6 +207,7 @@ class Site:
     def _games_table(self, rows, names: Names) -> str:
         if not rows:
             return '<p class="muted">No games recorded yet.</p>'
+        seasons_on = bool(self.db.seasons())
         out = []
         for g in rows:
             players = self.db.game_players(g["id"])  # highest points first
@@ -205,7 +216,9 @@ class Site:
                 star = f'{self._player_link(names, players[0]["username"])} ' \
                        f'<span class="muted">{_num(players[0]["fantasy_points"])} pts</span>'
             wk = f'<span class="chip">Wk {g["week"]}</span>' if g["week"] else ""
-            ss = f'<span class="chip">S{g["season"]}</span>' if g["season"] else ""
+            ss = (f'<span class="chip">S{g["season"]}</span>' if g["season"] else
+                  f'<span class="chip" title="Under {season_min_players()} players: kept in the all-time stats, '
+                  f'but not in a season">not counted</span>' if seasons_on else "")
             out.append(f'<tr><td><a href="/games/{g["id"]}">#{g["id"]}</a></td>'
                        f'<td><a href="/games/{g["id"]}">{self._score(g)}</a> {wk}{ss}</td>'
                        f'<td class="small muted">{_time(g["played_at"])}</td><td>{star}</td></tr>')
@@ -268,11 +281,8 @@ class Site:
             banner += (f'<div class="card">🗳️ <b>Voting is open</b> for {_e(voting["name"])}\'s awards until '
                        f'{_time(voting["vote_ends_at"])}. <a href="/vote">Cast your votes →</a></div>')
         if active:
-            limit = int(getattr(config, "SEASON_GAMES", 20) or 0)
-            done = self.db.season_game_count(active["id"])
-            banner += (f'<div class="card">📅 <b>{_e(active["name"])}</b>: {done}'
-                       + (f" of {limit}" if limit else "") + f' games played. '
-                       f'<a href="/seasons/{active["id"]}">Awards race →</a></div>')
+            banner += (f'<div class="card">📅 <b>{_e(active["name"])}</b>: {self._progress(active["id"])}'
+                       f'<a href="/seasons/{active["id"]}">Season games and awards race →</a></div>')
         body = (f"<h1>{_e(SITE_NAME)}</h1>{self._picker(request, sid)}{banner}"
                 f'<div class="card"><span class="stat"><b>{n_games}</b><span class="muted">games</span></span>'
                 f'<span class="stat"><b>{n_players}</b><span class="muted">players</span></span></div>'
@@ -292,7 +302,11 @@ class Site:
     async def games(self, request: web.Request) -> web.Response:
         sid = self._sid(request)
         rows = self._games(sid)
-        return _page("Games", f"<h1>Games played</h1>{self._picker(request, sid)}"
+        note = (f"<div class='card'>{self._progress(sid)}</div>" if sid else
+                f"<p class='muted'>Every game recorded. Games marked <i>not counted</i> had under "
+                f"{season_min_players()} players: they count in the all-time stats but not toward a season.</p>"
+                if self.db.seasons() else "")
+        return _page("Games", f"<h1>{'Season game log' if sid else 'Games played'}</h1>{self._picker(request, sid)}{note}"
                               f"<p class='muted'>{len(rows)} games {self._scope_note(sid)}, newest first.</p>"
                               f"{self._games_table(rows, Names(self.db))}")
 
@@ -308,6 +322,9 @@ class Site:
         wk = f'<span class="chip">Week {g["week"]}</span>' if g["week"] else ""
         if g["season"] and (srow := self.db.season(g["season"])):
             wk += f' <a class="chip" href="/seasons/{srow["id"]}">{_e(srow["name"])}</a>'
+        elif self.db.seasons():
+            wk += (f' <span class="chip">Not counted for a season: {len(players)} players, needs '
+                   f'{season_min_players()}</span>')
         rows = []
         for i, p in enumerate(players):
             groups = by_group(p["stats"], p["pos_stats"])
@@ -428,7 +445,7 @@ class Site:
                 f'<div class="card">{trend}</div>'
                 + (f'<div class="grid">{chart_cards}</div>' if chart_cards else "")
                 + f'<h2>{totals_title}</h2>{self._stats_cards(summ["totals"])}'
-                f'<h2>Game log</h2><div class="card scroll"><table><tr><th>#</th><th>Game</th><th class="n">Pts</th>'
+                f'<h2>{"Season game log" if sid else "Game log"}</h2><div class="card scroll"><table><tr><th>#</th><th>Game</th><th class="n">Pts</th>'
                 f'<th>Stats and how the points were scored</th></tr>{log}</table></div>')
         return _page(names(summ["username"]), body)
 
@@ -547,21 +564,24 @@ class Site:
         if not rows:
             return _page("Seasons", "<h1>Seasons</h1><p class='muted'>No seasons yet. The next game played "
                                     "starts Season 1.</p>")
-        limit = int(getattr(config, "SEASON_GAMES", 20) or 0)
+        _, limit, _ = self.db.season_progress(rows[0]["id"])
         body = []
         for srow in rows:
-            n = self.db.season_game_count(srow["id"])
             status = ("Voting open" if srow["ended_at"] and not srow["vote_results"] and srow["vote_ends_at"]
-                      else "Finished" if srow["ended_at"] else f"In progress · {n}" + (f"/{limit}" if limit else "")
-                      + " games")
+                      else "Finished" if srow["ended_at"] else "In progress")
             body.append(f'<tr><td><a href="/seasons/{srow["id"]}">{_e(srow["name"])}</a></td><td>{status}</td>'
-                        f'<td class="n">{n}</td><td class="small muted">{_time(srow["started_at"])}</td>'
-                        f'<td class="small"><a href="/fantasy?season={srow["id"]}">stats</a></td></tr>')
+                        f'<td class="small">{self._progress(srow["id"])}</td>'
+                        f'<td class="small muted">{_time(srow["started_at"])}</td>'
+                        f'<td class="small"><a href="/games?season={srow["id"]}">games</a> · '
+                        f'<a href="/fantasy?season={srow["id"]}">stats</a></td></tr>')
+        need = season_min_players()
         return _page("Seasons", "<h1>Seasons</h1><p class='muted'>"
                                 + (f"A season is {limit} games. " if limit else "")
-                                + "When one ends, the stat awards are handed out and the players vote for the "
+                                + (f"Only games with {need} or more players count toward a season; smaller games "
+                                   f"are still saved and count in the all-time stats. " if need else "")
+                                + "When a season ends, the stat awards are handed out and the players vote for the "
                                   "rest.</p><div class='card scroll'><table><tr><th>Season</th><th>Status</th>"
-                                  "<th class='n'>Games</th><th>Started</th><th></th></tr>"
+                                  "<th>Progress</th><th>Started</th><th></th></tr>"
                                 + "".join(body) + "</table></div>")
 
     async def season_page(self, request: web.Request) -> web.Response:
@@ -588,10 +608,7 @@ class Site:
         stat_cards = "".join(award_card(t, icon, race["roles"].get(code) or [], lambda r: _num(r["points"]), " pts",
                                         "No eligible players yet")
                              for code, (t, icon) in STAT_AWARDS.items())
-        n = self.db.season_game_count(sid)
-        limit = int(getattr(config, "SEASON_GAMES", 20) or 0)
-        status = (f"Ended {_time(srow['ended_at'])}" if srow["ended_at"] else
-                  f"In progress: {n}" + (f" of {limit}" if limit else "") + " games played")
+        status = f"Ended {_time(srow['ended_at'])}" if srow["ended_at"] else "In progress"
         if srow["vote_results"]:
             res = json.loads(srow["vote_results"])
             vote_html = (f"<h2>🗳️ Voted awards</h2><p class='muted'>{res['voters']} players voted. Votes are "
@@ -606,11 +623,15 @@ class Site:
         else:
             vote_html = ("<div class='card muted'>🗳️ When the season ends, players vote for "
                          + ", ".join(_e(t) for t, _ in vote_awards().values()) + ".</div>")
-        sub = (f"<p class='muted'>{status}. Stat awards go to the most fantasy points earned in that role "
-               f"(needs {race['min_games']}+ games in the role). "
-               f"<a href='/fantasy?season={sid}'>Season stats →</a></p>")
+        sub = (f"<div class='card'><b>{status}</b> · {self._progress(sid)}<span class='small muted'>Stat awards go "
+               f"to the most fantasy points earned in that role (needs {race['min_games']}+ games in the role). "
+               f"<a href='/fantasy?season={sid}'>Season stats →</a></span></div>")
+        games = self._games(sid)
+        log = (f"<h2>Season game log <a class='small' href='/games?season={sid}'>{len(games)} games →</a></h2>"
+               + self._games_table(games, names)
+               + f"<p class='small muted'>Only games with {season_min_players()}+ players count toward a season.</p>")
         body = (f"<h1>{_e(srow['name'])}</h1>{sub}<h2>{'🏆 Stat awards' if final else '📊 Stat awards race'}</h2>"
-                f"<div class='grid'>{stat_cards}</div>{vote_html}")
+                f"<div class='grid'>{stat_cards}</div>{vote_html}{log}")
         return _page(srow["name"], body)
 
     async def scoring(self, request: web.Request) -> web.Response:

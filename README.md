@@ -267,7 +267,14 @@ Anywhere a player name is asked for you can type a mapped real name, a Roblox us
 
 ### Seasons and awards
 
-**A season is 20 games.** The first game played starts Season 1. When a season reaches 20 games it ends by itself, and the next game starts the next season. Change the length with `SEASON_GAMES` in `config.py` (`0` = admins start and end seasons by hand). `/seasonadmin end` ends a season early, and `/seasonadmin start` starts one by hand. A game goes into the season it was played in, so a game imported later with `/admin backfill` still lands in the right season. Games recorded before seasons existed aren't in any season until you run `/seasonadmin start include_past_games:True`, which files them into seasons of 20, oldest first.
+**A season is 80 games, and only games with at least 8 players count.** The first game with 8+ players starts Season 1. When a season reaches 80 counted games it ends by itself, and the next counted game starts the next season. A game with fewer than 8 players is still saved and still counts in every all-time stat, game log and leaderboard. It just isn't part of any season. Change the numbers with `SEASON_GAMES` (`0` = admins start and end seasons by hand) and `SEASON_MIN_PLAYERS` in `config.py`.
+
+**Season game logs and progress:**
+- The website's **Games** page lists every game, marking the ones that didn't count. Pick a season in **Stats for** to see only that season's game log.
+- Each season's page shows its completion (for example "34 of 80 games · 42.5% complete") with a progress bar, and its game log.
+- A player's page with a season picked shows their game log for that season only.
+- In Discord, `/games season:` and `/gamelog name season:` do the same. `/season` shows the completion %.
+- Each game's result post says which season it counted for (for example "Season 2 · 35/80 games (44%)"), or that it didn't count. `/seasonadmin end` ends a season early, and `/seasonadmin start` starts one by hand. A game goes into the season it was played in, so a game imported later with `/admin backfill` still lands in the right season. Games recorded before seasons existed aren't in any season until you run `/seasonadmin start include_past_games:True`, which files the ones with 8+ players into 80-game seasons, oldest first.
 
 When a season ends there are two kinds of awards:
 
@@ -281,7 +288,7 @@ When a season ends there are two kinds of awards:
 | 75% or more | 1 |
 | 50% | 0.75 |
 | 25% | 0.5 |
-| 1 game of 20 | about 0.3 |
+| 1 game of 80 | about 0.26 |
 
 Shares in between are worked out on a sliding scale (for example, 60% of the games counts 0.85). To change the curve, set `SEASON_VOTE_WEIGHTS = [(0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0), (1, 1.0)]` in `config.py`. Each pair is a share of games and the weight a voter gets at that share.
 

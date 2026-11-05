@@ -10,10 +10,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-import config
-
 from . import analytics
 from .admin import is_admin
+from .db import season_length, season_min_players
 from .embeds import season_embed, vote_embed
 
 if TYPE_CHECKING:
@@ -47,7 +46,7 @@ class SeasonAdmin(commands.GroupCog, group_name="seasonadmin", group_description
             return
         s = self.db.start_season(name, include_past_games)
         made = [r for r in self.db.seasons() if r["id"] >= s["id"]]
-        limit = int(getattr(config, "SEASON_GAMES", 20) or 0)
+        limit = season_length()
         msg = f"Started **{s['name']}**. New games count toward it"
         if include_past_games:
             msg += (", and the earlier games were filed into " + ", ".join(
@@ -55,7 +54,8 @@ class SeasonAdmin(commands.GroupCog, group_name="seasonadmin", group_description
         else:
             msg += "."
         if limit:
-            msg += f" Each season ends by itself after {limit} games, or end it early with `/seasonadmin end`."
+            msg += (f" Each season ends by itself after {limit} games, or end it early with `/seasonadmin end`. "
+                    f"Only games with {season_min_players()}+ players count.")
         if any(r["ended_at"] for r in made):
             msg += " Seasons that filled up have ended, and their awards and votes are announced shortly."
         await self._ok(inter, msg)

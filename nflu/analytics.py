@@ -284,7 +284,7 @@ def season_mvps(db: Database, season_id: int, top: int = 3) -> dict:
 
 # -------------------------------------------------------------------- MVP voting
 # (share of the season's games played, vote weight). Points in between are interpolated, so
-# 75%+ of the games = 1, 50% = 0.75, 25% = 0.5, and one game out of 20 = about 0.3.
+# 75%+ of the games = 1, 50% = 0.75, 25% = 0.5, and one game out of 80 = about 0.26.
 DEFAULT_VOTE_WEIGHTS = [(0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0), (1.0, 1.0)]
 
 

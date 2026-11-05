@@ -93,21 +93,31 @@ class Stats(commands.Cog):
         return season, f" · {srow['name'] if srow else f'Season {season}'}"
 
     @app_commands.command(name="games", description="Every game played, newest first, with date and time")
-    async def games(self, inter: discord.Interaction):
-        rows = self.db.recent_games(100000)
+    @app_commands.describe(season="Only the games that count for one season (default: every game)")
+    @app_commands.autocomplete(season=season_autocomplete)
+    async def games(self, inter: discord.Interaction, season: int | None = None):
+        sid, suffix = self._scope(season)
+        rows = (self.db.q("SELECT * FROM games WHERE season = ? ORDER BY played_at DESC, id DESC", (sid,)) if sid
+                else self.db.recent_games(100000))
         if not rows:
-            await inter.response.send_message("No games recorded yet.")
+            await inter.response.send_message("No games recorded yet." if not sid else f"No games{suffix} yet.")
             return
         names = Names(self.db)
         per_page = GAMES_PER_PAGE
         pages = (len(rows) + per_page - 1) // per_page
-        title = "Games played"
+        title = "Games played" + suffix
+        if sid:
+            n, total, pct = self.db.season_progress(sid)
+            if total:
+                title += f" · {n}/{total} ({pct:.0f}%)"
 
         def render(page: int) -> discord.Embed:
             out = []
             for g in rows[page * per_page:(page + 1) * per_page]:
                 line = f"`#{g['id']}` {score_line(g)}\n🕒 {when(g['played_at'])}"
                 players = self.db.game_players(g["id"])  # sorted by fantasy points
+                if not sid and self.db.seasons():
+                    line += f" · S{g['season']}" if g["season"] else " · not counted"
                 if players and players[0]["fantasy_points"] > 0:
                     line += f" · ⭐ {names(players[0]['username'])} ({fmt_num(players[0]['fantasy_points'])} pts)"
                 out.append(line)
@@ -235,14 +245,20 @@ class Stats(commands.Cog):
         await Pager(inter.user.id, len(order), card, start=start).send(inter)
 
     @app_commands.command(name="gamelog", description="A player's recent games")
-    @app_commands.autocomplete(name=player_autocomplete)
-    async def gamelog(self, inter: discord.Interaction, name: str, count: app_commands.Range[int, 1, 20] = 10):
+    @app_commands.describe(season="Only games that count for one season (default: every game)")
+    @app_commands.autocomplete(name=player_autocomplete, season=season_autocomplete)
+    async def gamelog(self, inter: discord.Interaction, name: str, count: app_commands.Range[int, 1, 20] = 10,
+                      season: int | None = None):
         key = await self._resolve(inter, name)
         if not key:
             return
-        lines = self.db.player_lines(key)[:count]
+        sid, suffix = self._scope(season)
+        lines = self.db.player_lines(key, sid)[:count]
         names = Names(self.db)
-        e = discord.Embed(title=f"Game log · {names.full(lines[0]['username'])}", color=config.EMBED_COLOR)
+        if not lines:
+            await inter.response.send_message(f"**{names.full(key)}** has no games{suffix}.")
+            return
+        e = discord.Embed(title=f"Game log · {names.full(lines[0]['username'])}{suffix}", color=config.EMBED_COLOR)
         e.description = "\n".join(
             f"`#{ln['game_id']}` {score_line(ln)} · "
             f"**{fmt_num(ln['fantasy_points'])} FP**\n{short_line(ln['stats'])}" for ln in lines)[:4000]

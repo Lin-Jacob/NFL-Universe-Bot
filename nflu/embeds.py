@@ -11,7 +11,7 @@ import discord
 
 import config
 
-from .db import Database
+from .db import Database, season_min_players
 from .fantasy import scored_stats
 from .stats import CATEGORY_ORDER, CORE_DISPLAY, MAX_STATS, STATS, label
 
@@ -208,14 +208,32 @@ def _rank_icon(rank: int) -> str:
     return {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"#{rank}")
 
 
+def progress_bar(pct: float, width: int = 10) -> str:
+    """'▰▰▰▱▱▱▱▱▱▱' for a percentage."""
+    full = round(max(0.0, min(100.0, pct)) / 100 * width)
+    return "▰" * full + "▱" * (width - full)
+
+
+def season_line(db: Database, g, players: int) -> str:
+    """Whether a game counts for a season: 'Season 2 · game 35 of 80 (44%)' or why it doesn't."""
+    if g["season"] and (s := db.season(g["season"])):
+        n, total, pct = db.season_progress(s["id"])
+        return f"📅 {s['name']}" + (f" · {n}/{total} games ({pct:.0f}%)" if total else "")
+    need = season_min_players()
+    if need and players < need and db.seasons():
+        return f"📅 Doesn't count for the season ({players} players, needs {need}). Still in the all-time stats."
+    return ""
+
+
 def game_embed(db: Database, game_id: int, title_prefix: str = "") -> discord.Embed | None:
     g = db.game(game_id)
     if not g:
         return None
     names = Names(db)
     players = db.game_players(game_id)
+    sl = season_line(db, g, len(players))
     e = discord.Embed(title=f"{title_prefix}{score_line(g, bold_winner=False)}",
-                      description=f"{game_header(g)}\nPlayed {when(g['played_at'], 'F')}",
+                      description=f"{game_header(g)}\nPlayed {when(g['played_at'], 'F')}" + (f"\n{sl}" if sl else ""),
                       color=config.EMBED_COLOR)
     by_team: dict[str, list[dict]] = {}
     for p in players:  # NFL Universe's stat sheet has no teams, so those players are listed together
@@ -271,8 +289,9 @@ def season_embed(db: Database, season, race: dict, final: bool) -> discord.Embed
     span = f"Started {when(season['started_at'], 'D')}"
     if season["ended_at"]:
         span += f" · ended {when(season['ended_at'], 'D')}"
-    limit = int(getattr(config, "SEASON_GAMES", 20) or 0)
-    count = f"{race['games']}/{limit} games" if limit and not season["ended_at"] else f"{race['games']} games"
+    n, limit, pct = db.season_progress(season["id"])
+    count = (f"{n}/{limit} games ({pct:.0f}% complete)\n{progress_bar(pct, 20)}" if limit and not season["ended_at"]
+             else f"{n} games")
     title = f"🏆 {season['name']} · stat awards" if final else f"📅 {season['name']}" + (
         "" if season["ended_at"] else " · awards race")
     e = discord.Embed(title=title, color=SEASON_GOLD if final else config.EMBED_COLOR,

@@ -23,6 +23,7 @@ def season_games(monkeypatch):
     monkeypatch.setattr(config, "SEASON_GAMES", 4, raising=False)
     monkeypatch.setattr(config, "SEASON_VOTE_DAYS", 3, raising=False)
     monkeypatch.setattr(config, "SEASON_AUTO_START", True, raising=False)
+    monkeypatch.setattr(config, "SEASON_MIN_PLAYERS", 0, raising=False)
 
 
 def test_vote_weight_curve():
@@ -114,6 +115,7 @@ def test_include_past_games_splits_into_seasons(tmp_path, season_games, monkeypa
 
 def test_manual_end_reopen_and_move(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SEASON_GAMES", 0, raising=False)  # manual seasons only
+    monkeypatch.setattr(config, "SEASON_MIN_PLAYERS", 0, raising=False)
     db = Database(tmp_path / "m.db")
     g, _ = db.save_game(_game("a", None, {"p": {"QB": {"pass_yards": 10}}}))
     assert db.game(g)["season"] == 1  # the first game starts a season
@@ -137,3 +139,27 @@ def test_old_databases_start_off_season(tmp_path):
     db.conn.commit()
     db.conn.close()
     assert Database(path).game(gid)["season"] == 0
+
+
+def test_small_games_dont_count(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "SEASON_GAMES", 3, raising=False)
+    monkeypatch.setattr(config, "SEASON_MIN_PLAYERS", 8, raising=False)
+    db = Database(tmp_path / "small.db")
+    full = {f"p{i}": {"WR": {"receptions": 1}} for i in range(8)}
+    small = {f"p{i}": {"WR": {"receptions": 1}} for i in range(5)}
+    a, _ = db.save_game(_game("a", _t(0), full))
+    b, _ = db.save_game(_game("b", _t(1), small))
+    assert db.game(a)["season"] == 1 and db.game(b)["season"] == 0  # kept, but not in the season
+    assert db.season_progress(1)[:2] == (1, 3) and round(db.season_progress(1)[2]) == 33
+    assert analytics.player_summary(db, "p0")["games"] == 2 and analytics.player_summary(db, "p0", 1)["games"] == 1
+    # saved first without its stat sheet, then again with it: counts once it has the players
+    c, _ = db.save_game(_game("c", _t(2), {}))
+    assert db.game(c)["season"] == 0
+    db.save_game(_game("c", _t(2), full))
+    assert db.game(c)["season"] == 1
+    # removing players so it's under 8 takes it out of the season
+    db.remove_player_from_game(c, "p0")
+    assert db.game(c)["season"] == 0
+    db.save_game(_game("d", _t(3), full))
+    db.save_game(_game("e", _t(4), full))
+    assert db.season(1)["ended_at"] and db.season_game_count(1) == 3  # small games didn't fill it
