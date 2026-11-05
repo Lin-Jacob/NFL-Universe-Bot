@@ -226,7 +226,9 @@ Notes:
 | `/compare player1 player2` | Side-by-side stats |
 | `/leaders stat [per_game]` | Top 10 in any stat, or fantasy points |
 | `/fantasy` | Fantasy leaderboard ranked by points per 100 snaps, so players who joined late aren't penalized. Players under `FANTASY_MIN_SNAPS` are listed separately |
-| `/stats [position]` | Position leaderboards: QB (Passing), RB (Rushing), WR (Receiving), DB (Cornerback), DL (DLine), ST (Special Teams), ranked by fantasy points earned at that position |
+| `/stats [position] [season]` | Position leaderboards: QB (Passing), RB (Rushing), WR (Receiving), DB (Cornerback), DL (DLine), ST (Special Teams), ranked by fantasy points earned at that position |
+| `/season [number] [votes]` | A season's stat awards (or the race for them while it's going); `votes:True` shows the voted awards (see "Seasons and awards" below) |
+| `/vote award player` | Vote for a season award (MVP, Most Improved, ...) while voting is open. League players only, not yourself |
 | `/points name [game_id]` | How a player's fantasy points were scored |
 | `/scoring` | Fantasy scoring rules |
 | `/odds team1 team2` | Win chances for two lineups. List each team's players separated by commas (real names or Roblox usernames, with autocomplete). Shows each team's win %, moneyline and decimal odds, projected fantasy points, and each player's rating. See "Matchup odds" below |
@@ -251,6 +253,10 @@ Anywhere a player name is asked for you can type a mapped real name, a Roblox us
 | `/admin intfaults [game]`, `/admin removeintfault fault_id` | List / undo interception rulings |
 | `/admin rawlog`, `/admin raw`, `/admin reparse` | Inspect and re-process raw webhook deliveries |
 | `/admin reparseall` | Re-read every saved game with the current parser (run after a bot update) |
+| `/seasonadmin start [name] [include_past_games]` | Start a season by hand (normally the next game starts one). `include_past_games` files every game that isn't in a season yet into seasons of `SEASON_GAMES` |
+| `/seasonadmin end [confirm]` | End the season early: post its stat awards and open the vote. Without `confirm:True` it only shows a preview |
+| `/seasonadmin closevote` | Close the open vote now and post the voted awards |
+| `/seasonadmin reopen`, `/seasonadmin move game_id season` | Undo ending the latest season (clears its awards and votes), or move one game into a season (0 = none) |
 | `/admin channel [channel]` | Where final scores are posted automatically |
 | `/admin announce game_id` | Re-post a game's result |
 | `/admin recalc` | Reload `config.py` (scoring and admins) and recalculate all fantasy points |
@@ -258,6 +264,37 @@ Anywhere a player name is asked for you can type a mapped real name, a Roblox us
 | `/admin admins` | List admins |
 
 ---
+
+### Seasons and awards
+
+**A season is 80 games, and only games with at least 8 players count.** The first game with 8+ players starts Season 1. When a season reaches 80 counted games it ends by itself, and the next counted game starts the next season. A game with fewer than 8 players is still saved and still counts in every all-time stat, game log and leaderboard. It just isn't part of any season. Change the numbers with `SEASON_GAMES` (`0` = admins start and end seasons by hand) and `SEASON_MIN_PLAYERS` in `config.py`.
+
+**Season game logs and progress:**
+- The website's **Games** page lists every game, marking the ones that didn't count. Pick a season in **Stats for** to see only that season's game log.
+- Each season's page shows its completion (for example "34 of 80 games · 42.5% complete") with a progress bar, and its game log.
+- A player's page with a season picked shows their game log for that season only.
+- In Discord, `/games season:` and `/gamelog name season:` do the same. `/season` shows the completion %.
+- Each game's result post says which season it counted for (for example "Season 2 · 35/80 games (44%)"), or that it didn't count. `/seasonadmin end` ends a season early, and `/seasonadmin start` starts one by hand. A game goes into the season it was played in, so a game imported later with `/admin backfill` still lands in the right season. Games recorded before seasons existed aren't in any season until you run `/seasonadmin start include_past_games:True`, which files the ones with 8+ players into 80-game seasons, oldest first.
+
+When a season ends there are two kinds of awards:
+
+- **Stat awards** come straight from the numbers and are posted in the results channel right away. They are 🔥 Top Scorer (most fantasy points), 🎯 Best Quarterback, 🏃 Best Running Back, 🙌 Best Receiver, 🛡️ Best Defensive Back, 💥 Best Defensive Lineman and 🦶 Best Special Teams. Each goes to whoever earned the most fantasy points in that role that season, the same points `/stats` uses. A player needs `SEASON_MVP_MIN_GAMES` games in the role to qualify (default 3, or half the season's games for a short season).
+- **Voted awards** are picked by the players: 🏆 Most Valuable Player, 📈 Most Improved Player, 🧊 Mr. Clutch, 🤝 Best Teammate, 🎬 Highlight Reel, 🐷 Ball Hog and 🗣️ Trash Talker. Voting is open for `SEASON_VOTE_DAYS` days (default 3) after the season ends. The results are then posted in the results channel and shown on the website. `/seasonadmin closevote` closes it early. Change the list with `SEASON_VOTE_AWARDS` in `config.py`, for example `{"MVP": "Most Valuable Player", "ROOKIE": ("Rookie of the Year", "🐣")}`.
+
+**How voting works:** league players vote with `/vote award player` in Discord, or on the website's **Vote** page, logged in with their sportsbook account. Voting again for the same award replaces the earlier vote. Only players who played in the season can vote. Nobody can vote for themselves, and only players from that season can be voted for. Each vote is weighted by how much of the season the voter played:
+
+| Share of the season's games played | Vote weight |
+|---|---|
+| 75% or more | 1 |
+| 50% | 0.75 |
+| 25% | 0.5 |
+| 1 game of 80 | about 0.26 |
+
+Shares in between are worked out on a sliding scale (for example, 60% of the games counts 0.85). To change the curve, set `SEASON_VOTE_WEIGHTS = [(0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0), (1, 1.0)]` in `config.py`. Each pair is a share of games and the weight a voter gets at that share.
+
+**Season stats vs overall stats:** `/stats`, `/fantasy`, `/leaders` and `/player` take an optional `season:` (autocompletes, **Overall** is the default) to show one season's numbers. On the website, a **Stats for** picker at the top of the home, games, players, player, fantasy, positions and leaders pages switches between Overall and any season. **Seasons** lists every season, and each season's page shows its stat awards (the live race while it's going) and its voted awards. `/season [number]` shows the stat awards in Discord, and `votes:True` shows the voted ones.
+
+**Charts on the website:** each player's page has a line chart of their fantasy points game by game (the dashed line is their average), plus bar charts of points by position and by season. The fantasy, positions, position, leaders and game pages have bar charts of the top players. Hover over a bar or point to see its exact value. Every chart follows the season picker.
 
 ## 5. Fantasy scoring
 

@@ -20,8 +20,9 @@ def sum_stats(lines: list[dict]) -> dict[str, float]:
     return dict(tot)
 
 
-def player_summary(db: Database, username_key: str) -> dict | None:
-    lines = db.player_lines(username_key)
+def player_summary(db: Database, username_key: str, season: int | None = None) -> dict | None:
+    """A player's totals over every game, or one season's games (season=N)."""
+    lines = db.player_lines(username_key, season)
     if not lines:
         return None
     totals = sum_stats(lines)
@@ -41,10 +42,10 @@ def player_summary(db: Database, username_key: str) -> dict | None:
 
 
 def leaders(db: Database, stat: str, limit: int = 10,
-            per_game: bool = False, min_games: int = 1) -> list[tuple[str, float, int]]:
+            per_game: bool = False, min_games: int = 1, season: int | None = None) -> list[tuple[str, float, int]]:
     """[(username, value, games)] sorted descending. stat='fantasy' ranks fantasy points."""
     agg: dict[str, list] = {}
-    for ln in db.all_player_lines():
+    for ln in db.all_player_lines(season=season):
         val = ln["fantasy_points"] if stat == "fantasy" else (ln["stats"].get(stat) or 0)
         entry = agg.setdefault(ln["username_key"], [ln["username"], 0.0, 0])
         entry[1] += val
@@ -60,12 +61,12 @@ def leaders(db: Database, stat: str, limit: int = 10,
     return rows[:limit]
 
 
-def career(db: Database, username_key: str) -> dict | None:
+def career(db: Database, username_key: str, season: int | None = None) -> dict | None:
     """A player's stats combined over every game, split by position group, for the /player card.
 
     groups = {"WR": {stat: (total, per_game_avg)}}; 'longest_*' stats give (best, average) instead.
     Averages divide by all games played, so a stat they skipped some games counts as 0 there."""
-    lines = db.player_lines(username_key)
+    lines = db.player_lines(username_key, season)
     if not lines:
         return None
     n = len(lines)
@@ -209,14 +210,14 @@ def per_snap(points: float, snaps: float) -> float:
     return round(points / snaps * config.FANTASY_RATE_SNAPS, 2) if snaps else 0.0
 
 
-def fantasy_rates(db: Database) -> tuple[list[dict], list[dict]]:
+def fantasy_rates(db: Database, season: int | None = None) -> tuple[list[dict], list[dict]]:
     """Fantasy leaderboard by points per snap, so players who joined late aren't penalized for it.
 
     Returns (ranked, not_enough_snaps), each [{username, points, snaps, games, rate}] best rate first.
     Players under config.FANTASY_MIN_SNAPS total snaps go in the second list. Snaps come from the
     NFL Universe stat sheet (every section's 'Snaps' added up = plays on the field)."""
     agg: dict[str, dict] = {}
-    for ln in db.all_player_lines():
+    for ln in db.all_player_lines(season=season):
         e = agg.setdefault(ln["username_key"], {"username": ln["username"], "points": 0.0, "snaps": 0.0, "games": 0})
         e["points"] += ln["fantasy_points"]
         e["snaps"] += ln["extra"].get("Snaps") or 0
@@ -227,11 +228,11 @@ def fantasy_rates(db: Database) -> tuple[list[dict], list[dict]]:
     return ranked, [r for r in rows if r["snaps"] < config.FANTASY_MIN_SNAPS]
 
 
-def position_leaders(db: Database, pos: str, limit: int = 10) -> list[dict]:
+def position_leaders(db: Database, pos: str, limit: int = 10, season: int | None = None) -> list[dict]:
     """Players ranked by fantasy points earned at one position (QB/RB/WR/DB/DL/ST), across all games.
     [{username, points, games, stats}] highest first. Points can be negative (interception penalty)."""
     agg: dict[str, dict] = {}
-    for ln in db.all_player_lines():
+    for ln in db.all_player_lines(season=season):
         st = ln["pos_stats"].get(pos)
         if not st:
             continue
@@ -244,3 +245,103 @@ def position_leaders(db: Database, pos: str, limit: int = 10) -> list[dict]:
     rows = [dict(e, points=round(e["points"], 2), stats=dict(e["stats"])) for e in agg.values()]
     rows.sort(key=lambda r: r["points"], reverse=True)
     return rows[:limit]
+
+
+def season_mvps(db: Database, season_id: int, top: int = 3) -> dict:
+    """The stat awards race for one season: for the top scorer (PTS, all fantasy points) and each
+    position (QB/RB/WR/DB/DL/ST), players ranked by the fantasy points they earned there in that
+    season's games, best first.
+
+    The same points as /stats, so the scoring in config.py decides it. To be eligible a player must
+    have played that role in SEASON_MVP_MIN_GAMES games (default 3), lowered to half the season's
+    games when the season is shorter, so someone with one huge game can't win it. Ties go to the
+    better points-per-game. Returns {"games": n, "min_games": m, "roles": {"PTS": [row...], "QB": ...}},
+    each row {username_key, username, points, games, avg}."""
+    lines = db.all_player_lines(season=season_id)
+    n_games = len({ln["game_id"] for ln in lines})
+    min_games = min(int(getattr(config, "SEASON_MVP_MIN_GAMES", 3)), max(1, math.ceil(n_games / 2)))
+    agg: dict[str, dict[str, dict]] = {role: {} for role in ("PTS", "QB", "RB", "WR", "DB", "DL", "ST")}
+
+    def add(role: str, ln: dict, points: float) -> None:
+        e = agg[role].setdefault(ln["username_key"], {"username_key": ln["username_key"],
+                                                       "username": ln["username"], "points": 0.0, "games": 0})
+        e["points"] += points
+        e["games"] += 1
+
+    for ln in lines:
+        add("PTS", ln, ln["fantasy_points"])
+        for code, st in by_group(ln["stats"], ln["pos_stats"]).items():
+            if code in agg and st:
+                add(code, ln, group_points(code, st))
+    roles = {}
+    for role, players in agg.items():
+        rows = [dict(e, points=round(e["points"], 2), avg=round(e["points"] / e["games"], 2))
+                for e in players.values() if e["games"] >= min_games and e["points"] > 0]
+        rows.sort(key=lambda r: (r["points"], r["avg"]), reverse=True)
+        roles[role] = rows[:top]
+    return {"games": n_games, "min_games": min_games, "roles": roles}
+
+
+# -------------------------------------------------------------------- MVP voting
+# (share of the season's games played, vote weight). Points in between are interpolated, so
+# 75%+ of the games = 1, 50% = 0.75, 25% = 0.5, and one game out of 80 = about 0.26.
+DEFAULT_VOTE_WEIGHTS = [(0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0), (1.0, 1.0)]
+
+
+def vote_weight(share: float) -> float:
+    """How much a vote counts, from the share (0-1) of the season's games the voter played.
+    SEASON_VOTE_WEIGHTS in config.py sets the curve. Someone who played no games can't vote (0)."""
+    if share <= 0:
+        return 0.0
+    pts = sorted(getattr(config, "SEASON_VOTE_WEIGHTS", None) or DEFAULT_VOTE_WEIGHTS)
+    if share <= pts[0][0]:
+        return round(pts[0][1], 3)
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if share <= x1:
+            return round(y0 + (y1 - y0) * (share - x0) / (x1 - x0) if x1 > x0 else y1, 3)
+    return round(pts[-1][1], 3)
+
+
+def season_roles_played(db: Database, season_id: int) -> tuple[int, dict[str, dict[str, int]], dict[str, str]]:
+    """(season's game count, {username_key: {"ALL": games, "QB": games at QB, ...}}, {key: username})."""
+    lines = db.all_player_lines(season=season_id)
+    played: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    names: dict[str, str] = {}
+    for ln in lines:
+        k = ln["username_key"]
+        names[k] = ln["username"]
+        played[k]["ALL"] += 1
+        for code, st in by_group(ln["stats"], ln["pos_stats"]).items():
+            if st:
+                played[k][code] += 1
+    return len({ln["game_id"] for ln in lines}), played, names
+
+
+def voter_weight(db: Database, season_id: int, voter_key: str) -> tuple[float, int, int]:
+    """(weight, games the voter played that season, games in the season)."""
+    total, played, _ = season_roles_played(db, season_id)
+    games = played.get(voter_key, {}).get("ALL", 0)
+    return (vote_weight(games / total) if total else 0.0), games, total
+
+
+def vote_results(db: Database, season_id: int) -> dict:
+    """Weighted vote totals per voted award: {"voters": n, "roles": {"MVP": [{username_key, username,
+    weight, votes}]}} best first. Ties go to whoever has more votes."""
+    names = {r["username_key"]: r["username"]
+             for r in db.q("SELECT username_key, username FROM player_games GROUP BY username_key")}
+    from .awards import vote_awards  # local: awards imports this module
+    roles: dict[str, dict[str, dict]] = {r: {} for r in vote_awards()}
+    voters = set()
+    for v in db.season_votes(season_id):
+        voters.add(v["voter_key"])
+        e = roles.setdefault(v["role"], {}).setdefault(v["candidate_key"], {
+            "username_key": v["candidate_key"], "username": names.get(v["candidate_key"], v["candidate_key"]),
+            "weight": 0.0, "votes": 0})
+        e["weight"] += v["weight"]
+        e["votes"] += 1
+    out = {}
+    for role, cands in roles.items():
+        rows = [dict(e, weight=round(e["weight"], 3)) for e in cands.values()]
+        rows.sort(key=lambda r: (r["weight"], r["votes"]), reverse=True)
+        out[role] = rows
+    return {"voters": len(voters), "roles": out}

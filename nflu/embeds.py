@@ -11,7 +11,7 @@ import discord
 
 import config
 
-from .db import Database
+from .db import Database, season_min_players
 from .fantasy import scored_stats
 from .stats import CATEGORY_ORDER, CORE_DISPLAY, MAX_STATS, STATS, label
 
@@ -208,14 +208,32 @@ def _rank_icon(rank: int) -> str:
     return {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"#{rank}")
 
 
+def progress_bar(pct: float, width: int = 10) -> str:
+    """'▰▰▰▱▱▱▱▱▱▱' for a percentage."""
+    full = round(max(0.0, min(100.0, pct)) / 100 * width)
+    return "▰" * full + "▱" * (width - full)
+
+
+def season_line(db: Database, g, players: int) -> str:
+    """Whether a game counts for a season: 'Season 2 · game 35 of 80 (44%)' or why it doesn't."""
+    if g["season"] and (s := db.season(g["season"])):
+        n, total, pct = db.season_progress(s["id"])
+        return f"📅 {s['name']}" + (f" · {n}/{total} games ({pct:.0f}%)" if total else "")
+    need = season_min_players()
+    if need and players < need and db.seasons():
+        return f"📅 Doesn't count for the season ({players} players, needs {need}). Still in the all-time stats."
+    return ""
+
+
 def game_embed(db: Database, game_id: int, title_prefix: str = "") -> discord.Embed | None:
     g = db.game(game_id)
     if not g:
         return None
     names = Names(db)
     players = db.game_players(game_id)
+    sl = season_line(db, g, len(players))
     e = discord.Embed(title=f"{title_prefix}{score_line(g, bold_winner=False)}",
-                      description=f"{game_header(g)}\nPlayed {when(g['played_at'], 'F')}",
+                      description=f"{game_header(g)}\nPlayed {when(g['played_at'], 'F')}" + (f"\n{sl}" if sl else ""),
                       color=config.EMBED_COLOR)
     by_team: dict[str, list[dict]] = {}
     for p in players:  # NFL Universe's stat sheet has no teams, so those players are listed together
@@ -258,3 +276,69 @@ def table(rows: list[list[str]], headers: list[str]) -> str:
     if len(text) > 3900:
         text = text[:3900] + "\n…"
     return f"```\n{text}\n```"
+
+
+SEASON_GOLD = 0xF1C40F
+
+
+def season_embed(db: Database, season, race: dict, final: bool) -> discord.Embed:
+    """A season's stat awards (final=True, when it ends) or the race for them while it's going."""
+    from .awards import STAT_AWARDS, vote_awards  # local: awards imports analytics, which imports db
+
+    names = Names(db)
+    span = f"Started {when(season['started_at'], 'D')}"
+    if season["ended_at"]:
+        span += f" · ended {when(season['ended_at'], 'D')}"
+    n, limit, pct = db.season_progress(season["id"])
+    count = (f"{n}/{limit} games ({pct:.0f}% complete)\n{progress_bar(pct, 20)}" if limit and not season["ended_at"]
+             else f"{n} games")
+    title = f"🏆 {season['name']} · stat awards" if final else f"📅 {season['name']}" + (
+        "" if season["ended_at"] else " · awards race")
+    e = discord.Embed(title=title, color=SEASON_GOLD if final else config.EMBED_COLOR,
+                      description=f"{span} · {count}")
+    for key, (award, icon) in STAT_AWARDS.items():
+        rows = race["roles"].get(key) or []
+        if not rows:
+            value = "No eligible players"
+        else:
+            winner, rest = rows[0], rows[1:]
+            value = (f"**{names(winner['username'])}** · {fmt_num(winner['points'])} pts "
+                     f"({winner['games']} GP, {fmt_num(winner['avg'])}/game)")
+            if rest:
+                value += "\n" + " · ".join(f"{['🥈', '🥉'][i] if i < 2 else f'{i + 2}.'} {names(r['username'])} "
+                                           f"{fmt_num(r['points'])}" for i, r in enumerate(rest))
+        e.add_field(name=f"{icon} {award}", value=value[:1024], inline=key != "PTS")
+    voted = ", ".join(t for t, _ in vote_awards().values())
+    if season["ended_at"] and season["vote_ends_at"] and not season["vote_results"]:
+        e.add_field(name="🗳️ Vote for the rest", inline=False, value=(
+            f"{voted}: players vote with `/vote` or on the website until {when(season['vote_ends_at'], 'f')}. "
+            f"You can't vote for yourself, and a vote counts more the more of the season's games you played."))
+    elif season["vote_results"]:
+        e.add_field(name="🗳️ Voted awards", inline=False, value="Voting has closed: see `/season votes:True`.")
+    else:
+        e.add_field(name="🗳️ Voted awards", inline=False, value=f"{voted}: voted on by the players when the season ends.")
+    e.set_footer(text=f"Stat awards: fantasy points earned in that role this season. "
+                      f"Needs {race['min_games']}+ games in the role to qualify.")
+    return e
+
+
+def vote_embed(db: Database, season, results: dict, final: bool = True) -> discord.Embed:
+    """The players' vote for a season's voted awards: winners by weighted votes."""
+    from .awards import vote_awards
+
+    names = Names(db)
+    e = discord.Embed(title=f"🗳️ {season['name']} · voted awards" + ("" if final else " (votes so far)"),
+                      color=SEASON_GOLD if final else config.EMBED_COLOR,
+                      description=f"{results['voters']} players voted. Each vote is weighted by the share of "
+                                  f"the season's games the voter played.")
+    for key, (award, icon) in vote_awards().items():
+        rows = results["roles"].get(key) or []
+        if not rows:
+            value = "No votes"
+        else:
+            w = rows[0]
+            value = f"**{names(w['username'])}** · {fmt_num(w['weight'])} ({w['votes']} vote{'s' if w['votes'] != 1 else ''})"
+            if rows[1:]:
+                value += "\n" + " · ".join(f"{names(r['username'])} {fmt_num(r['weight'])}" for r in rows[1:3])
+        e.add_field(name=f"{icon} {award}", value=value[:1024], inline=key != "MVP")
+    return e
