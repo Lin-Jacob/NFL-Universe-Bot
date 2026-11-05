@@ -196,3 +196,18 @@ def test_past_games_become_season_1(tmp_path, monkeypatch):
     db = Database(tmp_path / "b.db")
     assert db.season_game_count(1) == 3 and len(db.seasons()) == 1
     assert db.season(1)["started_at"].startswith("2030-01-01T00")
+
+
+def test_comparison_series(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "SEASON_MIN_PLAYERS", 0, raising=False)
+    db = Database(tmp_path / "c.db")
+    db.save_game(_game("a", _t(0), {"x": {"QB": {"pass_yards": 100}}, "y": {"WR": {"receptions": 2}}}))
+    db.save_game(_game("b", _t(1), {"y": {"WR": {"receptions": 3}, "QB": {"pass_yards": 50}}}))
+    games, s = analytics.game_series(db)
+    assert [g["id"] for g in games] == [1, 2]
+    assert s["x"]["values"] == [4.0, None] and s["y"]["values"] == [2.0, 5.0] and s["y"]["total"] == 7.0
+    _, qb = analytics.game_series(db, pos="QB")
+    assert qb["x"]["values"] == [4.0, None] and qb["y"]["values"] == [None, 2.0]
+    assert analytics.cumulative([None, 2, None, 3]) == [None, 2, 2, 5]
+    games, s = analytics.game_series(db, last=1)
+    assert [g["id"] for g in games] == [2] and "x" not in s

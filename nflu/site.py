@@ -402,10 +402,20 @@ class Site:
                 f'{_num(b["fantasy_points"])} pts · {_e(short_line(b["stats"]))}</div></div>')
         # Charts: points per game over time, points by position, and (overall) points by season
         lines = list(reversed(summ["lines"]))  # oldest first
-        trend = charts.line([(f"#{ln['game_id']}", ln["fantasy_points"],
-                              f"Game #{ln['game_id']}: {_num(ln['fantasy_points'])} pts · {short_line(ln['stats'])}",
-                              f"/games/{ln['game_id']}") for ln in lines],
-                            "Fantasy points by game", "points per game")
+        pos = request.query.get("pos", "").upper()
+        pos = pos if pos in POSITIONS else None
+        pts = [(ln, analytics.line_points(ln, pos)) for ln in lines]
+        trend = charts.line([(f"#{ln['game_id']}", v,
+                              f"Game #{ln['game_id']}: {_num(v)} pts" + (f" at {pos}" if pos else "")
+                              + f" · {short_line(ln['stats'])}", f"/games/{ln['game_id']}")
+                             for ln, v in pts if v is not None],
+                            f"Points at {pos} by game" if pos else "Fantasy points by game",
+                            "points per game" + (f" at {pos}" if pos else ""))
+        played = {c for ln in lines for c, st in by_group(ln["stats"], ln["pos_stats"]).items() if st}
+        tabs = (f'<a class="{"" if pos else "on"}" href="{_e(request.path)}{self._q(sid)}">All</a>' + "".join(
+            f'<a class="{"on" if pos == c else ""}" href="{_e(request.path)}{self._q(sid, pos=c)}">{c}</a>'
+            for c in POSITIONS if c in played))
+        trend = f'<div class="tabs">{tabs}</div>' + (trend or f"<p class='muted'>No games at {pos}.</p>")
         pos_pts: dict[str, float] = {}
         for ln in summ["lines"]:
             for code, st in by_group(ln["stats"], ln["pos_stats"]).items():
@@ -471,19 +481,79 @@ class Site:
         sid = self._sid(request)
         ranked, short = analytics.fantasy_rates(self.db, sid)
         per = config.FANTASY_RATE_SNAPS
-        chart = charts.bars(self._bar_rows(ranked, names, lambda r: r["rate"],
-                                           lambda r: f'{names(r["username"])}: {_num(r["rate"])} per {per} snaps, '
-                                                     f'{_num(r["points"])} pts in {r["games"]} games', sid),
-                            f"Points per {per} snaps (top 15)")
+        f = self._chart_filters(request)
+        games, series = analytics.game_series(self.db, sid, f["pos"], f["last"])
+        order = sorted(series, key=lambda k: series[k]["total"], reverse=True)
+        if f["pos"]:  # bars rank points earned at that position
+            bar_rows = [(self._player_link(names, series[k]["username"], sid=sid), series[k]["total"],
+                         f'{names(series[k]["username"])}: {_num(series[k]["total"])} pts at {f["pos"]} in '
+                         f'{series[k]["games"]} games') for k in order[:15]]
+            chart = charts.bars(bar_rows, f"Points at {f['pos']} · {POSITIONS[f['pos']][0]} (top 15)", " pts")
+        else:
+            chart = charts.bars(self._bar_rows(ranked, names, lambda r: r["rate"],
+                                               lambda r: f'{names(r["username"])}: {_num(r["rate"])} per {per} snaps, '
+                                                         f'{_num(r["points"])} pts in {r["games"]} games', sid),
+                                f"Points per {per} snaps (top 15)")
+        # in leaderboard order, so the same players keep the same colors
+        picked = [k for k in order if k in f["players"]][:charts.SERIES_MAX] or order[:5]
+        values = {k: (analytics.cumulative(series[k]["values"]) if f["metric"] == "total" else series[k]["values"])
+                  for k in picked}
+        what = f"Points at {f['pos']}" if f["pos"] else "Fantasy points"
+        cmp_title = f"{what} added up game by game" if f["metric"] == "total" else f"{what} in each game"
+        compare = charts.compare([f"#{g['id']}" for g in games],
+                                 [(names(series[k]["username"]), values[k], "") for k in picked],
+                                 cmp_title + (f" (last {f['last']} games)" if f["last"] else ""),
+                                 links=[f"/games/{g['id']}" for g in games])
+        boxes = "".join(
+            f'<label><input type="checkbox" name="p" value="{_e(k)}"{" checked" if k in picked else ""}>'
+            f'{_e(names(series[k]["username"]))} <span class="muted">{_num(series[k]["total"])}</span></label>'
+            for k in order)
+        filters = self._filter_form(request, sid, f, boxes)
         body = (f"<h1>Fantasy leaderboard</h1>{self._picker(request, sid)}<p class='muted'>Fantasy points per {per} "
                 f"snaps on the field {self._scope_note(sid)}, so joining a game late doesn't cost you. "
                 f"A full game is about 130-145 snaps.</p>"
+                + f'<div class="card"><h2 style="margin-top:0">Compare players</h2>{filters}'
+                + (compare or "<p class='muted'>No games to chart with these filters.</p>")
+                + f'<p class="small muted">Pick up to {charts.SERIES_MAX} players. Hover a line to bring it '
+                  f'forward, or a point for that game. Gaps are games they missed'
+                + (" (in “added up”, their total stays flat)" if f["metric"] == "total" else "") + ".</p></div>"
                 + (f'<div class="card">{chart}</div>' if chart else "")
                 + (self._rate_table(ranked, names, sid) if ranked else "<p class='muted'>Nobody has enough snaps yet.</p>"))
         if short:
             body += (f"<h2>Not enough snaps yet (under {config.FANTASY_MIN_SNAPS})</h2>"
                      + self._rate_table(short, names, sid))
         return _page("Fantasy", body)
+
+    @staticmethod
+    def _chart_filters(request: web.Request) -> dict:
+        """Chart filters from the query: pos (QB..ST or None), metric (total|game), last (N or None), players."""
+        pos = request.query.get("pos", "").upper()
+        try:
+            last = int(request.query.get("last", "0"))
+        except ValueError:
+            last = 0
+        return {"pos": pos if pos in POSITIONS else None,
+                "metric": "game" if request.query.get("metric") == "game" else "total",
+                "last": last if last in (5, 10, 20, 40) else None,
+                "players": [k.lower() for k in request.query.getall("p", [])]}
+
+    @staticmethod
+    def _filter_form(request: web.Request, sid: int | None, f: dict, boxes: str = "") -> str:
+        pos_opts = '<option value="">All positions</option>' + "".join(
+            f'<option value="{c}"{" selected" if f["pos"] == c else ""}>{c} · {_e(t)}</option>'
+            for c, (t, _) in POSITIONS.items())
+        metric_opts = "".join(f'<option value="{v}"{" selected" if f["metric"] == v else ""}>{lbl}</option>'
+                              for v, lbl in (("total", "Added up (running total)"), ("game", "Each game")))
+        last_opts = "".join(f'<option value="{v}"{" selected" if (f["last"] or 0) == v else ""}>{lbl}</option>'
+                            for v, lbl in ((0, "All games"), (5, "Last 5 games"), (10, "Last 10 games"),
+                                           (20, "Last 20 games"), (40, "Last 40 games")))
+        keep = f'<input type="hidden" name="season" value="{sid}">' if sid else ""
+        players = f"<fieldset><legend>Players</legend>{boxes}</fieldset>" if boxes else ""
+        return (f'<form class="filters" method="get" action="{_e(request.path)}">{keep}'
+                f'<label>Position<select name="pos">{pos_opts}</select></label>'
+                f'<label>Show<select name="metric">{metric_opts}</select></label>'
+                f'<label>Games<select name="last">{last_opts}</select></label>'
+                f'{players}<button>Update chart</button></form>')
 
     async def positions(self, request: web.Request) -> web.Response:
         names = Names(self.db)
