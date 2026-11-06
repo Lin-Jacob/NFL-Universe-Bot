@@ -208,6 +208,7 @@ def test_comparison_series(tmp_path, monkeypatch):
     assert s["x"]["values"] == [4.0, None] and s["y"]["values"] == [2.0, 5.0] and s["y"]["total"] == 7.0
     _, qb = analytics.game_series(db, pos="QB")
     assert qb["x"]["values"] == [4.0, None] and qb["y"]["values"] == [None, 2.0]
+    assert qb["y"]["stats"] == [None, {"pass_yards": 50}] and s["y"]["stats"][1]["receptions"] == 3
     assert analytics.cumulative([None, 2, None, 3]) == [None, 2, 2, 5]
     games, s = analytics.game_series(db, last=1)
     assert [g["id"] for g in games] == [2] and "x" not in s

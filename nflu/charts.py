@@ -2,7 +2,8 @@
 
 No JavaScript or outside files (the site's Content-Security-Policy allows neither). Colors come
 from the page's CSS variables, so charts follow light and dark mode. Hovering a bar or a point
-shows its exact value (a native tooltip), and every chart sits next to a table of the same numbers.
+shows its exact value, and every chart sits next to a table of the same numbers. On the compare
+chart, hovering a game shows every player's value and stat line for that game (pure CSS :hover).
 """
 
 from __future__ import annotations
@@ -32,8 +33,14 @@ svg.line a:hover .pt{r:6}
 --s6:#008300;--s7:#9085e9;--s8:#e66767}}
 .cmp svg .sr path{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
 .cmp svg .sr circle{stroke:var(--card);stroke-width:1.5}
-.cmp svg:hover .sr{opacity:.25}.cmp svg .sr:hover{opacity:1}.cmp svg .sr:hover path{stroke-width:3}
-.cmp svg .sr .hit{stroke:transparent;stroke-width:12;fill:none}
+.cmp svg .col rect.hit{fill:transparent}.cmp svg .col,.cmp svg .col:hover{text-decoration:none}
+.cmp svg .col .guide{stroke:var(--muted);stroke-width:1;stroke-dasharray:3 3}
+.cmp svg .col .on,.cmp svg .col .guide,.cmp svg .col .tip{display:none}
+.cmp svg .col:hover .on,.cmp svg .col:hover .guide,.cmp svg .col:hover .tip{display:inline}
+.cmp svg .col .on{stroke:var(--card);stroke-width:2}
+.cmp svg .tip rect{fill:var(--card);stroke:var(--line);stroke-width:1}
+.cmp svg .tip text{font-size:11px;fill:var(--text);font-variant-numeric:tabular-nums}
+.cmp svg .tip .hd{font-weight:600}.cmp svg .tip .v{font-weight:600}.cmp svg .tip .m{fill:var(--muted)}
 .legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin:8px 0 0;font-size:13px}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .legend i{display:inline-block;width:14px;height:3px;border-radius:2px}
@@ -128,11 +135,18 @@ def _nice_step(raw: float) -> float:
     return 10 * mag
 
 
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
 def compare(xlabels: list[str], series: list[tuple[str, list[float | None], str]], title: str = "",
-            unit: str = "pts", links: list[str | None] | None = None) -> str:
+            unit: str = "pts", links: list[str | None] | None = None,
+            notes: list[list[str | None]] | None = None) -> str:
     """Several players' lines on one chart. series = [(name, values per x, tooltip prefix)], at most
     SERIES_MAX, each in its fixed color slot. None values are gaps (the line breaks there).
-    Hovering a line brings it forward; hovering a point shows that game's value."""
+    notes = per series, a short text per x (that game's stat line), shown in the hover box.
+    Hovering a game shows a box with every player's value there (highest first) and their note;
+    clicking it opens links[x]."""
     series = series[:SERIES_MAX]
     allv = [v for _, vals, _ in series for v in vals if v is not None]
     if not series or not allv or not xlabels:
@@ -163,7 +177,8 @@ def compare(xlabels: list[str], series: list[tuple[str, list[float | None], str]
         if i == n - 1 or (i % every == 0 and n - 1 - i >= max(1, every * 0.6)):
             parts.append(f'<text class="axis" x="{x(i):.1f}" y="{h - 8}" text-anchor="middle">{_e(lbl)}</text>')
     legend = []
-    for k, (name, vals, tip) in enumerate(series):
+    r = 4 if n <= 40 else 3
+    for k, (name, vals, _) in enumerate(series):
         color = f"var(--s{k + 1})"
         segs, cur = [], []
         for i, v in enumerate(vals):
@@ -177,15 +192,52 @@ def compare(xlabels: list[str], series: list[tuple[str, list[float | None], str]
             segs.append(cur)
         d = " ".join(" ".join(f"{'M' if j == 0 else 'L'}{x(i):.1f},{y(v):.1f}" for j, (i, v) in enumerate(seg))
                      for seg in segs)
-        dots = "".join(
-            (f'<a href="{_e(links[i])}">' if links and links[i] else "<g>")
-            + f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="{4 if n <= 40 else 3}" fill="{color}">'
-              f'<title>{_e(name)} · {_e(xlabels[i])}: {fmt_num(v)} {_e(unit)}{_e(tip)}</title></circle>'
-            + ("</a>" if links and links[i] else "</g>")
-            for i, v in enumerate(vals) if v is not None)
-        parts.append(f'<g class="sr"><title>{_e(name)}</title><path class="hit" d="{d}"/>'
-                     f'<path d="{d}" stroke="{color}"/>{dots}</g>')
+        dots = "".join(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="{r}" fill="{color}"/>'
+                       for i, v in enumerate(vals) if v is not None)
+        parts.append(f'<g class="sr"><path d="{d}" stroke="{color}"/>{dots}</g>')
         legend.append(f'<span><i style="background:{color}"></i>{_e(name)}</span>')
+    # One hover column per game, drawn on top: a guide line, bigger dots and a box listing everyone.
+    half = (w - left - right) / (2 * (n - 1)) if n > 1 else (w - left - right) / 2
+    for i, lbl in enumerate(xlabels):
+        rows = []
+        for k, (name, vals, tip) in enumerate(series):
+            v = vals[i] if i < len(vals) else None
+            note = (notes[k][i] if notes and k < len(notes) and i < len(notes[k]) else None) or ""
+            rows.append((v, k, name, tip, note))
+        rows.sort(key=lambda row: (row[0] is None, -(row[0] or 0), row[1]))
+        name_w = max(len(row[2]) for row in rows)
+        val_txt = [("—" if v is None else f"{fmt_num(v)}") for v, *_ in rows]
+        val_w = max(len(t) for t in val_txt)
+        texts = [_clip(row[4] or ("didn't play" if row[0] is None else ""), 46) for row in rows]
+        note_w = max((len(t) for t in texts), default=0)
+        cw = 6.3  # rough width of one 11px character
+        nx = 22 + name_w * cw + 10
+        mx = nx + val_w * cw + 12
+        bw = mx + note_w * cw + 10
+        bh = 22 + 16 * len(rows) + 4
+        bx = x(i) + 10 if x(i) + 10 + bw <= w - right or x(i) - 10 - bw < 0 else x(i) - 10 - bw
+        by = top + 2
+        lines = [f'<text class="hd" x="{bx + 10:.1f}" y="{by + 16:.1f}">{_e(lbl)}'
+                 f'<tspan class="m"> · {_e(unit)}</tspan></text>']
+        for j, ((v, k, name, tip, _), vt, nt) in enumerate(zip(rows, val_txt, texts)):
+            ry = by + 22 + 16 * j + 12
+            lines.append(f'<circle cx="{bx + 14:.1f}" cy="{ry - 4:.1f}" r="4" fill="var(--s{k + 1})"/>'
+                         f'<text x="{bx + 22:.1f}" y="{ry:.1f}">{_e(name)}</text>'
+                         f'<text class="v" x="{bx + mx - 12:.1f}" y="{ry:.1f}" text-anchor="end">{_e(vt)}</text>'
+                         f'<text class="m" x="{bx + mx:.1f}" y="{ry:.1f}">{_e(nt)}</text>')
+        on = "".join(f'<circle class="on" cx="{x(i):.1f}" cy="{y(v):.1f}" r="{r + 2}" fill="var(--s{k + 1})"/>'
+                     for v, k, *_ in rows if v is not None)
+        summary = "; ".join(f"{name} {vt} {unit}{tip}" + (f" ({nt})" if nt else "")
+                            for (v, k, name, tip, _), vt, nt in zip(rows, val_txt, texts))
+        col = (f'<rect class="hit" x="{x(i) - half:.1f}" y="{top}" width="{2 * half:.1f}" '
+               f'height="{h - top - bottom}"/>'
+               f'<line class="guide" x1="{x(i):.1f}" x2="{x(i):.1f}" y1="{top}" y2="{h - bottom}"/>{on}'
+               f'<g class="tip"><rect x="{bx:.1f}" y="{by:.1f}" width="{bw:.1f}" height="{bh:.1f}" rx="6"/>'
+               f'{"".join(lines)}</g>')
+        href = links[i] if links and i < len(links) else None
+        aria = f'aria-label="{_e(lbl)}: {_e(summary)}"'
+        parts.append(f'<a class="col" href="{_e(href)}" {aria}>{col}</a>' if href
+                     else f'<g class="col" {aria}>{col}</g>')
     head = f"<h3>{_e(title)}</h3>" if title else ""
     return (f'<div class="chart cmp">{head}<svg class="line" viewBox="0 0 {w} {h}" role="img" '
             f'aria-label="{_e(title)}">{"".join(parts)}</svg><div class="legend">{"".join(legend)}</div></div>')

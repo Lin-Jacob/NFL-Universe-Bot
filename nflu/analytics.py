@@ -361,8 +361,9 @@ def game_series(db: Database, season: int | None = None, pos: str | None = None,
     """Every player's points game by game, for comparing them on one chart.
 
     Returns (games, players): games = [{id, played_at}] oldest first (the last `last` of them),
-    players = {username_key: {username, values: [points or None per game], total, games}}, where
-    None = they didn't play that game (or not at `pos`). Totals cover only those games."""
+    players = {username_key: {username, values: [points or None per game], stats: [stat dict or None
+    per game], total, games}}, where None = they didn't play that game (or not at `pos`); with `pos`,
+    stats holds only what they did at that position. Totals cover only those games."""
     rows = db.q("SELECT id, played_at FROM games" + (" WHERE season = ?" if season else "")
                 + " ORDER BY played_at, id", (season,) if season else ())
     games = [dict(r) for r in rows][-last:] if last else [dict(r) for r in rows]
@@ -376,8 +377,9 @@ def game_series(db: Database, season: int | None = None, pos: str | None = None,
         if v is None:
             continue
         e = players.setdefault(ln["username_key"], {"username": ln["username"], "values": [None] * len(games),
-                                                    "total": 0.0, "games": 0})
+                                                    "stats": [None] * len(games), "total": 0.0, "games": 0})
         e["values"][i] = round(v, 2)
+        e["stats"][i] = by_group(ln["stats"], ln["pos_stats"]).get(pos) if pos else ln["stats"]
         e["total"] += v
         e["games"] += 1
     for e in players.values():

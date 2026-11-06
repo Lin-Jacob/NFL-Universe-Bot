@@ -500,10 +500,20 @@ class Site:
                   for k in picked}
         what = f"Points at {f['pos']}" if f["pos"] else "Fantasy points"
         cmp_title = f"{what} added up game by game" if f["metric"] == "total" else f"{what} in each game"
+        def note(k: str, i: int) -> str | None:  # that game's stat line, shown when hovering a game
+            st, pts = series[k]["stats"][i], series[k]["values"][i]
+            if st is None:
+                return "didn't play" if values[k][i] is not None else None
+            line = short_line(st)
+            if f["metric"] == "total":
+                return f"+{_num(pts)}" + (f" · {line}" if line else "")
+            return line or None
+
         compare = charts.compare([f"#{g['id']}" for g in games],
                                  [(names(series[k]["username"]), values[k], "") for k in picked],
                                  cmp_title + (f" (last {f['last']} games)" if f["last"] else ""),
-                                 links=[f"/games/{g['id']}" for g in games])
+                                 links=[f"/games/{g['id']}" for g in games],
+                                 notes=[[note(k, i) for i in range(len(games))] for k in picked])
         boxes = "".join(
             f'<label><input type="checkbox" name="p" value="{_e(k)}"{" checked" if k in picked else ""}>'
             f'{_e(names(series[k]["username"]))} <span class="muted">{_num(series[k]["total"])}</span></label>'
@@ -514,8 +524,8 @@ class Site:
                 f"A full game is about 130-145 snaps.</p>"
                 + f'<div class="card"><h2 style="margin-top:0">Compare players</h2>{filters}'
                 + (compare or "<p class='muted'>No games to chart with these filters.</p>")
-                + f'<p class="small muted">Pick up to {charts.SERIES_MAX} players. Hover a line to bring it '
-                  f'forward, or a point for that game. Gaps are games they missed'
+                + f'<p class="small muted">Pick up to {charts.SERIES_MAX} players. Hover a game to see every '
+                  f'player\'s points and stat line there, or click it to open the game. Gaps are games they missed'
                 + (" (in “added up”, their total stays flat)" if f["metric"] == "total" else "") + ".</p></div>"
                 + (f'<div class="card">{chart}</div>' if chart else "")
                 + (self._rate_table(ranked, names, sid) if ranked else "<p class='muted'>Nobody has enough snaps yet.</p>"))
