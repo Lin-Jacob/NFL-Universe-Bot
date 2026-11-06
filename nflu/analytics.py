@@ -356,9 +356,9 @@ def line_points(ln: dict, pos: str | None) -> float | None:
     return group_points(pos, st) if st else None
 
 
-def game_series(db: Database, season: int | None = None, pos: str | None = None, last: int | None = None
-                ) -> tuple[list[dict], dict[str, dict]]:
-    """Every player's points game by game, for comparing them on one chart.
+def game_series(db: Database, season: int | None = None, pos: str | None = None, last: int | None = None,
+                stat: str | None = None) -> tuple[list[dict], dict[str, dict]]:
+    """Every player's points game by game (or one stat, e.g. receptions), for comparing them on one chart.
 
     Returns (games, players): games = [{id, played_at}] oldest first (the last `last` of them),
     players = {username_key: {username, values: [points or None per game], stats: [stat dict or None
@@ -373,13 +373,14 @@ def game_series(db: Database, season: int | None = None, pos: str | None = None,
         i = index.get(ln["game_id"])
         if i is None:
             continue
-        v = line_points(ln, pos)
+        st = by_group(ln["stats"], ln["pos_stats"]).get(pos) if pos else ln["stats"]
+        v = line_points(ln, pos) if not stat else (st.get(stat, 0) if st else None)
         if v is None:
             continue
         e = players.setdefault(ln["username_key"], {"username": ln["username"], "values": [None] * len(games),
                                                     "stats": [None] * len(games), "total": 0.0, "games": 0})
         e["values"][i] = round(v, 2)
-        e["stats"][i] = by_group(ln["stats"], ln["pos_stats"]).get(pos) if pos else ln["stats"]
+        e["stats"][i] = st
         e["total"] += v
         e["games"] += 1
     for e in players.values():
